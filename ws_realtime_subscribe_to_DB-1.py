@@ -109,7 +109,7 @@ nohup 실행:
 wss 데이터 저장위치 : /home/ubuntu/Stoc_Kis/data/wss_data/
 
 git add ws_realtime_subscribe_to_DB-1.py
-git commit -m "feat: 260226_1610, 파일저장방식 개선(일괄 → 1000개단위 저장 복원)  *시스템 다운 방지
+git commit -m "feat: 260226_1610, 파일저장방식 개선(일괄 → 1000개단위 저장 복원)  *시스템 다운 방지"
 git push
 """
 
@@ -2610,15 +2610,16 @@ def scheduler_loop():
                         if _active_kws is not None:
                             _request_ws_close(_active_kws)
                     time.sleep(1.0)
-                    # ② 버퍼 flush (병합은 finally에서 프로세스 완료 후 수행)
+                    # ② 버퍼 flush + parts 병합 (18:00 장 종료 시에만 병합)
                     _flush_part_buffer("18:00_shutdown", force_full=True)
+                    _merge_parts_to_final()
                     time.sleep(1.0)
                     # ③ 최종 요약
                     _notify(_final_summary())
                     time.sleep(1.0)
                     # ④ 프로그램 종료 안내 (텔레그램)
                     _notify(f"{ts_prefix()} 18:00 이후 시간외 단일가 종료로 프로그램 종료", tele=True)
-                    _end_time_reached = True   # WS 지연 종료 시 finally에서 병합 수행
+                    _end_time_reached = True
                     _stop_event.set()
                     break
 
@@ -5294,7 +5295,7 @@ def _apply_subscriptions(kws, desired: dict, force: bool = False) -> None:
                 _subscribed.pop(req.__name__, None)
         return
 
-    # ── 일반 모드: 해지 먼저, 신규 구독 전 UNSUBSCRIBE로 ALREADY IN SUBSCRIBE 방지 ──
+    # ── 일반 모드: 예상↔체결 전환 시 UNSUBSCRIBE 필수 (생략 시 다음 슬롯에서 ALREADY IN SUBSCRIBE) ──
     pending_adds: list[tuple] = []
     for req in all_reqs:
         want = desired.get(req, set())
@@ -5310,10 +5311,8 @@ def _apply_subscriptions(kws, desired: dict, force: bool = False) -> None:
         if to_add:
             pending_adds.append((req, to_add))
 
-    # ── 2단계: 신규 구독 (ALREADY IN SUBSCRIBE 방지용 UNSUBSCRIBE 선행) ────
+    # ── 2단계: 신규 구독 (to_add는 아직 미구독이므로 UNSUBSCRIBE 불필요) ────
     for req, add_list in pending_adds:
-        _send_subscribe(kws, req, add_list, "2")  # UNSUBSCRIBE 먼저
-        time.sleep(0.03)
         _send_subscribe(kws, req, add_list, "1")  # SUBSCRIBE
 
     # ── 3단계: 전송 완료 후 _subscribed 갱신 ──────────────────────
@@ -5449,9 +5448,16 @@ def run_ws_forever():
                         _notify(f"{ts_prefix()} [체결통보] H0STCNI0 구독 성공", tele=True)
                     return
                 if rsp.tr_msg:
-                    logger.warning(
-                        f"{ts_prefix()} [ws][system] tr_id={rsp.tr_id} tr_key={rsp.tr_key} msg={rsp.tr_msg}"
-                    )
+                    msg = str(rsp.tr_msg)
+                    # 구독 전환 시 서버 타이밍에 따른 무해한 메시지는 DEBUG로
+                    if "not found" in msg.lower() or "ALREADY IN SUBSCRIBE" in msg:
+                        logger.debug(
+                            f"{ts_prefix()} [ws][system] tr_id={rsp.tr_id} tr_key={rsp.tr_key} msg={msg}"
+                        )
+                    else:
+                        logger.warning(
+                            f"{ts_prefix()} [ws][system] tr_id={rsp.tr_id} tr_key={rsp.tr_key} msg={msg}"
+                        )
 
             kws.on_system = _on_system
 
@@ -5592,21 +5598,16 @@ if __name__ == "__main__":
             t_top.join(timeout=3.0)
         except Exception:
             pass
-        # 종료 시 메모리 버퍼 데이터 저장 (기존 part와 중복 없음 — 미저장분만 버퍼에 있음)
+        # 종료 시 메모리 버퍼만 part로 저장 (병합은 18:00 장 종료 시에만 수행)
         try:
             with _part_buffer_lock:
                 has_data = bool(_part_buffer)
             if has_data:
-                _notify(f"{ts_prefix()} 메모리 데이터 최종 part 저장 중", tele=False)
+                _notify(f"{ts_prefix()} 메모리 데이터 part 저장 중", tele=False)
                 _flush_part_buffer("final_shutdown", force_full=True)
+                _notify(f"{ts_prefix()} part 저장 완료", tele=False)
         except Exception as e:
             logger.error(f"[finally] 최종 flush 실패: {e}")
-        # 모든 프로세스 완료 후 마지막에 parts 병합
-        try:
-            _merge_parts_to_final()
-            _notify(f"{ts_prefix()} 최종 병합 완료: {FINAL_PARQUET_PATH.name}", tele=True)
-        except Exception as e:
-            logger.error(f"[finally] 병합 실패: {e}")
         _flush_overwrite_log()
         _notify(f"{ts_prefix()} {PROGRAM_NAME} 종료", tele=True)
         logger.info("=== WSS END ===")

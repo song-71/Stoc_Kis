@@ -1,0 +1,42 @@
+# ── 데이터 (업로드 제외) ──
+data/
+*.parquet
+*.csv
+!**/KRX_code.csv
+TR_tot_result_data/
+TR_tot_result_data_data.csv
+ohlcv_output.csv
+temp.csv
+
+# ── 비밀/설정 (절대 푸시 금지) ──
+config.json
+config_wss_*.json
+kis_token*.json
+.secrets/
+*.pem
+config/
+
+# ── Python ──
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+.venv/
+env/
+.env
+
+# ── IDE/임시 ──
+.vscode/
+out/
+temp/
+*.log
+*.tmp
+*.tmp.parquet
+*.bak
+
+# ── 기타 ──
+*.jpg
+*.png
+.DS_Store

@@ -108,9 +108,8 @@ nohup 실행:
 
 wss 데이터 저장위치 : /home/ubuntu/Stoc_Kis/data/wss_data/
 
-
 git add ws_realtime_subscribe_to_DB-1.py
-git commit -m "feat: 테스트"
+git commit -m "feat: 260226_1610, 파일저장방식 개선(일괄 → 1000개단위 저장 복원)  *시스템 다운 방지
 git push
 """
 
@@ -369,8 +368,10 @@ print_option = 2  # 1: 수신 DF print, 2: 초당/누적 카운트 1줄 모니�
 # - "time": 시간대 플래그에 따라 저장
 SAVE_MODE = "always"
 
-# 1분마다 _accumulator 전체를 FINAL_PARQUET_PATH에 스냅샷 저장
-SAVE_EVERY_SEC = 60
+# part 파일 저장: 1500행 수신 시 오래된 1000행 저장·500행 버퍼 유지, 또는 1분마다 flush → 18:00 parts 병합
+PART_FLUSH_THRESHOLD = 1500
+PART_FLUSH_SAVE = 1000
+PART_FLUSH_SEC = 60
 
 # ── 기술적 지표 설정 ──
 # EMA 기간 리스트 (ma3, ma50, ma200, ma300, ma500, ma2000 컬럼 생성)
@@ -929,8 +930,8 @@ def _save_exp_first_tick() -> None:
 
 def _load_exp_first_tick_from_wss(codes: list[str]) -> dict[str, float]:
     """
-    _accumulator (인메모리 누적) 에서 15:20~15:30 예상체결(is_real_ccnl=N) 첫 틱 조회.
-    closing_buy_state codes 대상.
+    저장된 parquet 파일에서 15:20~15:30 예상체결(is_real_ccnl=N) 첫 틱 조회.
+    closing_buy_state codes 대상. parts 및 FINAL parquet 파일에서 조회.
     """
     if not codes:
         return {}
@@ -940,10 +941,25 @@ def _load_exp_first_tick_from_wss(codes: list[str]) -> dict[str, float]:
     ts_max = f"{today_ymd} 15:30:00"
     result: dict[str, float] = {}
     try:
-        with _accumulator_lock:
-            if not _accumulator:
-                return {}
-            df = pl.concat(_accumulator, how="diagonal_relaxed")
+        # parquet 우선 (parts 백업용)
+        sources: list[Path] = []
+        if FINAL_PARQUET_PATH.exists() and _is_valid_parquet(FINAL_PARQUET_PATH):
+            sources.append(FINAL_PARQUET_PATH)
+        for p in sorted(PART_DIR.glob("*.parquet")):
+            if _is_valid_parquet(p):
+                sources.append(p)
+        if not sources:
+            return {}
+
+        dfs: list[pl.DataFrame] = []
+        for p in sources:
+            try:
+                dfs.append(pl.read_parquet(str(p)))
+            except Exception:
+                continue
+        if not dfs:
+            return {}
+        df = pl.concat(dfs, how="diagonal_relaxed")
 
         # 코드 컬럼 탐색
         code_col = next(
@@ -980,7 +996,7 @@ def _load_exp_first_tick_from_wss(codes: list[str]) -> dict[str, float]:
                 except Exception:
                     pass
     except Exception as e:
-        logger.warning(f"{ts_prefix()} [종가모니터] WSS accumulator 첫틱 조회 실패: {e}")
+        logger.warning(f"{ts_prefix()} [종가모니터] parquet 첫틱 조회 실패: {e}")
     return result
 
 
@@ -2594,8 +2610,8 @@ def scheduler_loop():
                         if _active_kws is not None:
                             _request_ws_close(_active_kws)
                     time.sleep(1.0)
-                    # ② accumulator 즉시 저장
-                    _save_accumulator("18:00_shutdown")
+                    # ② 버퍼 flush (병합은 finally에서 프로세스 완료 후 수행)
+                    _flush_part_buffer("18:00_shutdown", force_full=True)
                     time.sleep(1.0)
                     # ③ 최종 요약
                     _notify(_final_summary())
@@ -2842,7 +2858,7 @@ def _print_counts():
         per_sec_total = sum(_per_sec_counts.values())
         since_active = sum(1 for c in codes if _since_save_counts.get(c, 0) > 0)
         total_codes = len(codes)
-    total_rows = _accumulator_rows
+    total_rows = _written_rows + _part_buffer_rows
     line = (
         f"{prefix} (초당 수신건수 {per_sec_total:03d}건/초), "
         f"(누적 {total_rows}건/수신 종목 {since_active}개/구독 종목 {total_codes}개)"
@@ -2896,10 +2912,11 @@ _lock = threading.RLock()
 _stop_event = threading.Event()
 _ingest_queue: "queue.Queue[tuple[pl.DataFrame, str, str, str | None, str]]" = queue.Queue()
 
-_accumulator: list[pl.DataFrame] = []         # 당일 전체 틱 데이터 (메모리 누적)
-_accumulator_lock = threading.RLock()          # 스냅샷 저장과 append 동시 처리용
-_save_lock = threading.Lock()                  # _save_accumulator 동시 호출 방지 (shutdown 중복 실행)
-_accumulator_rows: int = 0                     # 누적 행 수 (표시용)
+_part_buffer: list[pl.DataFrame] = []         # flush 전 임시 버퍼 (1000행 또는 1분마다 part로 저장)
+_part_buffer_lock = threading.RLock()          # flush와 append 동시 처리용
+_save_lock = threading.Lock()                  # _flush_part_buffer 동시 호출 방지
+_part_buffer_rows: int = 0                      # 버퍼 내 행 수 (표시용)
+_part_seq: int = 0                              # 당일 part 파일 순번 (파일명 중복 방지)
 
 # ── 종목별 기술적 지표 인메모리 상태 ──
 # EMA: {code: {period: float|None}}  – EMA 누적값 (None이면 첫 틱에 가격으로 초기화)
@@ -3683,8 +3700,7 @@ def _remove_code_structs(remove_codes: list[str], force: bool = False) -> list[s
             _last_rest_req_ts.pop(c, None)
             _last_prdy_ctrt.pop(c, None)
             _code_added_ts.pop(c, None)
-            _ema_state.pop(c, None)
-            _price_buf.pop(c, None)
+            # _ema_state, _price_buf는 당일 모든 종목 유지 (구독 해제해도 pop 안 함)
         if removed:
             _persist_subscription_codes(codes)
     return removed
@@ -4234,32 +4250,31 @@ def _infer_tr_kind(trid: str, is_real: str | None) -> str:
     return "unknown"
 
 
-def _save_accumulator(reason: str = "periodic") -> int:
+def _flush_part_buffer(reason: str = "periodic", force_full: bool = False) -> int:
     """
-    _accumulator 전체를 FINAL_PARQUET_PATH 에 스냅샷 저장.
-
-    - 스냅샷 방식: lock 안에서 리스트를 얕은 복사한 뒤 lock 밖에서 IO 수행
-      → 저장 중에도 ingest_loop이 계속 append 가능 (lock 경합 최소화)
-    - 원자적 저장: .tmp → rename (저장 도중 crash 시 이전 파일 보존)
-    - recv_ts 기준 정렬 및 종목명(name) 컬럼 추가
-    - _save_lock으로 동시 호출 방지 (signal + finally 중복 실행 시 에러 방지)
+    _part_buffer 를 part 파일로 저장.
+    - force_full=False: 1500행 이상 시 1000행 저장·500행 버퍼 유지
+    - force_full=True (periodic/shutdown): 남은 데이터 전부 저장
     """
     if not _save_lock.acquire(blocking=False):
-        logger.info(f"[save] {reason} skipped (already saving)")
+        logger.info(f"[part] {reason} skipped (already flushing)")
         return 0
     try:
-        return _save_accumulator_inner(reason)
+        return _flush_part_buffer_inner(reason, force_full)
     finally:
         _save_lock.release()
 
 
-def _save_accumulator_inner(reason: str) -> int:
-    global _written_rows, _last_save_time
-    with _accumulator_lock:
-        if not _accumulator:
+def _flush_part_buffer_inner(reason: str, force_full: bool) -> int:
+    """force_full이면 전부 저장, 아니면 1500행 이상 시 1000행 저장·500행 버퍼 유지."""
+    global _written_rows, _last_save_time, _part_seq, _part_buffer_rows
+    with _part_buffer_lock:
+        if not _part_buffer:
             _last_save_time = time.time()
             return 0
-        snapshot = list(_accumulator)   # 얕은 복사 (pl.DataFrame은 불변)
+        if not force_full and _part_buffer_rows < PART_FLUSH_THRESHOLD:
+            return 0
+        snapshot = list(_part_buffer)
 
     try:
         t0 = time.time()
@@ -4267,16 +4282,26 @@ def _save_accumulator_inner(reason: str) -> int:
         if "recv_ts" in df.columns:
             df = df.sort("recv_ts")
 
+        total_n = len(df)
+        if force_full:
+            df_save = df
+            df_keep = pl.DataFrame()
+        else:
+            if total_n < PART_FLUSH_THRESHOLD:
+                return 0
+            df_save = df.head(PART_FLUSH_SAVE)
+            df_keep = df.tail(total_n - PART_FLUSH_SAVE)
+
         # 종목명 컬럼 추가
-        if "name" not in df.columns:
+        if "name" not in df_save.columns:
             code_col = next(
-                (c for c in ("mksc_shrn_iscd", "stck_shrn_iscd", "code") if c in df.columns),
+                (c for c in ("mksc_shrn_iscd", "stck_shrn_iscd", "code") if c in df_save.columns),
                 None,
             )
             if code_col:
                 try:
                     name_map = _code_name_map()
-                    df = df.with_columns(
+                    df_save = df_save.with_columns(
                         pl.col(code_col)
                         .cast(pl.Utf8)
                         .str.zfill(6)
@@ -4286,30 +4311,110 @@ def _save_accumulator_inner(reason: str) -> int:
                 except Exception:
                     pass
 
-        # 원자적 저장: tmp 파일에 쓴 뒤 rename
-        tmp_path = FINAL_PARQUET_PATH.with_suffix(".tmp.parquet")
-        df.write_parquet(str(tmp_path), compression="zstd", use_pyarrow=True)
-        tmp_path.replace(FINAL_PARQUET_PATH)
+        n = len(df_save)
+        yymmdd = datetime.now(KST).strftime("%y%m%d")
+        hms = datetime.now(KST).strftime("%H%M%S")
+        _part_seq += 1
+        part_name = f"{yymmdd}_{hms}_{_part_seq:04d}.parquet"
+        part_path = PART_DIR / part_name
+        df_save.write_parquet(str(part_path), compression="zstd", use_pyarrow=True)
 
-        n = len(df)
+        # 유지할 데이터를 버퍼에 되돌림 (force_full이면 비움)
+        with _part_buffer_lock:
+            _part_buffer.clear()
+            if len(df_keep) > 0:
+                _part_buffer.append(df_keep)
+            _part_buffer_rows = len(df_keep)
+
         t1 = time.time()
         with _lock:
-            _written_rows = n
+            _written_rows += n
         _last_save_time = time.time()
         try:
-            size_mb = FINAL_PARQUET_PATH.stat().st_size / (1024 * 1024)
+            size_mb = part_path.stat().st_size / (1024 * 1024)
         except Exception:
             size_mb = -1
         logger.info(
-            f"[save] {reason}: rows={n} sec={t1-t0:.3f} "
-            f"file={FINAL_PARQUET_PATH.name} mb={size_mb:.2f}"
+            f"[part] {reason}: rows={n} sec={t1-t0:.3f} "
+            f"file={part_name} mb={size_mb:.2f}"
         )
         _emit_save_done(n)
         return n
     except Exception as e:
-        logger.error(f"[save] {reason} failed: {e}")
+        logger.error(f"[part] {reason} failed: {e}")
         logger.error(traceback.format_exc())
         return 0
+
+
+def _merge_parts_to_final() -> int:
+    """
+    당일 데이터 병합: FINAL(덮어쓰기 형식) + parts(청크 형식) → 중복 제거 후 FINAL 저장.
+    FINAL(YYMMDD_wss_data.parquet)는 기존 덮어쓰기 저장 형식으로 오늘 이미 있을 수 있음.
+    """
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    import pyarrow.dataset as ds
+
+    global _written_rows
+    yymmdd = datetime.now(KST).strftime("%y%m%d")
+    date_parts = sorted(PART_DIR.glob(f"{yymmdd}_*.parquet"))
+
+    tables: list[pa.Table] = []
+    # 1) 덮어쓰기 형식 파일 (FINAL) 우선 포함
+    if FINAL_PARQUET_PATH.exists() and _is_valid_parquet(FINAL_PARQUET_PATH):
+        try:
+            tables.append(pq.read_table(str(FINAL_PARQUET_PATH)))
+            logger.info(f"[merge] 기존 FINAL 포함: {FINAL_PARQUET_PATH.name}")
+        except Exception as e:
+            logger.warning(f"[merge] FINAL 읽기 실패: {e}")
+
+    # 2) parts(청크) 파일 포함
+    if date_parts:
+        try:
+            dataset = ds.dataset([str(p) for p in date_parts], format="parquet")
+            tables.append(dataset.to_table())
+            logger.info(f"[merge] parts {len(date_parts)}개 포함")
+        except Exception as e:
+            logger.error(f"[merge] parts 읽기 실패: {e}")
+
+    if not tables:
+        logger.info(f"[merge] 병합할 데이터 없음 (날짜={yymmdd})")
+        return 0
+
+    combined = pa.concat_tables(tables, promote_options="permissive") if len(tables) > 1 else tables[0]
+    df = combined.to_pandas()
+
+    # 3) code + recv_ts 기준 중복 제거 (덮어쓰기·parts 겹침 방지)
+    code_col = next((c for c in ("mksc_shrn_iscd", "stck_shrn_iscd", "code") if c in df.columns), None)
+    if code_col and "recv_ts" in df.columns:
+        before_n = len(df)
+        df = df.drop_duplicates(subset=[code_col, "recv_ts"], keep="last")
+        if len(df) < before_n:
+            logger.info(f"[merge] 중복 제거: {before_n - len(df)}행")
+
+    if "recv_ts" in df.columns:
+        try:
+            df = df.sort_values("recv_ts", kind="mergesort").reset_index(drop=True)
+        except Exception:
+            pass
+    combined = pa.Table.from_pandas(df, preserve_index=False)
+    tmp_path = FINAL_PARQUET_PATH.with_suffix(".tmp.parquet")
+    pq.write_table(combined, tmp_path, compression="zstd", use_dictionary=True)
+    tmp_path.replace(FINAL_PARQUET_PATH)
+
+    BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+    for p in date_parts:
+        try:
+            p.replace(BACKUP_DIR / p.name)
+        except Exception as e:
+            logger.warning(f"[merge] backup 이동 실패 {p.name}: {e}")
+
+    n = combined.num_rows
+    src_desc = f"FINAL+{len(date_parts)}parts" if date_parts else "FINAL만"
+    logger.info(f"[merge] 완료: {src_desc} → {FINAL_PARQUET_PATH.name} ({n:,}행)")
+    with _lock:
+        _written_rows = n
+    return n
 
 def _handle_existing_parquet(path: Path) -> None:
     ts = datetime.now(KST).strftime("%y%m%d_%H%M%S")
@@ -4400,19 +4505,14 @@ def _init_indicator_buf(code: str) -> None:
 
 def _restore_state_on_startup() -> None:
     """
-    재시작 시 당일 저장 파일(FINAL_PARQUET_PATH) 및 구 parts/*.parquet 를 읽어
-    _accumulator 복원 + EMA·BB 지표 상태 복원.
+    재시작 시 parts 및 FINAL_PARQUET_PATH 를 읽어 _ema_state, _price_buf 만 복원.
 
-    흐름:
-      1) FINAL_PARQUET_PATH (새 아키텍처 스냅샷) 우선 로드
-      2) 없으면 구 아키텍처 호환: PART_DIR/*.parquet 를 통합
-      3) recv_ts 기준 오름차순 정렬 후 _accumulator 에 단일 DataFrame 으로 저장
-      4) 종목별로 stck_prpr 를 _calc_indicators 에 재투입 → 지표 상태 복원
-      5) 구 parts 파일은 backup 으로 이동 (중복 방지)
+    - part 파일 방식: 기술적 지표는 저장된 parquet에 포함. 복원은 지표 상태만.
+    - 복원 대상: 현재 구독(codes) 종목만. 구독 해제된 종목은 미복원.
+    - parts는 18:00 병합용으로 유지 (backup 이동 안 함).
 
     호출 시점: codes 초기화·구독 직전 (WSS 연결 전)
     """
-    global _accumulator, _accumulator_rows
     try:
         sources: list[str] = []
         parts: list[Path] = []
@@ -4465,12 +4565,7 @@ def _restore_state_on_startup() -> None:
 
         total_rows = len(df)
 
-        # _accumulator 복원 (단일 DataFrame으로 저장)
-        with _accumulator_lock:
-            _accumulator = [df]
-            _accumulator_rows = total_rows
-
-        # 지표 상태 복원 (stck_prpr 컬럼이 있을 때만)
+        # 지표 상태 복원: 당일 모든 종목(구독 해제된 종목 포함) 복원
         restored_codes: list[str] = []
         if "stck_prpr" in df.columns:
             df_ind = df.with_columns(
@@ -4481,21 +4576,12 @@ def _restore_state_on_startup() -> None:
                 code = str(df_code[code_col][0])
                 if code not in _ema_state:
                     _init_indicator_buf(code)
-                prices = df_code["stck_prpr"].to_list()
-                for pr in prices:
+                for pr in df_code["stck_prpr"].to_list():
                     if pr and pr > 0:
                         _calc_indicators(code, float(pr))
                 restored_codes.append(code)
 
-        # 구 parts 파일을 backup 으로 이동 (이미 accumulator 에 흡수됨)
-        if parts:
-            BACKUP_DIR.mkdir(parents=True, exist_ok=True)
-            for p in parts:
-                try:
-                    p.replace(BACKUP_DIR / p.name)
-                except Exception:
-                    pass
-            logger.info(f"[restore] 구 parts {len(parts)}개 → backup 이동 완료")
+        # parts는 18:00 병합용으로 유지 (backup 이동 안 함)
 
         msg = (
             f"[restore] 복원 완료: {len(restored_codes)}종목 / {total_rows}행 "
@@ -4854,16 +4940,16 @@ def _print_premarket_order_summary() -> None:
 
 
 def writer_loop():
-    """1분마다 _accumulator 전체를 FINAL_PARQUET_PATH 에 스냅샷 저장."""
+    """1분마다 _part_buffer 를 part 파일로 flush. 18:00 경 merge는 scheduler에서 처리."""
     logger.info("[writer] started")
     while not _stop_event.is_set():
         try:
-            time_ok = (time.time() - _last_save_time) >= SAVE_EVERY_SEC
+            time_ok = (time.time() - _last_save_time) >= PART_FLUSH_SEC
             if time_ok:
-                with _accumulator_lock:
-                    has_data = bool(_accumulator)
+                with _part_buffer_lock:
+                    has_data = bool(_part_buffer)
                 if has_data:
-                    _save_accumulator("periodic")
+                    _flush_part_buffer("periodic", force_full=True)
         except Exception as e:
             logger.error(f"[writer] save error: {e}")
             logger.error(traceback.format_exc())
@@ -4871,7 +4957,7 @@ def writer_loop():
 
     # 종료 시 최종 저장
     try:
-        _save_accumulator("shutdown")
+        _flush_part_buffer("shutdown", force_full=True)
     except Exception:
         pass
     logger.info("[writer] stopped")
@@ -4942,7 +5028,7 @@ def on_result(ws, tr_id, result, data_info):
 
 
 def ingest_loop():
-    global _last_print_ts, _last_summary_ts, _last_full_status_ts, _since_save_rows, _last_any_recv_ts, _accumulator_rows
+    global _last_print_ts, _last_summary_ts, _last_full_status_ts, _since_save_rows, _last_any_recv_ts, _part_buffer_rows
     logger.info("[ingest] started")
     while not _stop_event.is_set() or not _ingest_queue.empty():
         try:
@@ -5060,15 +5146,18 @@ def ingest_loop():
                                         ind_df[col_name].alias(col_name)
                                     )
                         chunks.append(df_code)
-                # _accumulator 는 _accumulator_lock 으로 보호 (락 분리로 핫패스 지연 최소화)
+                # _part_buffer 에 추가 (1000행 또는 1분마다 part 파일로 flush)
                 if chunks:
-                    with _accumulator_lock:
+                    with _part_buffer_lock:
                         for chunk in chunks:
-                            _accumulator.append(chunk)
+                            _part_buffer.append(chunk)
                         total_n = sum(len(c) for c in chunks)
-                        _accumulator_rows += total_n
+                        _part_buffer_rows += total_n
+                    # 1500행 도달 시 오래된 1000행 flush
+                    if _part_buffer_rows >= PART_FLUSH_THRESHOLD:
+                        _flush_part_buffer("1000rows")
             except Exception:
-                logger.error("[ingest] accumulator append failed")
+                logger.error("[ingest] part buffer append failed")
                 logger.error(traceback.format_exc())
 
         # ── Str1 실전 매도 조건 체크 ─────────────────────────────────────────
@@ -5088,11 +5177,11 @@ def ingest_loop():
             with _lock:
                 total_rows = sum(_total_counts.values())
                 saved_rows = _written_rows
-            accum_rows = _accumulator_rows
+            accum_rows = _part_buffer_rows
 
             logger.info(
             f"[summary] total_rows={total_rows} saved_rows={saved_rows} "
-            f"accum_rows={accum_rows} parquet={FINAL_PARQUET_PATH.name}"
+            f"buf={accum_rows} saved={saved_rows} -> parts"
             )
             _last_summary_ts = now
 
@@ -5123,7 +5212,7 @@ def _handle_signal(signum, frame):
         time.sleep(0.2)
     # accumulator 즉시 저장
     try:
-        _save_accumulator("signal_shutdown")
+        _flush_part_buffer("signal_shutdown", force_full=True)
     except Exception:
         pass
     raise SystemExit(0)
@@ -5193,17 +5282,19 @@ def _apply_subscriptions(kws, desired: dict, force: bool = False) -> None:
     all_reqs = [ccnl_krx, exp_ccnl_krx, overtime_ccnl_krx, overtime_exp_ccnl_krx]  # noqa: F405
 
     if force:
-        # ── force 재구독: UNSUBSCRIBE 없이 SUBSCRIBE만 ──────────────
+        # ── force 재구독: ALREADY IN SUBSCRIBE 방지 위해 UNSUBSCRIBE 후 SUBSCRIBE ──
         for req in all_reqs:
             want = desired.get(req, set())
             if want:
-                _send_subscribe(kws, req, list(want), "1")
+                _send_subscribe(kws, req, list(want), "2")  # UNSUBSCRIBE 먼저
+                time.sleep(0.05)
+                _send_subscribe(kws, req, list(want), "1")  # SUBSCRIBE
                 _subscribed[req.__name__] = set(want)
             else:
                 _subscribed.pop(req.__name__, None)
         return
 
-    # ── 일반 모드 전환: 해지 먼저 (MAX SUBSCRIBE OVER 방지) ──────────────
+    # ── 일반 모드: 해지 먼저, 신규 구독 전 UNSUBSCRIBE로 ALREADY IN SUBSCRIBE 방지 ──
     pending_adds: list[tuple] = []
     for req in all_reqs:
         want = desired.get(req, set())
@@ -5219,9 +5310,11 @@ def _apply_subscriptions(kws, desired: dict, force: bool = False) -> None:
         if to_add:
             pending_adds.append((req, to_add))
 
-    # ── 2단계: 신규 구독 (해지 완료 후) ──────────────────────
+    # ── 2단계: 신규 구독 (ALREADY IN SUBSCRIBE 방지용 UNSUBSCRIBE 선행) ────
     for req, add_list in pending_adds:
-        _send_subscribe(kws, req, add_list, "1")
+        _send_subscribe(kws, req, add_list, "2")  # UNSUBSCRIBE 먼저
+        time.sleep(0.03)
+        _send_subscribe(kws, req, add_list, "1")  # SUBSCRIBE
 
     # ── 3단계: 전송 완료 후 _subscribed 갱신 ──────────────────────
     for req in all_reqs:
@@ -5422,7 +5515,7 @@ if __name__ == "__main__":
         msg = f"{ts_prefix()} {PROGRAM_NAME} => 오늘은 개장일이므로 프로그램을 시작합니다."
         _notify(msg, tele=True)
     logger.info(f"[save_mode] {SAVE_MODE}")
-    logger.info(f"[save] snapshot every {SAVE_EVERY_SEC}s -> {FINAL_PARQUET_PATH}")
+    logger.info(f"[part] flush {PART_FLUSH_THRESHOLD}행 시 {PART_FLUSH_SAVE}행 저장/{PART_FLUSH_SEC}s -> parts/ -> 18:00 merge")
     logger.info(f"[monitor] summary_every={SUMMARY_EVERY_SEC}s stale={STALE_SEC}s")
     logger.info(f"[parquet] -> {FINAL_PARQUET_PATH}")
 
@@ -5446,7 +5539,7 @@ if __name__ == "__main__":
     # Str1 매도 상태 복원 — 시작잔고 결과 전달 (중복 API 호출 없이 재사용)
     _load_str1_sell_state_on_startup(_startup_balance_map)
 
-    # 당일 저장 파일 → _accumulator 복원 + EMA·BB 지표 상태 복원 (재시작 연속성)
+    # 당일 parts/FINAL → _ema_state, _price_buf 지표 복원 (재시작 연속성)
     _restore_state_on_startup()
 
     # 워커 시작
@@ -5499,16 +5592,21 @@ if __name__ == "__main__":
             t_top.join(timeout=3.0)
         except Exception:
             pass
-        # 종료 시 최종 스냅샷 저장 (writer_loop 가 이미 저장했을 수 있지만 재확인)
+        # 종료 시 메모리 버퍼 데이터 저장 (기존 part와 중복 없음 — 미저장분만 버퍼에 있음)
         try:
-            with _accumulator_lock:
-                has_data = bool(_accumulator)
+            with _part_buffer_lock:
+                has_data = bool(_part_buffer)
             if has_data:
-                _notify(f"{ts_prefix()} 최종 스냅샷 저장 중: {FINAL_PARQUET_PATH}", tele=False)
-                _save_accumulator("final_shutdown")
-                _notify(f"{ts_prefix()} 최종 스냅샷 저장 완료: {FINAL_PARQUET_PATH}", tele=True)
+                _notify(f"{ts_prefix()} 메모리 데이터 최종 part 저장 중", tele=False)
+                _flush_part_buffer("final_shutdown", force_full=True)
         except Exception as e:
-            logger.error(f"[finally] 최종 저장 실패: {e}")
+            logger.error(f"[finally] 최종 flush 실패: {e}")
+        # 모든 프로세스 완료 후 마지막에 parts 병합
+        try:
+            _merge_parts_to_final()
+            _notify(f"{ts_prefix()} 최종 병합 완료: {FINAL_PARQUET_PATH.name}", tele=True)
+        except Exception as e:
+            logger.error(f"[finally] 병합 실패: {e}")
         _flush_overwrite_log()
         _notify(f"{ts_prefix()} {PROGRAM_NAME} 종료", tele=True)
         logger.info("=== WSS END ===")

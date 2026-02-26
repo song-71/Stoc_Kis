@@ -108,8 +108,9 @@ nohup 실행:
 
 wss 데이터 저장위치 : /home/ubuntu/Stoc_Kis/data/wss_data/
 
+cd /home/ubuntu/Stoc_Kis
 git add ws_realtime_subscribe_to_DB-1.py
-git commit -m "feat: 260226_1610, 파일저장방식 개선(일괄 → 1000개단위 저장 복원)  *시스템 다운 방지"
+git commit -m "feat: 260226_1810, 셧다운시 메모리 파일만 저장토록 개선"
 git push
 """
 

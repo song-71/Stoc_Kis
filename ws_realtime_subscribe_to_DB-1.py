@@ -107,6 +107,11 @@ nohup 실행:
 
 
 wss 데이터 저장위치 : /home/ubuntu/Stoc_Kis/data/wss_data/
+
+
+git add ws_realtime_subscribe_to_DB-1.py
+git commit -m "feat: 테스트"
+git push
 """
 
 import sys

@@ -113,12 +113,13 @@ def _merge_date_group(
             final_path.rename(bad)
             logger.warning(f"{base_msg} invalid parquet → {bad.name}")
 
-    # parts 읽기
+    # parts 읽기 (스키마 불일치 방지: 개별 읽기 후 permissive 병합)
     _progress(f"{base_msg} parts 읽는 중 ({len(parts)}개)...")
-    dataset = ds.dataset([str(p) for p in parts], format="parquet")
-    tables.append(dataset.to_table())
+    for p in parts:
+        if _is_valid_parquet(p):
+            tables.append(pq.read_table(p))
 
-    combined = pa.concat_tables(tables, promote_options="permissive") if len(tables) > 1 else tables[0]
+    combined = pa.concat_tables(tables, promote_options="permissive")
 
     # recv_ts 정렬 (있으면)
     _progress(f"{base_msg} 정렬 중...")
@@ -126,6 +127,11 @@ def _merge_date_group(
     if "recv_ts" in df.columns:
         try:
             df = df.sort_values("recv_ts", kind="mergesort").reset_index(drop=True)
+            before = len(df)
+            df = df.drop_duplicates(subset=["recv_ts"]).reset_index(drop=True)
+            removed = before - len(df)
+            if removed:
+                logger.info(f"{base_msg} 중복 제거: {removed:,}건")
         except Exception:
             pass
     combined = pa.Table.from_pandas(df, preserve_index=False)

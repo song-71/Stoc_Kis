@@ -114,6 +114,11 @@ cd /home/ubuntu/Stoc_Kis
 git add ws_realtime_subscribe_to_DB-1.py
 git commit -m "feat: 260226_1810, 셧다운시 메모리 파일만 저장토록 개선"
 git push
+
+cd /home/ubuntu/Stoc_Kis
+git add -A
+git commit -m "feat: DB-1 파일명 변경 후 전체 파일 커밋"
+git push
 """
 
 import sys

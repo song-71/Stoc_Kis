@@ -6,8 +6,10 @@ Str1 실전 실시간 매도 전략 모듈
     → 시초가 시장가 매도 주문 (09:00 동시호가에 체결)
     → 예상가 복귀(prdy_ctrt>=0 또는 antc>=매수가) 시 주문 취소
   - 09:00 이후 (정규장): 다음 조건 중 하나 충족 시 즉시 시장가 매도
-    ① bidp1 < wghn_avrg_stck_prc  (가중평균 하락)
-    ② ma50 < ma500                 (데드크로스)
+    ① bidp1*(1-slippage) < wghn_avrg_stck_prc  (가중평균 하락, 슬리피지 적용)
+    ② Up_trend and ma500 < ma2000  (EMA 상승추세 중 ma500/ma2000 데드크로스)
+       - Up_trend: ma50 > ma200 > ma300 > ma500 > ma2000 > wghn_avrg_stck_prc
+    ③ prdy_ctrt < 0  (전일종가 이하 하락)
   - 종목당 1회 매도, 매도 후 종료
   - 수수료·세금 포함 실수익 계산
 
@@ -92,22 +94,39 @@ def check_realtime_sell(
     bidp1: float,
     wghn_avrg: float,
     ma50: float,
+    ma200: float,
+    ma300: float,
     ma500: float,
+    ma2000: float,
     stck_oprc: float,
+    slippage_rate: float = 0.0,
 ) -> tuple[bool, str]:
     """
     09:00 이후 실시간 매도 조건 판단.
 
     - stck_oprc <= 0: 시초가 미형성 → 거래 미개시, 매도 안 함
-    - ① bidp1 < wghn_avrg_stck_prc : 가중평균가 하락 → 즉시 매도
-    - ② ma50 < ma500               : 데드크로스 → 즉시 매도
+    - ① bidp1*(1-slippage) < wghn_avrg_stck_prc : 가중평균가 하락 (슬리피지 적용)
+    - ② Up_trend and ma500 < ma2000             : EMA 상승추세 중 ma500/ma2000 데드크로스
+       Up_trend: ma50 > ma200 > ma300 > ma2000 > wghn_avrg (EMA 정배열 유지)
+       ma500 < ma2000 이면 매도 (상승추세 붕괴)
     """
     if stck_oprc <= 0:
         return False, ""
-    if bidp1 > 0 and wghn_avrg > 0 and bidp1 < wghn_avrg:
-        return True, "str1_wghn_하락"
-    if ma50 > 0 and ma500 > 0 and ma50 < ma500:
-        return True, "str1_ma50_ma500_데드크로스"
+    # ① 가중평균 하락 (슬리피지 적용)
+    if bidp1 > 0 and wghn_avrg > 0:
+        effective_bidp1 = bidp1 * (1.0 - slippage_rate)
+        if effective_bidp1 < wghn_avrg:
+            return True, "str1_wghn_하락"
+    # ② Up_trend and ma500 < ma2000 (상승추세 중 ma500/ma2000 데드크로스)
+    # Up_trend: ma50 > ma200 > ma300 > ma500 > ma2000 > wghn_avrg 인 구조
+    # market_sell: Up_trend 상태에서 ma500 < ma2000 (추세 붕괴)
+    # → (ma50>ma200>ma300>ma2000>wghn) 유지 시 ma500이 ma2000 아래로 돌파하면 매도
+    if (
+        ma50 > 0 and ma200 > 0 and ma300 > 0 and ma500 > 0 and ma2000 > 0 and wghn_avrg > 0
+        and (ma50 > ma200 > ma300 > ma2000 > wghn_avrg)
+        and (ma500 < ma2000)
+    ):
+        return True, "str1_Up_trend_ma500_ma2000_데드크로스"
     return False, ""
 
 

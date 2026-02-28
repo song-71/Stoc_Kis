@@ -17,7 +17,7 @@ from zoneinfo import ZoneInfo
 from pathlib import Path
 import pandas as pd
 
-TARGET_DATE = "260225"  # YYMMDD, 비어있으면 오늘
+TARGET_DATE = ""  # YYMMDD, 비어있으면 오늘
 DEFAULT_DIR = Path("/home/ubuntu/Stoc_Kis/data/fetch_top_list/1m_fetch")
 BACKUP_SUBDIR = "backup"
 

@@ -1,5 +1,5 @@
 """
-09:01 ~ 15:09 매 1분마다 등락률 상위 Top30을 조회하여 CSV 저장
+08:50 ~ 15:09 매 1분마다 등락률 상위 Top30을 조회하여 CSV 저장
 15:10 도달 시 당일 CSV 전체를 하나로 병합 후, 원본은 backup 폴더로 이동
 syw_2 계정 사용
 
@@ -7,7 +7,8 @@ nohup 실행:
 nohup /home/ubuntu/Stoc_Kis/venv/bin/python -u /home/ubuntu/Stoc_Kis/fetch_top30_each_1m.py > /home/ubuntu/Stoc_Kis/out/fetch_top30_each_1m.out 2>&1 &
 
 로그 보기:
-tail -f /home/ubuntu/Stoc_Kis/out/fetch_Top30_each_1m.out
+노협
+tail -f /home/ubuntu/Stoc_Kis/out/fetch_top30_each_1m.out
 
 프로세스 확인:
 pgrep -af fetch_top30_each_1m.py
@@ -197,7 +198,7 @@ if __name__ == "__main__":
         raise SystemExit(0)
 
     print("=" * 60)
-    start_msg = f"[{PROGRAM_NAME}] 프로그램 시작 — 당일 등락율 상위 Top30 1분단위 수집(09:01 ~ 15:09)"
+    start_msg = f"[{PROGRAM_NAME}] 프로그램 시작 — 당일 등락율 상위 Top30 1분단위 수집(08:50 ~ 15:09)"
     print(start_msg)
     print(f"저장 경로: {OUT_DIR}")
     print("=" * 60)
@@ -209,8 +210,8 @@ if __name__ == "__main__":
     today = now.date()
     today_str = now.strftime("%y%m%d")
 
-    # 시작 시각: 09:01 (이미 지났으면 다음 정각+1분)
-    start_time = datetime(today.year, today.month, today.day, 9, 1, 0, tzinfo=KST)
+    # 시작 시각: 08:50 (이미 지났으면 다음 정각+1분)
+    start_time = datetime(today.year, today.month, today.day, 8, 50, 0, tzinfo=KST)
     end_time = datetime(today.year, today.month, today.day, 15, 9, 0, tzinfo=KST)
     merge_time = datetime(today.year, today.month, today.day, 15, 10, 0, tzinfo=KST)
 
@@ -222,9 +223,9 @@ if __name__ == "__main__":
         _tele(end_msg)
         raise SystemExit(0)
 
-    # 09:01 이전이면 대기
+    # 08:50 이전이면 대기
     if now < start_time:
-        print(f"[{now.strftime('%H:%M:%S')}] 09:01까지 대기 중...")
+        print(f"[{now.strftime('%H:%M:%S')}] 08:50까지 대기 중...")
         _wait_until(start_time)
 
     # ── 매 1분 루프: 09:01 ~ 15:09 ──

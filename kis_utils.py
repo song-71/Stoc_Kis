@@ -104,6 +104,111 @@ def is_holiday() -> bool:
     return not is_open
 
 
+def _detect_config_version(raw: dict) -> int:
+    """config dict의 버전 감지. V2는 'users' 키 + _config_version=2."""
+    if raw.get("_config_version") == 2 and "users" in raw:
+        return 2
+    return 1
+
+
+class ConfigProxy(dict):
+    """V2 config를 V1 플랫 뷰로 투영하는 dict 서브클래스.
+
+    읽기: cfg.get("appkey") → users.{default_user}.accounts.main.appkey
+    쓰기: cfg["strategy_swap"] = {...} → raw["strategy_swap"] = {...}
+    직렬화: get_raw() → V2 원본 구조 반환
+    """
+
+    USER_KEYS = {"BOT_TOKEN", "CHAT_ID", "my_htsid", "htsid"}
+    ACCOUNT_KEYS = {"appkey", "appsecret", "cano", "acnt_prdt_cd", "exclude_cash"}
+
+    def __init__(self, raw: dict):
+        self._raw = raw
+        flat = self._build_flat(raw)
+        super().__init__(flat)
+
+    def _build_flat(self, raw: dict) -> dict:
+        flat = {}
+        # global keys (users 제외 모든 루트 키)
+        for k, v in raw.items():
+            if k != "users":
+                flat[k] = v
+        # default user → flat
+        uid = raw.get("default_user", "")
+        user = raw.get("users", {}).get(uid, {})
+        for k, v in user.items():
+            if k != "accounts":
+                flat[k] = v
+        # my_htsid 호환: V2에서 htsid로 저장되지만 기존 코드는 my_htsid 사용
+        if "htsid" in user and "my_htsid" not in flat:
+            flat["my_htsid"] = user["htsid"]
+        # main account → flat (appkey, cano 등)
+        main_acct = user.get("accounts", {}).get("main", {})
+        for k, v in main_acct.items():
+            flat[k] = v
+        # accounts dict 유지 (syw_2 접근용) - main 제외
+        if "accounts" in user:
+            flat["accounts"] = {
+                aid: dict(acfg) for aid, acfg in user["accounts"].items()
+                if aid != "main"
+            }
+        return flat
+
+    def __setitem__(self, key, value):
+        super().__setitem__(key, value)
+        # 쓰기 시 raw에도 반영
+        uid = self._raw.get("default_user", "")
+        users = self._raw.get("users", {})
+        user = users.get(uid, {})
+        main_acct = user.get("accounts", {}).get("main", {})
+
+        if key in self.ACCOUNT_KEYS and "main" in user.get("accounts", {}):
+            main_acct[key] = value
+        elif key in self.USER_KEYS and uid in users:
+            user[key] = value
+        else:
+            self._raw[key] = value
+
+    def get_raw(self) -> dict:
+        """V2 원본 구조 반환 (save_config에서 사용)."""
+        return self._raw
+
+
+def _migrate_config_to_v2(v1: dict) -> dict:
+    """V1 플랫 config → V2 users 중심 구조로 변환 (메모리 내)."""
+    htsid = v1.get("my_htsid", "default")
+
+    # main account (루트의 appkey/cano 등)
+    main_acct = {}
+    for k in ("appkey", "appsecret", "cano", "acnt_prdt_cd", "exclude_cash"):
+        if k in v1:
+            main_acct[k] = v1[k]
+
+    # 기존 accounts (syw_2 등)
+    old_accounts = v1.get("accounts", {})
+    accounts = {"main": main_acct}
+    for aid, acfg in old_accounts.items():
+        accounts[aid] = dict(acfg)
+
+    # user block
+    user = {
+        "htsid": htsid,
+        "BOT_TOKEN": v1.get("BOT_TOKEN", ""),
+        "CHAT_ID": v1.get("CHAT_ID", ""),
+        "accounts": accounts,
+    }
+
+    # global (users/account 키 제외한 나머지)
+    skip = {"appkey", "appsecret", "cano", "acnt_prdt_cd", "exclude_cash",
+            "BOT_TOKEN", "CHAT_ID", "my_htsid", "accounts"}
+    v2 = {"_config_version": 2, "default_user": htsid}
+    for k, v in v1.items():
+        if k not in skip:
+            v2[k] = v
+    v2["users"] = {htsid: user}
+    return v2
+
+
 def load_config(config_path: str = "config.json", account_id: str | None = None) -> Dict[str, str]:
     """
     설정 파일을 읽어서 딕셔너리로 반환합니다.
@@ -121,21 +226,38 @@ def load_config(config_path: str = "config.json", account_id: str | None = None)
     """
     if not os.path.exists(config_path):
         raise FileNotFoundError(f"설정 파일을 찾을 수 없습니다: {config_path}")
-    
+
     with open(config_path, "r", encoding="utf-8") as f:
-        config = json.load(f)
-    
+        raw = json.load(f)
+
+    ver = _detect_config_version(raw)
+
+    if ver == 1:
+        # V1: account_id 지정 시 기존 병합 로직
+        if account_id:
+            accounts = raw.get("accounts", {})
+            if isinstance(accounts, dict) and account_id in accounts:
+                base_cfg = {k: v for k, v in raw.items() if k != "accounts"}
+                merged = dict(base_cfg)
+                merged.update(accounts.get(account_id, {}))
+                if "cano" in merged:
+                    merged.setdefault("cano1", merged.get("cano", ""))
+                    merged.setdefault("cano2", merged.get("cano", ""))
+                return merged
+        return raw  # V1은 기존대로 plain dict 반환
+
+    # V2: ConfigProxy로 감싸서 반환
     if account_id:
-        accounts = config.get("accounts", {})
-        if isinstance(accounts, dict) and account_id in accounts:
-            base_cfg = {k: v for k, v in config.items() if k != "accounts"}
-            merged = dict(base_cfg)
-            merged.update(accounts.get(account_id, {}))
-            if "cano" in merged:
-                merged.setdefault("cano1", merged.get("cano", ""))
-                merged.setdefault("cano2", merged.get("cano", ""))
-            return merged
-    return config
+        # V2에서 account_id 지정 시: 해당 계좌의 키를 플랫으로 오버라이드
+        uid = raw.get("default_user", "")
+        user = raw.get("users", {}).get(uid, {})
+        acct = user.get("accounts", {}).get(account_id, {})
+        if acct:
+            proxy = ConfigProxy(raw)
+            for k, v in acct.items():
+                dict.__setitem__(proxy, k, v)  # 플랫 뷰만 업데이트
+            return proxy
+    return ConfigProxy(raw)
 
 
 def resolve_account_config(config_path: str = "config.json", account_id: str | None = None) -> Dict[str, str]:
@@ -402,14 +524,15 @@ def pad_text(text: str, width: int, align: str = "left") -> str:
 
 
 def print_table(rows: list[dict], columns: list[str], align: dict[str, str],
-                max_rows: int | None = None) -> None:
+                max_rows: int | None = None, no_print: bool = False) -> str:
     """
-    한글 폭 보정 정렬 테이블 출력.
+    한글 폭 보정 정렬 테이블 출력 + 문자열 반환.
       max_rows=None : 전체 행 출력
       max_rows=20   : 앞 10행 + ... + 뒤 10행 (중간 생략)
+      no_print=True : stdout 출력 없이 문자열만 반환
     """
     if not rows:
-        return
+        return ""
     str_rows = []
     widths = {col: display_width(col) for col in columns}
     for row in rows:
@@ -428,28 +551,35 @@ def print_table(rows: list[dict], columns: list[str], align: dict[str, str],
     else:
         show_rows = str_rows
     # 헤더 + 구분선
-    header = "  ".join(pad_text(col, widths[col], "left") for col in columns)
-    print(header)
-    print("  ".join("-" * widths[col] for col in columns))
+    lines: list[str] = []
+    header = "  ".join(pad_text(col, widths[col], align.get(col, "left")) for col in columns)
+    lines.append(header)
+    lines.append("  ".join("─" * widths[col] for col in columns))
     # 행 출력
     for srow in show_rows:
         if srow is None:
-            print("  ".join(pad_text("...", widths[col], "center") for col in columns))
+            lines.append("  ".join(pad_text("...", widths[col], "center") for col in columns))
         else:
-            print("  ".join(pad_text(srow[col], widths[col], align.get(col, "left")) for col in columns))
-    print(f"[{n} rows x {len(columns)} columns]")
+            lines.append("  ".join(pad_text(srow[col], widths[col], align.get(col, "left")) for col in columns))
+    result = "\n".join(lines)
+    if not no_print:
+        print(result)
+        print(f"[{n} rows x {len(columns)} columns]")
+    return result
 
 
 def save_config(config: Dict[str, str], config_path: str = "config.json") -> None:
     """
     설정을 파일에 저장합니다.
-    
-    Args:
-        config: 저장할 설정 딕셔너리
-        config_path: 설정 파일 경로 (기본값: config.json)
+    ConfigProxy인 경우 V2 raw 구조로 저장합니다.
     """
+    # ConfigProxy면 V2 raw 구조로 저장
+    if isinstance(config, ConfigProxy):
+        raw = config.get_raw()
+    else:
+        raw = config
     with open(config_path, "w", encoding="utf-8") as f:
-        json.dump(config, f, ensure_ascii=False, indent=2)
+        json.dump(raw, f, ensure_ascii=False, indent=2)
 
 
 def get_config_value(config: Dict[str, str], key: str, default: Optional[str] = None) -> Optional[str]:
@@ -465,6 +595,38 @@ def get_config_value(config: Dict[str, str], key: str, default: Optional[str] = 
         설정 값 또는 기본값
     """
     return config.get(key, default)
+
+
+def get_user_config(config: dict, user_id: str | None = None) -> dict:
+    """V2 config에서 특정 사용자 설정 반환."""
+    raw = config.get_raw() if isinstance(config, ConfigProxy) else config
+    if _detect_config_version(raw) < 2:
+        return config
+    uid = user_id or raw.get("default_user", "")
+    return raw.get("users", {}).get(uid, {})
+
+
+def get_account_config(config: dict, account_id: str, user_id: str | None = None) -> dict:
+    """V2 config에서 특정 계좌 설정 반환."""
+    user = get_user_config(config, user_id)
+    return user.get("accounts", {}).get(account_id, {})
+
+
+def migrate_config_file_to_v2(config_path: str = "config.json") -> None:
+    """V1 config 파일을 V2로 변환 (백업 생성)."""
+    import shutil
+
+    with open(config_path, "r", encoding="utf-8") as f:
+        raw = json.load(f)
+    if _detect_config_version(raw) >= 2:
+        return  # 이미 V2
+    # 백업
+    backup_path = config_path + ".v1.bak"
+    shutil.copy2(config_path, backup_path)
+    # 변환 + 저장
+    v2 = _migrate_config_to_v2(raw)
+    with open(config_path, "w", encoding="utf-8") as f:
+        json.dump(v2, f, ensure_ascii=False, indent=2)
 
 
 def load_checkpoints(config_path: str = "config.json") -> Dict[str, str]:
@@ -771,15 +933,23 @@ def list_s3_1d_paths(layout: KisDataLayout, date_from: str, date_to: str) -> lis
     return sorted(paths)
 
 
-def _kr_tick_size(price: float) -> int:
-    if price < 1000:
-        return 1
-    if price < 5000:
-        return 5
+def _kr_tick_size(price: float, market: str = "KOSPI") -> int:
+    """호가단위 반환. KOSDAQ은 2,000원 미만 1원, 10,000~50,000원 구간 10원."""
+    is_kosdaq = str(market).upper() == "KOSDAQ"
+    if is_kosdaq:
+        if price < 2000:
+            return 1
+        if price < 5000:
+            return 5
+    else:
+        if price < 1000:
+            return 1
+        if price < 5000:
+            return 5
     if price < 10000:
         return 10
     if price < 50000:
-        return 50
+        return 10 if is_kosdaq else 50
     if price < 100000:
         return 100
     if price < 500000:
@@ -787,17 +957,42 @@ def _kr_tick_size(price: float) -> int:
     return 1000
 
 
-def calc_limit_up_price(prev_close: float) -> float:
-    if prev_close is None:
+def calc_limit_up_price(prev_close: float, market: str = "KOSPI") -> float:
+    """KRX 공식 상한가: 변동폭(기준가×30%)을 호가단위로 절사 → 기준가+변동폭을 호가단위로 절사."""
+    if prev_close is None or prev_close != prev_close or prev_close <= 0:
         return float("nan")
-    try:
-        if prev_close != prev_close:
-            return float("nan")
-    except Exception:
+    fluct_raw = prev_close * 0.3
+    tick_f    = _kr_tick_size(fluct_raw, market)
+    fluct     = int(fluct_raw / tick_f) * tick_f
+    raw_upper = prev_close + fluct
+    tick_u    = _kr_tick_size(raw_upper, market)
+    return int(raw_upper / tick_u) * tick_u
+
+
+def round_to_tick(price: float, market: str = "KOSPI") -> float:
+    """가격을 호가단위로 반올림."""
+    tick = _kr_tick_size(price, market)
+    return round(price / tick) * tick
+
+
+def price_minus_one_tick(price: float, market: str = "KOSPI") -> float:
+    """가격에서 1틱 낮춘 가격 반환."""
+    if price <= 0:
+        return price
+    tick = _kr_tick_size(price, market)
+    return max(tick, price - tick)
+
+
+def calc_limit_down_price(prev_close: float, market: str = "KOSPI") -> float:
+    """KRX 공식 하한가: 변동폭(기준가×30%)을 호가단위로 절사 → 기준가-변동폭을 호가단위로 올림(ceil)."""
+    if prev_close is None or prev_close != prev_close or prev_close <= 0:
         return float("nan")
-    raw = prev_close * 1.3
-    tick = _kr_tick_size(raw)
-    return round(raw / tick) * tick
+    fluct_raw = prev_close * 0.3
+    tick_f    = _kr_tick_size(fluct_raw, market)
+    fluct     = int(fluct_raw / tick_f) * tick_f
+    raw_lower = prev_close - fluct
+    tick_l    = _kr_tick_size(raw_lower, market)
+    return -int(-raw_lower / tick_l) * tick_l   # ceil
 
 
 def _configure_duckdb_s3(con, config_path: str = "config.json") -> None:

@@ -230,7 +230,7 @@ def get_closing_buy_candidates(
     """
     종가매수 후보 선정. Select_Tr_target_list와 동일 조건 (58 제외, str1~5).
     반환: (codes, code_info) code_info[code] = {prev_close, name}
-    ws_realtime_subscribe_to_DB-1.py 15:19 호출용.
+    ws_realtime_trading.py 15:19 호출용.
     """
     base = Path(__file__).resolve().parent.parent
     path = parquet_path or str(base / "data" / "1d_data" / "kis_1d_unified_parquet_DB.parquet")

@@ -4,17 +4,17 @@
 
 | 대상 | 경로 | 담당 프로그램 | 비고 |
 |------|------|---------------|------|
-| **거래장부 (주문/체결)** | `data/trades/trades_all.parquet` | kis_Trading_1_LmUp_str.py (mode4) | **ws_realtime_subscribe_to_DB-1.py는 사용 안 함** |
-| 시세 틱 데이터 | `data/wss_data/{yymmdd}_wss_data.parquet` | ws_realtime_subscribe_to_DB-1 | 실시간/예상체결가 시세만 |
-| 체결통보 raw 로그 | `logs/ccnl_notice_{yymmdd}.log` | ws_realtime_subscribe_to_DB-1 | H0STCNI0 텍스트 (parquet 미포함) |
-| 종가매수 체결 수량 | `data/fetch_top_list/closing_filled_{yymmdd}.json` | ws_realtime_subscribe_to_DB-1 | code→체결수량 |
-| 종가매수 주문/상태 | `data/fetch_top_list/closing_buy_state_{yymmdd}.json` | ws_realtime_subscribe_to_DB-1 | 주문 목록, filled_qty 등 |
+| **거래장부 (주문/체결)** | `data/trades/trades_all.parquet` | kis_Trading_1_LmUp_str.py (mode4) | **ws_realtime_trading.py는 사용 안 함** |
+| 시세 틱 데이터 | `data/wss_data/{yymmdd}_wss_data.parquet` | ws_realtime_trading | 실시간/예상체결가 시세만 |
+| 체결통보 raw 로그 | `logs/ccnl_notice_{yymmdd}.log` | ws_realtime_trading | H0STCNI0 텍스트 (parquet 미포함) |
+| 종가매수 체결 수량 | `data/fetch_top_list/closing_filled_{yymmdd}.json` | ws_realtime_trading | code→체결수량 |
+| 종가매수 주문/상태 | `data/fetch_top_list/closing_buy_state_{yymmdd}.json` | ws_realtime_trading | 주문 목록, filled_qty 등 |
 
 ---
 
 ## 2. 장별 거래 기록 처리 현황
 
-### 2.1 ws_realtime_subscribe_to_DB-1.py (DB-1 메인 프로그램)
+### 2.1 ws_realtime_trading.py (ws_realtime_trading 메인 프로그램)
 
 #### 08:30~08:40 시간외 종가 (전일 미매수 추가 매수)
 
@@ -30,7 +30,7 @@
 | 항목 | 기록 위치 | 형식 |
 |------|-----------|------|
 | 시세 틱 | wss_data parquet | 실시간 체결가 (SAVE_REAL_REGULAR 시간대별) |
-| 주문/체결 | **없음** (DB-1은 정규장 매매 없음) | 종가매수만 수행 |
+| 주문/체결 | **없음** (ws_realtime_trading은 정규장 매매 없음) | 종가매수만 수행 |
 | trades_all.parquet | **기록 안 함** | - |
 
 #### 15:20~15:30 종가 동시호가 (15:30 일괄 체결)
@@ -62,7 +62,7 @@
 | 시세 틱 | wss_data parquet | 예상/체결 (SAVE_REAL/EXP_OVERTIME) |
 | trades_all.parquet | **기록 안 함** | - |
 
-### 2.2 H0STCNI0 체결통보 처리 (ws_realtime_subscribe_to_DB-1)
+### 2.2 H0STCNI0 체결통보 처리 (ws_realtime_trading)
 
 ```
 체결통보 수신 → _write_ccnl_notice_log(텍스트 로그) + _on_ccnl_notice_filled(메모리/JSON)
@@ -81,23 +81,23 @@
 | 취소 시 | cancel | side, code, ord_no, cancel_qty |
 
 - **조건**: ENABLE_TRADE_LEDGER=True, CURRENT_RUN_MODE=4
-- DB-1은 이 프로그램과 별개로 동작 → DB-1의 종가매수 거래는 trades_all.parquet에 기록되지 않음
+- ws_realtime_trading은 이 프로그램과 별개로 동작 → ws_realtime_trading의 종가매수 거래는 trades_all.parquet에 기록되지 않음
 
 ---
 
 ## 3. 핵심 이슈
 
-1. **trades_all.parquet**는 Top Trading(mode4) 전용이며, **ws_realtime_subscribe_to_DB-1.py는 이 파일에 기록하지 않음**
-2. DB-1의 모든 주문/체결(08:30, 15:20, 15:40, 16:00~18:00)은 JSON + ccnl_notice 로그에만 의존
+1. **trades_all.parquet**는 Top Trading(mode4) 전용이며, **ws_realtime_trading.py는 이 파일에 기록하지 않음**
+2. ws_realtime_trading의 모든 주문/체결(08:30, 15:20, 15:40, 16:00~18:00)은 JSON + ccnl_notice 로그에만 의존
 3. 시세 parquet(wss_data)는 **가격/호가/거래량 틱**이며, **주문/체결 장부**와는 성격이 다름
 
 ---
 
 ## 4. 개선 권장 사항
 
-### 4.1 ws_realtime_subscribe_to_DB-1에 trades_all.parquet 기록 추가
+### 4.1 ws_realtime_trading에 trades_all.parquet 기록 추가
 
-**방향**: DB-1에서 주문·체결 발생 시 `data/trades/trades_all.parquet`에 append
+**방향**: ws_realtime_trading에서 주문·체결 발생 시 `data/trades/trades_all.parquet`에 append
 
 | 시점 | stage | 기록 필드 예시 |
 |------|-------|----------------|
@@ -129,6 +129,6 @@ fill_qty, fill_price, fill_amt, session, source
 
 ### 4.4 우선순위 제안
 
-1. **1단계**: DB-1 주문 시(order) trades_all.parquet에 order row 기록
+1. **1단계**: ws_realtime_trading 주문 시(order) trades_all.parquet에 order row 기록
 2. **2단계**: H0STCNI0 체결 시 fill row 기록 (가능한 필드만)
 3. **3단계**: kis_Trading과 스키마/소스 구분 정리, 중복/충돌 방지

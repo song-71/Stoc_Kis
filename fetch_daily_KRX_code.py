@@ -16,7 +16,7 @@ KRX 종목 코드 파일 생성
 직접 실행:
   /home/ubuntu/Stoc_Kis/venv/bin/python /home/ubuntu/Stoc_Kis/fetch__daily_KRX_code.py
 
-cron (매일 KST 08:20 = UTC 23:20 전날, DB-1과 동일 nohup 패턴):
+cron (매일 KST 08:20 = UTC 23:20 전날, ws_realtime_trading과 동일 nohup 패턴):
   20 23 * * * nohup /home/ubuntu/Stoc_Kis/venv/bin/python /home/ubuntu/Stoc_Kis/fetch__daily_KRX_code.py >> /home/ubuntu/Stoc_Kis/out/fetch_daily_KRX_code.log 2>&1 &
 
 nohup 실행:
@@ -30,6 +30,7 @@ nohup 실행:
 """
 
 import os
+import sys
 import zipfile
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -37,7 +38,7 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 import requests
 
-from kis_utils import load_kis_data_layout
+from kis_utils import is_holiday, load_kis_data_layout
 
 try:
     from telegMsg import tmsg
@@ -46,6 +47,19 @@ except Exception:
 
 KST = ZoneInfo("Asia/Seoul")
 PROGRAM_NAME = "fetch__daily_KRX_code"
+
+
+def _ts_prefix() -> str:
+    return datetime.now(KST).strftime(f"[%y%m%d_%H%M%S_{PROGRAM_NAME}]")
+
+
+def _notify(msg: str, tele: bool = False) -> None:
+    print(msg)
+    if tele and tmsg is not None:
+        try:
+            tmsg(msg, "-t")
+        except Exception:
+            pass
 
 
 STANDARD_COLUMNS = [
@@ -648,11 +662,15 @@ def _append_to_daily_db(df: pd.DataFrame, db_path: str) -> bool:
 
 
 def main() -> None:
-    if tmsg is not None:
-        try:
-            tmsg(f"[{PROGRAM_NAME}] 프로그램 시작", "-t")
-        except Exception:
-            pass
+    # 휴일 체크: 휴장일이면 프로그램 종료
+    if is_holiday():
+        msg = f"{_ts_prefix()} {PROGRAM_NAME} => 오늘은 휴일이므로 프로그램을 종료합니다."
+        _notify(msg, tele=True)
+        sys.exit(0)
+    else:
+        msg = f"{_ts_prefix()} {PROGRAM_NAME} => 오늘은 개장일이므로 프로그램을 시작합니다."
+        _notify(msg, tele=True)
+
     base_dir = os.path.dirname(os.path.abspath(__file__))
     default_dir = os.path.join(base_dir, "data", "admin", "symbol_master")
     os.makedirs(default_dir, exist_ok=True)

@@ -13,7 +13,7 @@
     15:59~18:00: overtime_exp_ccnl_krx + overtime_ccnl_krx
 
 => 현재 지정된 목록에 대해서만 웹소켓 수신 => 웹소켓 수신 및 저장 잘됨.
-(매일 자동화 가능=> 현재 DB-1파일로만 진행, DB-2는 자동화에서 제외함.)
+(매일 자동화 가능=> 현재 ws_realtime_trading.py로만 진행, DB-2는 자동화에서 제외함.)
 
 계정2(syw_2) 사용 : 한도 초과 시 계정1(메인)으로 재시도
 데이터 저장: /home/ubuntu/Stoc_Kis/data/wss_data-2/

@@ -12,7 +12,7 @@ os.environ["TZ"] = "Asia/Seoul"
 time.tzset()
 
 """
-  =============================================================================
+  =============================================================================2
 <<<  실행 옵션 >>>
   1: 계좌 잔고 조회(10초 간격 재 조회)
   2: open id 조회/정리
@@ -5362,7 +5362,7 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="보유 종목 조회 후 시장가 매도")
     ap.add_argument("--config", default="config.json", help="설정 파일 경로")
     ap.add_argument("--cano-key", default=None, help="config에서 계좌키 선택 (예: cano)")
-    ap.add_argument("--account-id", default=None, help="accounts 하위 계정 ID 선택")
+    ap.add_argument("--account-id", default="syw_2", help="accounts 하위 계정 ID 선택 (기본: syw_2)")
     ap.add_argument(
         "--run-mode",
         type=int,
@@ -5414,8 +5414,8 @@ def main() -> None:
 
     cano_key = _to_str(args.cano_key) or CANO_KEY
     cano = cfg.get(cano_key) or cfg.get(cano_key.upper())
-    acnt_prdt_cd = cfg.get("acnt_prdt_cd") or cfg.get("ACNT_PRDT_CD")
-    if not cano or not acnt_prdt_cd:
+    acnt_prdt_cd = cfg.get("acnt_prdt_cd") or cfg.get("ACNT_PRDT_CD") or "01"
+    if not cano:
         available = sorted([k for k in cfg.keys() if k.lower().startswith("cano") or k.lower() == "cano"])
         raise ValueError(
             f"CANO/ACNT_PRDT_CD가 필요합니다. config.json에 설정하세요. 사용가능 키: {available}"

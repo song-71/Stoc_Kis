@@ -10,6 +10,10 @@ END_DATE="$(date +%Y%m%d)"
 
 mkdir -p "${LOG_DIR}"
 
+# 오늘 로그를 제외한 이전 *_Daily_fetch_data.log 삭제
+TODAY_LOG="$(date +%Y%m%d)_Daily_fetch_data.log"
+find "${LOG_DIR}" -name "*_Daily_fetch_data.log" ! -name "${TODAY_LOG}" -delete
+
 # 휴일 체크 — 휴일이면 종료 (프로그램명 출력 + 텔레그램 전송)
 cd "${BASE_DIR}" || true
 if ! "${VENV_PY}" -c "
@@ -29,7 +33,6 @@ fi
 echo "===============================" >> "${LOG_FILE}"
 TS="$(date '+%Y-%m-%d %H:%M:%S %Z')"
 echo "[${TS}] started tz=${TZ} python=${VENV_PY} -> ${LOG_FILE}" >> "${LOG_FILE}"
-#nohup "${VENV_PY}" "${BASE_DIR}/kis_KRX_code_fetch.py" >> "${LOG_FILE}" 2>&1
 
 # 1일 1회 종목별 OHLCV 데이터(1d) 다운로드
 nohup "${VENV_PY}" "${BASE_DIR}/kis_1d_Daily_ohlcv_fetch_manager.py" --freq 1d --end "${END_DATE}" >> "${LOG_FILE}" 2>&1

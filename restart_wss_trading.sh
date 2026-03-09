@@ -1,9 +1,9 @@
 #!/bin/bash
-# ws_realtime_subscribe_to_DB-1.py 재시작 (기존 종료 후 업데이트 버전 실행)
+# ws_realtime_trading.py 재시작 (기존 종료 후 업데이트 버전 실행)
 set -e
-SCRIPT_NAME="ws_realtime_subscribe_to_DB-1.py"
+SCRIPT_NAME="ws_realtime_trading.py"
 SCRIPT="/home/ubuntu/Stoc_Kis/${SCRIPT_NAME}"
-OUT="/home/ubuntu/Stoc_Kis/out/wss_realtime_DB-1.out"
+OUT="/home/ubuntu/Stoc_Kis/out/wss_realtime_trading.out"
 PYTHON="/home/ubuntu/Stoc_Kis/venv/bin/python"
 
 echo "[restart] 기존 프로세스 종료 요청 (SIGTERM)..."

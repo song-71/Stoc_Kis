@@ -8,7 +8,7 @@
 QUERY_DATE = "all"
 
 CODE_TEXT = """
-예선테크
+넥사다이내믹스
 """
 
 import argparse

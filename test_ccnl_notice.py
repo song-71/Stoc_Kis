@@ -10,7 +10,7 @@ H0STCNI0 체결통보 구독 연결 테스트
 옵션: --tr-key-only  (1번만, 네트워크 없이)
       --tr-key sywems12 (직접 지정, 기본값: config의 my_htsid)
 
-주의: ws_realtime_subscribe_to_DB-1.py 등 다른 프로그램이 동일 appkey로
+주의: ws_realtime_trading.py 등 다른 프로그램이 동일 appkey로
       연결 중이면 "ALREADY IN USE appkey" 에러가 납니다. 해당 프로그램을
       중지한 뒤 테스트하세요.
 """

@@ -776,8 +776,14 @@ def _cancel_open_sell_orders_for_code(client, cano: str, acnt: str, code: str) -
 
 
 def _run_open_buy_order_cancel_on_startup() -> None:
-    """재시작 시 미체결 매수주문 전부 취소. 조회 → 현황 출력 → 취소 → 결과 출력."""
+    """재시작 시 미체결 매수주문 전부 취소. 조회 → 현황 출력 → 취소 → 결과 출력.
+    단, 16:00~18:00 시간외 단일가 시간대에는 기존 주문이 10분 주기로 자동 유지되므로 취소 스킵."""
     if not OPEN_BUY_ORDER_CANCEL:
+        return
+    # 16:00~18:00 시간외 단일가: 기존 주문이 다음 10분 주기 체결에 자동 유지되므로 취소하지 않음
+    nt = datetime.now(KST).time()
+    if dtime(16, 0) <= nt < dtime(18, 0):
+        _notify(f"{ts_prefix()} [미체결취소] 시간외 단일가 시간대(16:00~18:00) → 기존 주문 유지, 취소 스킵")
         return
     sys.stdout.write("\n")
     _notify(f"{ts_prefix()} [미체결취소] 매수주문 확인 중...")
@@ -7455,8 +7461,13 @@ if __name__ == "__main__":
     # ── 시작 즉시 계좌 잔고조회 → 보유종목 출력 + balance_map 취득 ──────────
     _startup_balance_map = _print_startup_balance()
 
-    # 재시작 시 미체결 매수주문 전부 취소 (OPEN_BUY_ORDER_CANCEL=True 시)
+    # 재시작 시 미체결 매수주문 전부 취소 (OPEN_BUY_ORDER_CANCEL=True 시, 16:00~18:00 제외)
     _run_open_buy_order_cancel_on_startup()
+
+    # 16:00 이후 재시작: 시간외 단일가 주문은 서버에 유지되므로 중복 주문 방지
+    if datetime.now(KST).time() >= dtime(16, 0):
+        _overtime_order_done = True  # noqa: F841 — 모듈 레벨 변수 직접 갱신
+        logger.info(f"{ts_prefix()} [시간외단일가] 16:00 이후 재시작 → 기존 주문 유지, 중복 주문 방지")
 
     # 15:20~15:30 재시작 시 미처리 종가매수 주문 재시도 (state 저장 기반)
     _run_closing_buy_retry_on_startup()

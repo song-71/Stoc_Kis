@@ -1,4 +1,8 @@
 """
+[260309] fix: 잔고조회 REST API를 별도 스레드로 분리 → ingest_loop 블로킹 해소
+  - _print_oca_monitor에서 _query_and_print_balance 동기 호출 → threading.Thread로 비동기 실행
+  - 매 60초 잔고조회 시 ingest_loop 2-3초 멈춤 → 수신 데이터 처리/저장 지연 해소
+
 시간대별로 서로 다른 TR 호출코드가 적용됨.
     정규장 실시간 체결가: ccnl_krx
     정규장 예상 체결가: exp_ccnl_krx
@@ -80,10 +84,14 @@ CLOSE_BUY = True
 STR1_SELL_ENABLED = True
 # VI 발동 매매 옵션: "test_mode"=1주만 매수/매도, "run_mode"=정상 매수/매도, "off"=적용 제외
 VI_TRADE_MODE = "off"
+# 상한가 스톱 연속 이탈 확인 틱 수 (서버 스톱지정가 대신 클라이언트에서 N틱 연속 확인 후 매도)
+STOP_LIMIT_CONFIRM_TICKS = 30
+
+# 직전 영업일 종가매수 선정 종목을 당일 base codes로 자동 사용
+AUTO_CODE_FROM_PREV_CLOSING = True
 
 # 재시작 시 미체결 매수주문 전부 취소 (True: 정정취소가능주문조회 후 취소, 주문번호 기록 없어도 가능)
 OPEN_BUY_ORDER_CANCEL = True
-INIT_CASH = 1_000_000  # 총 매수 한도(원), 종목당 균등분배
 # 08:30~08:40 시간외 종가 추가 매수 (True: 전일 미매수 종목에 전일종가 지정가 ORD_DVSN=02 매수)
 MORNING_EXTRA_CLOSING_PR_BUY = True
 
@@ -2297,8 +2305,9 @@ def _prepare_closing_buy_orders() -> None:
                 avail_cash = _get_account_available_cash(acct_client, acct)
             except Exception as e:
                 logger.warning(f"{ts_prefix()} [종가매수준비] {alias} 잔고조회 실패: {e}")
-                # 폴백: INIT_CASH 사용
-                avail_cash = max(0, INIT_CASH)
+                # 폴백: max_invest 사용
+                max_inv = float(str(acct.get("max_invest", "0") or 0).replace("_", "") or 0)
+                avail_cash = max(0, max_inv) if max_inv > 0 else 0
 
             if avail_cash <= 0:
                 logger.info(f"{ts_prefix()} [종가매수준비] {alias} 가용현금=0 → 스킵")
@@ -2857,6 +2866,36 @@ def _persist_subscription_codes(all_codes: list[str]) -> None:
         pass
 
 
+def _load_prev_closing_codes() -> list[str]:
+    """연도별 거래장부 parquet에서 직전 종가매수 종목코드 로드.
+    reason에 '종가매수'를 포함하는 행 중 가장 마지막 날짜의 code를 추출.
+    없으면 빈 리스트 → CODE_TEXT 폴백.
+    """
+    if not AUTO_CODE_FROM_PREV_CLOSING:
+        return []
+    try:
+        now = datetime.now(KST)
+        for year in [now.strftime("%Y"), str(int(now.strftime("%Y")) - 1)]:
+            path = LEDGER_DIR / f"trade_ledger_{year}.parquet"
+            if not path.exists():
+                continue
+            df = pd.read_parquet(path)
+            closing = df[df["reason"].astype(str).str.contains("종가매수", na=False)]
+            if closing.empty:
+                continue
+            last_date = closing["date"].max()
+            last_day = closing[closing["date"] == last_date]
+            codes = last_day["code"].astype(str).str.zfill(6).unique().tolist()
+            if codes:
+                logger.info(
+                    f"[codes] 거래장부({last_date}) 종가매수 {len(codes)}개 로드: {codes}"
+                )
+                return codes
+    except Exception as e:
+        logger.warning(f"[codes] 거래장부 parquet 로드 실패: {e}")
+    return []
+
+
 _loaded_top_added: list[str] = []  # config에서 복원한 top_added (초기화 전 임시 저장)
 
 def _load_codes_from_cfg(base_codes: list[str]) -> list[str]:
@@ -2915,7 +2954,12 @@ def _code_name_map() -> dict[str, str]:
         return {}
 
 
-_code_text_codes = _parse_codes(CODE_TEXT)  # CODE_TEXT 원본 (보호 대상)
+_prev_closing_codes = _load_prev_closing_codes()
+if _prev_closing_codes:
+    _code_text_codes = _prev_closing_codes
+else:
+    _code_text_codes = _parse_codes(CODE_TEXT)
+    logger.info(f"[codes] 직전 종가매수 없음 → CODE_TEXT 폴백({len(_code_text_codes)}개)")
 codes = _load_codes_from_cfg(_code_text_codes)
 if not codes:
     raise RuntimeError("CODE_TEXT에서 종목코드를 찾지 못했습니다.")
@@ -4029,6 +4073,7 @@ def _iter_enabled_accounts(trade_only: bool = False) -> list[dict]:
             "cano": cfg.get("cano", ""),
             "acnt_prdt_cd": cfg.get("acnt_prdt_cd", "01"),
             "exclude_cash": cfg.get("exclude_cash", "0"),
+            "max_invest": cfg.get("max_invest", "0"),
             "base_url": cfg.get("base_url") or DEFAULT_BASE_URL,
             "token_cache_path": str(SCRIPT_DIR / "kis_token_main.json"),
         }]
@@ -4058,6 +4103,7 @@ def _iter_enabled_accounts(trade_only: bool = False) -> list[dict]:
                 "cano": cano,
                 "acnt_prdt_cd": acfg.get("acnt_prdt_cd", "") or "01",
                 "exclude_cash": acfg.get("exclude_cash", "0"),
+                "max_invest": acfg.get("max_invest", "0"),
                 "base_url": base_url,
                 "token_cache_path": str(SCRIPT_DIR / token_name),
                 "trade_enabled": te,
@@ -4080,15 +4126,32 @@ def _init_account_client(acct: dict) -> KisClient:
 
 
 def _get_account_available_cash(client: KisClient, acct: dict) -> float:
-    """계좌의 주문가능금액 조회 (exclude_cash 차감)."""
+    """계좌의 투자가능금액 조회.
+    max_invest 설정 시: min(총평가-exclude, max_invest) - 보유평가
+    미설정 시: 주문가능금액 - exclude_cash (기존방식)
+    """
     cano = acct["cano"]
     acnt = acct.get("acnt_prdt_cd", "01") or "01"
-    exclude = float(acct.get("exclude_cash", "0") or 0)
+    exclude = float(str(acct.get("exclude_cash", "0") or 0).replace("_", "") or 0)
+    max_inv = float(str(acct.get("max_invest", "0") or 0).replace("_", "") or 0)
     try:
-        _, out2, _, _ = _get_balance_page(client, cano, acnt, "TTTC8434R")
+        hold_rows, out2, _, _ = _get_balance_page(client, cano, acnt, "TTTC8434R")
         items = [out2] if isinstance(out2, dict) else (out2 if isinstance(out2, list) else [])
-        if items:
-            ord_cash = float(str(items[0].get("prvs_rcdl_excc_amt", 0) or 0).replace(",", "") or 0)
+        if not items:
+            return 0.0
+        ord_cash = float(str(items[0].get("prvs_rcdl_excc_amt", 0) or 0).replace(",", "") or 0)
+
+        if max_inv > 0:
+            tot_eval = float(str(items[0].get("tot_evlu_amt", 0) or 0).replace(",", "") or 0)
+            stock_eval = sum(
+                float(str(r.get("evlu_amt", 0) or 0).replace(",", "") or 0)
+                for r in (hold_rows or [])
+                if int(float(str(r.get("hldg_qty", 0) or 0).replace(",", "") or 0)) > 0
+            )
+            budget = min(tot_eval - exclude, max_inv)
+            investable = max(0.0, budget - stock_eval)
+            return min(investable, ord_cash)
+        else:
             return max(0.0, ord_cash - exclude)
     except Exception as e:
         logger.warning(f"[multi-acct] {acct['account_id']} 잔고조회 실패: {e}")
@@ -4369,11 +4432,18 @@ def _try_vi_buy(code: str, name: str, antc_prce: float, stck_prpr: float) -> Non
         client = _top_client or _init_top_client()
         buy_price = stck_prpr if stck_prpr > 0 else antc_prce
         limit_up = calc_limit_up_price(buy_price)
-        # test_mode: 1주, run_mode: INIT_CASH 기반 수량
+        # test_mode: 1주, run_mode: max_invest 기반 수량
+        accts = _iter_enabled_accounts(trade_only=True)
+        main_acct = accts[0] if accts else {}
+        max_inv = float(str(main_acct.get("max_invest", "0") or 0).replace("_", "") or 0)
         if VI_TRADE_MODE == "test_mode":
             qty = 1
         else:
-            qty = max(1, int(INIT_CASH / buy_price))
+            try:
+                vi_avail = _get_account_available_cash(client, main_acct)
+            except Exception:
+                vi_avail = max_inv
+            qty = max(1, int(vi_avail / buy_price)) if vi_avail > 0 else 1
         j = _buy_order_cash(client, cano, acnt, "TTTC0802U", code, qty, limit_up, ord_dvsn="01")
         out = j.get("output") or {}
         ordno = str(out.get("ODNO") or out.get("odno") or "").strip()
@@ -5525,10 +5595,12 @@ def _top_rank_loop():
                     sys.stdout.write("\n")
                     _notify(msg_cl, tele=True)
                     n_sel = len(_closing_codes)
-                    per_alloc = INIT_CASH // n_sel if n_sel else 0
+                    _accts = _iter_enabled_accounts(trade_only=True)
+                    _max_inv = float(str((_accts[0] if _accts else {}).get("max_invest", "0") or 0).replace("_", "") or 0)
+                    per_alloc = int(_max_inv) // n_sel if n_sel else 0
                     _notify(
                         f"{ts_prefix()} [종가매매선정] 자원배분 | "
-                        f"총액={INIT_CASH:,}원 | 선정종목수={n_sel}개 | 종목당 배정액={per_alloc:,}원"
+                        f"총액={int(_max_inv):,}원 | 선정종목수={n_sel}개 | 종목당 배정액={per_alloc:,}원"
                     )
                     # 상세 선정 로그 (Phase 3-8)
                     for i, c in enumerate(_closing_codes):
@@ -6360,22 +6432,59 @@ def _check_str1_sell_conditions(
             ma500  = ema.get(500)  or 0.0
             ma2000 = ema.get(2000) or 0.0
 
-            # ── 상한가 근접(29%+) 스톱지정가 매도 (1회만) ──
+            # ── 상한가 근접(29%+) 클라이언트 스톱 매도 (연속 N틱 이탈 확인) ──
             with _str1_sell_state_lock:
                 _st_sl = _str1_sell_state.get(code, {})
                 _sl_ordered = _st_sl.get("stop_limit_ordered", False)
                 _sl_sold = _st_sl.get("sold", False)
-            if prdy_v >= 29.0 and not _sl_ordered and not _sl_sold and bidp1 > 0:
-                prev_close = bidp1 / (1 + prdy_v / 100)
-                if prev_close > 0:
-                    cndt_price = int(prev_close * 1.29)
-                    sell_price = int(prev_close * 1.28)
-                    _enqueue_str1_sell(
-                        code,
-                        f"str1_상한가_스톱지정가(prdy={prdy_v:.1f}%,조건={cndt_price:,},지정={sell_price:,})",
-                        ref_price=sell_price, ord_dvsn="22",
-                        price=sell_price, cndt_pric=cndt_price,
-                    )
+                _sl_monitoring = _st_sl.get("sl_monitoring", False)
+                _sl_cndt = _st_sl.get("sl_cndt_price", 0)
+                _sl_sell = _st_sl.get("sl_sell_price", 0)
+                _sl_below = _st_sl.get("sl_below_count", 0)
+            if not _sl_ordered and not _sl_sold and bidp1 > 0:
+                if prdy_v >= 29.0 and not _sl_monitoring:
+                    # ▶ 첫 29%+ 감지 → 모니터링 시작 (주문 안 함)
+                    prev_close = bidp1 / (1 + prdy_v / 100)
+                    if prev_close > 0:
+                        _cndt = int(prev_close * 1.29)
+                        _sell = int(prev_close * 1.28)
+                        with _str1_sell_state_lock:
+                            if code in _str1_sell_state:
+                                _str1_sell_state[code]["sl_monitoring"] = True
+                                _str1_sell_state[code]["sl_cndt_price"] = _cndt
+                                _str1_sell_state[code]["sl_sell_price"] = _sell
+                                _str1_sell_state[code]["sl_below_count"] = 0
+                        logger.info(
+                            f"{ts_prefix()} [스톱] {code} 29%+ 모니터링 시작"
+                            f" (조건={_cndt:,}, 지정={_sell:,})"
+                        )
+                elif _sl_monitoring and _sl_cndt > 0:
+                    # ▶ 모니터링 중 → 이탈 확인
+                    if bidp1 < _sl_cndt:
+                        new_count = _sl_below + 1
+                        with _str1_sell_state_lock:
+                            if code in _str1_sell_state:
+                                _str1_sell_state[code]["sl_below_count"] = new_count
+                        if new_count >= STOP_LIMIT_CONFIRM_TICKS:
+                            # N틱 연속 이탈 확인 → 지정가 매도
+                            _enqueue_str1_sell(
+                                code,
+                                f"str1_상한가_스톱({new_count}틱이탈,"
+                                f"조건={_sl_cndt:,},지정={_sl_sell:,})",
+                                ref_price=_sl_sell, ord_dvsn="00",
+                                price=_sl_sell,
+                            )
+                        else:
+                            logger.debug(
+                                f"{ts_prefix()} [스톱] {code} 이탈 {new_count}/{STOP_LIMIT_CONFIRM_TICKS}"
+                                f" bidp1={bidp1:,} < 조건={_sl_cndt:,}"
+                            )
+                    else:
+                        # 29% 이상 복귀 → 카운트 리셋
+                        if _sl_below > 0:
+                            with _str1_sell_state_lock:
+                                if code in _str1_sell_state:
+                                    _str1_sell_state[code]["sl_below_count"] = 0
 
             # ── VI 포지션 매도 판단 ──
             vi_pos = _vi_positions.get(code)
@@ -6453,6 +6562,34 @@ def _check_str1_sell_conditions(
         _print_oca_monitor(newly_triggered, now_ts, is_oca=is_oca)
 
 
+def _run_balance_monitor_bg(sell_lines: list[str]) -> None:
+    """별도 스레드에서 REST 잔고조회 + 결과 출력. ingest_loop 블로킹 방지."""
+    try:
+        nt = datetime.now(KST).time()
+        if dtime(8, 29) <= nt < dtime(9, 0):
+            bal_label = "장전 예상체결가 모니터링"
+        elif dtime(15, 20) <= nt < dtime(15, 30):
+            bal_label = "장마감 예상체결가 모니터링"
+        else:
+            bal_label = "보유종목 모니터링"
+
+        _query_and_print_balance(bal_label)
+
+        if sell_lines:
+            now_str = datetime.now(KST).strftime("%H:%M:%S")
+            sell_header = f"  ▼ 매도조건 ({len(sell_lines)}종목) ─────────────────────"
+            sell_msg = "\n".join([sell_header] + [f"    {l}" for l in sell_lines])
+            sys.stdout.write(f"{sell_msg}\n")
+            sys.stdout.flush()
+            logger.info(sell_msg)
+            tele_lines = [f"[매도조건 {now_str}]"]
+            tele_lines.append(f"▼ 매도조건 {len(sell_lines)}종목")
+            tele_lines.extend(sell_lines)
+            _notify("\n".join(tele_lines), tele=True)
+    except Exception as e:
+        logger.warning(f"{ts_prefix()} [balance_monitor_bg] {e}")
+
+
 def _print_oca_monitor(newly_triggered: list[str], now_ts: float, is_oca: bool = True) -> None:
     """
     Str1 포지션 모니터링 출력.
@@ -6462,7 +6599,7 @@ def _print_oca_monitor(newly_triggered: list[str], now_ts: float, is_oca: bool =
     - 15:20~15:30: 장마감 예상체결가
 
     ① 이번 틱에서 처음 매도조건 진입한 종목 → 즉시 출력 + 텔레그램
-    ② 60초마다 → 전체 감시 종목 요약 출력 (매도조건 / 이상없음 구분)
+    ② 60초마다 → REST 잔고조회를 별도 스레드에서 실행 (ingest_loop 블로킹 방지)
     """
     global _oca_last_summary_ts
 
@@ -6477,40 +6614,23 @@ def _print_oca_monitor(newly_triggered: list[str], now_ts: float, is_oca: bool =
         _notify(msg, tele=True)
         logger.info(msg)
 
-    # ② 1분 주기 요약 — REST API 잔고조회 기반 출력
+    # ② 1분 주기 요약 — REST API 잔고조회를 별도 스레드에서 실행
     if (now_ts - _oca_last_summary_ts) < OCA_SUMMARY_INTERVAL:
         return
     _oca_last_summary_ts = now_ts
 
-    # 매도조건 종목 먼저 확인 (WSS 캐시 기반)
+    # 매도조건 종목 먼저 확인 (WSS 캐시 기반 — 빠름)
     sell_lines: list[str] = []
     for code, w in sorted(_oca_watch.items()):
         if w.get("in_sell_cond"):
             sell_lines.append(_fmt_oca_alert_line(code, w))
 
-    # REST API 잔고조회 + 테이블 출력
-    nt = datetime.now(KST).time()
-    if dtime(8, 29) <= nt < dtime(9, 0):
-        bal_label = "장전 예상체결가 모니터링"
-    elif dtime(15, 20) <= nt < dtime(15, 30):
-        bal_label = "장마감 예상체결가 모니터링"
-    else:
-        bal_label = "보유종목 모니터링"
-
-    _query_and_print_balance(bal_label)
-
-    # 매도조건 종목이 있으면 추가 출력 + 텔레그램
-    if sell_lines:
-        now_str = datetime.now(KST).strftime("%H:%M:%S")
-        sell_header = f"  ▼ 매도조건 ({len(sell_lines)}종목) ─────────────────────"
-        sell_msg = "\n".join([sell_header] + [f"    {l}" for l in sell_lines])
-        sys.stdout.write(f"{sell_msg}\n")
-        sys.stdout.flush()
-        logger.info(sell_msg)
-        tele_lines = [f"[매도조건 {now_str}]"]
-        tele_lines.append(f"▼ 매도조건 {len(sell_lines)}종목")
-        tele_lines.extend(sell_lines)
-        _notify("\n".join(tele_lines), tele=True)
+    # REST 잔고조회 + 출력을 별도 스레드에서 실행 (ingest_loop 블로킹 방지)
+    threading.Thread(
+        target=_run_balance_monitor_bg,
+        args=(list(sell_lines),),
+        daemon=True,
+    ).start()
 
 
 def _get_str1_status_label(code: str) -> str:

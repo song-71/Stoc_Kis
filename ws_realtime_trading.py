@@ -949,6 +949,8 @@ def _query_and_print_balance(label: str, *, trade_only: bool = True,
                 _raw_nm = str(r.get("hts_kor_isnm", "") or "").strip()
                 if not _raw_nm or _raw_nm == code:
                     _raw_nm = code_name_map.get(code, code)
+                if code in _no_sell_codes:
+                    _raw_nm = f"{_raw_nm}[NS]"
                 hldg   = int(float(str(r.get("hldg_qty", 0) or 0).replace(",", "") or 0))
                 psbl   = int(float(str(r.get("ord_psbl_qty", 0) or 0).replace(",", "") or 0))
                 pchs   = float(str(r.get("pchs_avg_pric", 0) or 0).replace(",", "") or 0)
@@ -1440,6 +1442,70 @@ def _load_str1_sell_state_on_startup(balance_map: dict[str, dict] | None = None)
         _mkstatus_sub_add(set(added_for_sell))
 
 
+# ── no_sell_codes 로드/갱신/추가 ─────────────────────────────────────────────
+
+def _load_no_sell_codes() -> None:
+    """시작 시 config.json에서 no_sell_codes 로드."""
+    global _no_sell_codes
+    cfg = _read_cfg()
+    if not cfg:
+        return
+    raw = cfg.get("no_sell_codes", [])
+    if isinstance(raw, list):
+        _no_sell_codes = {str(c).strip().zfill(6) for c in raw if str(c).strip()}
+    if _no_sell_codes:
+        msg = f"{ts_prefix()} [no_sell] 매도금지 종목 로드: {sorted(_no_sell_codes)}"
+        _notify(msg, tele=True)
+        logger.info(msg)
+
+
+def _refresh_no_sell_from_cfg(cfg: dict) -> None:
+    """_check_external_orders() 에서 매 사이클 호출 → 변경 감지 시 갱신."""
+    global _no_sell_codes
+    raw = cfg.get("no_sell_codes", [])
+    new_set: set[str] = set()
+    if isinstance(raw, list):
+        new_set = {str(c).strip().zfill(6) for c in raw if str(c).strip()}
+    if new_set != _no_sell_codes:
+        added = new_set - _no_sell_codes
+        removed = _no_sell_codes - new_set
+        _no_sell_codes = new_set
+        parts = []
+        if added:
+            parts.append(f"추가={sorted(added)}")
+        if removed:
+            parts.append(f"해제={sorted(removed)}")
+        msg = f"{ts_prefix()} [no_sell] 매도금지 변경: {', '.join(parts)}"
+        _notify(msg, tele=True)
+        logger.info(msg)
+
+
+def _add_no_sell_code(code: str, source: str = "") -> None:
+    """런타임 추가 + config.json에 영구 저장."""
+    global _no_sell_codes
+    code = str(code).strip().zfill(6)
+    if code in _no_sell_codes:
+        return
+    _no_sell_codes.add(code)
+    # config.json에 저장
+    try:
+        cfg = _read_cfg()
+        if cfg is not None:
+            ns_list = cfg.get("no_sell_codes", [])
+            if not isinstance(ns_list, list):
+                ns_list = []
+            if code not in ns_list:
+                ns_list.append(code)
+            cfg["no_sell_codes"] = ns_list
+            save_config(cfg, str(CONFIG_PATH))
+    except Exception as e:
+        logger.warning(f"[no_sell] config 저장 실패: {e}")
+    src_label = f" (source={source})" if source else ""
+    msg = f"{ts_prefix()} [no_sell] 매도금지 추가: {code}{src_label}"
+    _notify(msg, tele=True)
+    logger.info(msg)
+
+
 def _str1_sell_worker() -> None:
     """
     별도 스레드: _str1_sell_queue에서 매도/취소 요청을 꺼내 KIS API로 처리.
@@ -1831,6 +1897,9 @@ def _enqueue_str1_sell(
     ord_dvsn: str = "01", price: float = 0.0, cndt_pric: float = 0.0,
 ) -> None:
     """ingest_loop에서 호출: 매도 조건 충족 시 sell worker에 비동기 주문 요청."""
+    if code in _no_sell_codes:
+        logger.debug(f"{ts_prefix()} [no_sell] 매도 차단: {code} 사유={reason}")
+        return
     is_stop_limit = (ord_dvsn == "22")
     with _str1_sell_state_lock:
         st = _str1_sell_state.get(code)
@@ -1902,6 +1971,7 @@ def _check_sell_by_prdy_ctrt_periodic() -> None:
             (code, dict(st))
             for code, st in _str1_sell_state.items()
             if not st.get("sold") and not st.get("sell_ordered") and not st.get("oca_ordered")
+            and code not in _no_sell_codes
         ]
 
     for code, st in targets:
@@ -2018,6 +2088,9 @@ _str1_sell_state_lock = threading.Lock()
 _str1_sell_queue: "queue.Queue[dict]" = queue.Queue()
 # 종목별 보유 계좌 매핑: _get_balance_holdings()에서 구축, 매도 시 올바른 계좌로 주문
 _code_account_map: dict[str, dict] = {}
+# ── 매도 금지 종목 (no_sell_codes) ─────────────────────────────────────────────
+# config.json의 no_sell_codes 배열에서 로드, 런타임 추가 가능
+_no_sell_codes: set[str] = set()
 # ── EMA 데드크로스 상태 기반 매도 ──────────────────────────────────────────────
 # up_trend 지속 상태: 정배열(ma50>ma200>ma300>ma500>ma2000>wghn) 유지 중이면 True
 _up_trend_state: dict[str, bool] = {}
@@ -3234,6 +3307,8 @@ def _check_external_orders() -> None:
         cfg = _read_cfg()
         if not cfg:
             return
+        # no_sell_codes 변경 감지 (매 사이클)
+        _refresh_no_sell_from_cfg(cfg)
         ext_orders = cfg.get("external_orders")
         if not ext_orders or not isinstance(ext_orders, list):
             return
@@ -3410,6 +3485,9 @@ def _exec_external_order(cfg: dict, order: dict, idx: int) -> None:
     if success_count > 0:
         order["result"] = "주문완료"
         order["remain_qty"] = 0
+        # no_sell 옵션: 매수 성공 시 매도 금지 목록에 자동 추가
+        if order_type == 1 and order.get("no_sell"):
+            _add_no_sell_code(sym.zfill(6), source="external_order")
     else:
         order["result"] = f"failed: {len(target_accounts)}계좌 전부 실패"
 
@@ -6385,6 +6463,19 @@ def _check_str1_sell_conditions(
                 }
                 continue
 
+            # no_sell 종목은 OCA 매도 스킵, 모니터링 캐시만 갱신
+            if code in _no_sell_codes:
+                prev_watch = _oca_watch.get(code, {})
+                _oca_watch[code] = {
+                    **prev_watch,
+                    "antc_prce": antc, "prdy_ctrt": prdy, "buy_price": buy_price,
+                    "in_sell_cond": False, "name": name, "qty": qty,
+                    "reason": "[no_sell]",
+                    "first_sell_ts": prev_watch.get("first_sell_ts"),
+                    "first_printed": prev_watch.get("first_printed", False),
+                }
+                continue
+
             should_sell, reason = check_opening_call_auction_sell(antc, prdy)
 
             # ── 장전 모니터링 상태 업데이트 ──
@@ -6439,58 +6530,59 @@ def _check_str1_sell_conditions(
             ma2000 = ema.get(2000) or 0.0
 
             # ── 상한가 근접(29%+) 클라이언트 스톱 매도 (연속 N틱 이탈 확인) ──
-            with _str1_sell_state_lock:
-                _st_sl = _str1_sell_state.get(code, {})
-                _sl_ordered = _st_sl.get("stop_limit_ordered", False)
-                _sl_sold = _st_sl.get("sold", False)
-                _sl_monitoring = _st_sl.get("sl_monitoring", False)
-                _sl_cndt = _st_sl.get("sl_cndt_price", 0)
-                _sl_sell = _st_sl.get("sl_sell_price", 0)
-                _sl_below = _st_sl.get("sl_below_count", 0)
-            if not _sl_ordered and not _sl_sold and bidp1 > 0:
-                if prdy_v >= 29.0 and not _sl_monitoring:
-                    # ▶ 첫 29%+ 감지 → 모니터링 시작 (주문 안 함)
-                    prev_close = bidp1 / (1 + prdy_v / 100)
-                    if prev_close > 0:
-                        _cndt = int(prev_close * 1.29)
-                        _sell = int(prev_close * 1.28)
-                        with _str1_sell_state_lock:
-                            if code in _str1_sell_state:
-                                _str1_sell_state[code]["sl_monitoring"] = True
-                                _str1_sell_state[code]["sl_cndt_price"] = _cndt
-                                _str1_sell_state[code]["sl_sell_price"] = _sell
-                                _str1_sell_state[code]["sl_below_count"] = 0
-                        logger.info(
-                            f"{ts_prefix()} [스톱] {code} 29%+ 모니터링 시작"
-                            f" (조건={_cndt:,}, 지정={_sell:,})"
-                        )
-                elif _sl_monitoring and _sl_cndt > 0:
-                    # ▶ 모니터링 중 → 이탈 확인
-                    if bidp1 < _sl_cndt:
-                        new_count = _sl_below + 1
-                        with _str1_sell_state_lock:
-                            if code in _str1_sell_state:
-                                _str1_sell_state[code]["sl_below_count"] = new_count
-                        if new_count >= STOP_LIMIT_CONFIRM_TICKS:
-                            # N틱 연속 이탈 확인 → 지정가 매도
-                            _enqueue_str1_sell(
-                                code,
-                                f"str1_상한가_스톱({new_count}틱이탈,"
-                                f"조건={_sl_cndt:,},지정={_sl_sell:,})",
-                                ref_price=_sl_sell, ord_dvsn="00",
-                                price=_sl_sell,
-                            )
-                        else:
-                            logger.debug(
-                                f"{ts_prefix()} [스톱] {code} 이탈 {new_count}/{STOP_LIMIT_CONFIRM_TICKS}"
-                                f" bidp1={bidp1:,} < 조건={_sl_cndt:,}"
-                            )
-                    else:
-                        # 29% 이상 복귀 → 카운트 리셋
-                        if _sl_below > 0:
+            if code not in _no_sell_codes:
+                with _str1_sell_state_lock:
+                    _st_sl = _str1_sell_state.get(code, {})
+                    _sl_ordered = _st_sl.get("stop_limit_ordered", False)
+                    _sl_sold = _st_sl.get("sold", False)
+                    _sl_monitoring = _st_sl.get("sl_monitoring", False)
+                    _sl_cndt = _st_sl.get("sl_cndt_price", 0)
+                    _sl_sell = _st_sl.get("sl_sell_price", 0)
+                    _sl_below = _st_sl.get("sl_below_count", 0)
+                if not _sl_ordered and not _sl_sold and bidp1 > 0:
+                    if prdy_v >= 29.0 and not _sl_monitoring:
+                        # ▶ 첫 29%+ 감지 → 모니터링 시작 (주문 안 함)
+                        prev_close = bidp1 / (1 + prdy_v / 100)
+                        if prev_close > 0:
+                            _cndt = int(prev_close * 1.29)
+                            _sell = int(prev_close * 1.28)
                             with _str1_sell_state_lock:
                                 if code in _str1_sell_state:
+                                    _str1_sell_state[code]["sl_monitoring"] = True
+                                    _str1_sell_state[code]["sl_cndt_price"] = _cndt
+                                    _str1_sell_state[code]["sl_sell_price"] = _sell
                                     _str1_sell_state[code]["sl_below_count"] = 0
+                            logger.info(
+                                f"{ts_prefix()} [스톱] {code} 29%+ 모니터링 시작"
+                                f" (조건={_cndt:,}, 지정={_sell:,})"
+                            )
+                    elif _sl_monitoring and _sl_cndt > 0:
+                        # ▶ 모니터링 중 → 이탈 확인
+                        if bidp1 < _sl_cndt:
+                            new_count = _sl_below + 1
+                            with _str1_sell_state_lock:
+                                if code in _str1_sell_state:
+                                    _str1_sell_state[code]["sl_below_count"] = new_count
+                            if new_count >= STOP_LIMIT_CONFIRM_TICKS:
+                                # N틱 연속 이탈 확인 → 지정가 매도
+                                _enqueue_str1_sell(
+                                    code,
+                                    f"str1_상한가_스톱({new_count}틱이탈,"
+                                    f"조건={_sl_cndt:,},지정={_sl_sell:,})",
+                                    ref_price=_sl_sell, ord_dvsn="00",
+                                    price=_sl_sell,
+                                )
+                            else:
+                                logger.debug(
+                                    f"{ts_prefix()} [스톱] {code} 이탈 {new_count}/{STOP_LIMIT_CONFIRM_TICKS}"
+                                    f" bidp1={bidp1:,} < 조건={_sl_cndt:,}"
+                                )
+                        else:
+                            # 29% 이상 복귀 → 카운트 리셋
+                            if _sl_below > 0:
+                                with _str1_sell_state_lock:
+                                    if code in _str1_sell_state:
+                                        _str1_sell_state[code]["sl_below_count"] = 0
 
             # ── VI 포지션 매도 판단 ──
             vi_pos = _vi_positions.get(code)
@@ -6500,49 +6592,51 @@ def _check_str1_sell_conditions(
                 # VI 최고가 갱신 (VI 매수 시점 이후 bidp1 기준, 일중최고가 사용 안 함)
                 if bidp1 > vi_pos.get("highest", 0):
                     vi_pos["highest"] = bidp1
-                vi_buy_price = vi_pos.get("buy_price", 0)
-                vi_buy_ts = vi_pos.get("buy_ts")
-                minutes_since = (datetime.now(KST) - vi_buy_ts).total_seconds() / 60.0 if vi_buy_ts else 999.0
-                vi_sell, vi_reason = check_vi_sell(
-                    bidp1, wghn, ma50, ma200, ma300, ma500, ma2000, oprc,
-                    highest_since_buy=vi_pos.get("highest", 0),
-                    buy_price=vi_buy_price,
-                    minutes_since_buy=minutes_since,
-                )
-                if vi_sell:
-                    vi_pos["sold"] = True
-                    _enqueue_str1_sell(code, vi_reason, bidp1)
+                if code not in _no_sell_codes:
+                    vi_buy_price = vi_pos.get("buy_price", 0)
+                    vi_buy_ts = vi_pos.get("buy_ts")
+                    minutes_since = (datetime.now(KST) - vi_buy_ts).total_seconds() / 60.0 if vi_buy_ts else 999.0
+                    vi_sell, vi_reason = check_vi_sell(
+                        bidp1, wghn, ma50, ma200, ma300, ma500, ma2000, oprc,
+                        highest_since_buy=vi_pos.get("highest", 0),
+                        buy_price=vi_buy_price,
+                        minutes_since_buy=minutes_since,
+                    )
+                    if vi_sell:
+                        vi_pos["sold"] = True
+                        _enqueue_str1_sell(code, vi_reason, bidp1)
             else:
                 # ── Str1 일반 매도 판단 (트레일스톱 포함) ──
                 with _str1_sell_state_lock:
                     _st = _str1_sell_state.get(code, {})
                     _buy_p = _st.get("buy_price", 0.0)
                     _highest = _st.get("highest", 0.0)
-                # Str1 최고가 갱신 (일중최고가 vs 매수호가 중 큰 값)
+                # Str1 최고가 갱신 (일중최고가 vs 매수호가 중 큰 값) — no_sell이어도 유지
                 tick_high = max(bidp1, hgpr)
                 if tick_high > _highest:
                     _highest = tick_high
                     with _str1_sell_state_lock:
                         if code in _str1_sell_state:
                             _str1_sell_state[code]["highest"] = _highest
-                should_sell, reason, cur_up = check_realtime_sell(
-                    bidp1, wghn, ma50, ma200, ma300, ma500, ma2000, oprc,
-                    was_up_trend=_up_trend_state.get(code, False),
-                    highest_since_buy=_highest,
-                    buy_price=_buy_p,
-                )
-                _up_trend_state[code] = cur_up
+                if code not in _no_sell_codes:
+                    should_sell, reason, cur_up = check_realtime_sell(
+                        bidp1, wghn, ma50, ma200, ma300, ma500, ma2000, oprc,
+                        was_up_trend=_up_trend_state.get(code, False),
+                        highest_since_buy=_highest,
+                        buy_price=_buy_p,
+                    )
+                    _up_trend_state[code] = cur_up
 
-                if should_sell:
-                    if "데드크로스" in reason:
-                        _ema_sell_cond[code] = True     # 매도 성공까지 유지용
-                    _enqueue_str1_sell(code, reason, bidp1)
-                elif prdy_v < 0:
-                    # 전일종가 이하 → 데드크로스 재시도보다 우선 (절대 손실 방지)
-                    _enqueue_str1_sell(code, f"전일종가하락(prdy_ctrt={prdy_v:.2f}%)", bidp1)
-                elif _ema_sell_cond.get(code, False):
-                    # 데드크로스 재시도는 전일종가 위일 때만
-                    _enqueue_str1_sell(code, "str1_Up_trend_ma500_ma2000_데드크로스", bidp1)
+                    if should_sell:
+                        if "데드크로스" in reason:
+                            _ema_sell_cond[code] = True     # 매도 성공까지 유지용
+                        _enqueue_str1_sell(code, reason, bidp1)
+                    elif prdy_v < 0:
+                        # 전일종가 이하 → 데드크로스 재시도보다 우선 (절대 손실 방지)
+                        _enqueue_str1_sell(code, f"전일종가하락(prdy_ctrt={prdy_v:.2f}%)", bidp1)
+                    elif _ema_sell_cond.get(code, False):
+                        # 데드크로스 재시도는 전일종가 위일 때만
+                        _enqueue_str1_sell(code, "str1_Up_trend_ma500_ma2000_데드크로스", bidp1)
 
             # ── 정규장 실시간 체결 시 모니터링 캐시 갱신 (stale 방지) ──
             with _str1_sell_state_lock:
@@ -6669,6 +6763,8 @@ def _fmt_oca_alert_line(code: str, w: dict, prefix: str = "") -> str:
 
     price_label = "예상가" if code in _single_price_codes else "현재가"
     parts = [name]
+    if code in _no_sell_codes:
+        parts.append("[no_sell]")
     parts.append(f"[{stat}]")
     parts.append(f"보유={qty}주")
     parts.append(f"{price_label}={antc:,.0f}" if antc > 0 else f"{price_label}=N/A")
@@ -7474,6 +7570,9 @@ if __name__ == "__main__":
 
     # Str1 매도 상태 복원 — 시작잔고 결과 전달 (중복 API 호출 없이 재사용)
     _load_str1_sell_state_on_startup(_startup_balance_map)
+
+    # 매도 금지 종목 로드
+    _load_no_sell_codes()
 
     # 당일 parts/FINAL → _ema_state, _price_buf 지표 복원 (재시작 연속성)
     _restore_state_on_startup()

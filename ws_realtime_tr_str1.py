@@ -45,7 +45,7 @@ def check_opening_call_auction_sell(
     """
     if antc_prce <= 0:
         return False, ""
-    PREMARKET_SELL_THRESHOLD = -0.5  # 장전 매도 임계값 (%)
+    PREMARKET_SELL_THRESHOLD = -3.0  # 장전 매도 임계값 (%)
     if prdy_ctrt < PREMARKET_SELL_THRESHOLD:
         return True, f"str1_시초가하락_예상({prdy_ctrt:+.2f}%)"
     return False, ""
@@ -120,16 +120,16 @@ def check_realtime_sell(
          → 다른 이유로 정배열 이탈일 뿐, up_trend 유지 (매도 안 함)
       ⑤ 그 외 → 매도 안 함, up_trend=False
     """
-    if stck_oprc <= 0:
-        return False, "", was_up_trend
-
-    # ⓪ 트레일링 스톱 — 최고가가 매수가 대비 3% 이상 상승한 경우에만 적용
+    # ⓪ 트레일링 스톱 — stck_oprc 여부와 무관하게 항상 판단
     if buy_price > 0 and highest_since_buy > 0:
         highest_vs_buy = highest_since_buy / buy_price - 1
         if highest_vs_buy >= trail_activate_pct:
             trail_level = highest_since_buy * (1 - trail_stop_pct)
             if bidp1 < trail_level:
                 return True, f"str1_트레일스톱(고가{int(highest_since_buy):,},+{highest_vs_buy*100:.1f}%)", was_up_trend
+
+    if stck_oprc <= 0:
+        return False, "", was_up_trend
 
     # ① 가중평균 대비 0.5% 하락 — up_trend 상태는 그대로 유지
     if bidp1 > 0 and wghn_avrg > 0 and bidp1 < wghn_avrg * 0.995:

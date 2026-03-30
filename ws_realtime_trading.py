@@ -5633,6 +5633,38 @@ def _to_float_closing(val) -> float:
         return 0.0
 
 
+def _sub_monthly_log_path() -> Path:
+    """월별 구독 이력 CSV 경로: wss_subscription_log_YYMM.csv"""
+    yymm = datetime.now(KST).strftime("%y%m")
+    return TOP_RANK_OUT_DIR / f"wss_subscription_log_{yymm}.csv"
+
+
+def _log_subscription_event(code: str, name: str, sub_type: str, action: str) -> None:
+    """월별 구독 이력 CSV에 1행 추가.
+    sub_type: base / top30 / vi / str1_sell / closing 등
+    action: 시작 / 추가 / 해제
+    """
+    TOP_RANK_OUT_DIR.mkdir(parents=True, exist_ok=True)
+    now = datetime.now(KST)
+    log_path = _sub_monthly_log_path()
+    write_header = not log_path.exists()
+    try:
+        with open(log_path, "a", encoding="utf-8-sig") as f:
+            if write_header:
+                f.write("date,time,type,code,name,action\n")
+            f.write(f"{now.strftime('%Y-%m-%d')},{now.strftime('%H:%M:%S')},{sub_type},{code},{name},{action}\n")
+    except Exception as e:
+        logger.warning(f"[sub_log] monthly write failed: {e}")
+
+
+def _log_base_codes_on_startup() -> None:
+    """프로그램 시작 시 base_codes(morning target)를 월별 CSV에 기록."""
+    for c in sorted(_base_codes):
+        name = code_name_map.get(c, c)
+        _log_subscription_event(c, name, "base", "시작")
+    logger.info(f"[sub_log] base_codes {len(_base_codes)}종목 월별 CSV 기록 완료")
+
+
 def _log_top_sub_event(code: str, name: str, action: str) -> None:
     """탑10 구독 추가/해제 이벤트를 CSV에 기록한다."""
     TOP_RANK_OUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -5645,6 +5677,8 @@ def _log_top_sub_event(code: str, name: str, action: str) -> None:
             f.write(f"{ts},{code},{name},{action}\n")
     except Exception as e:
         logger.warning(f"[top] sub log write failed: {e}")
+    # 월별 CSV에도 기록
+    _log_subscription_event(code, name, "top30", "추가" if action == "추가" else "해제")
 
 
 def _remove_code_structs(remove_codes: list[str], force: bool = False) -> list[str]:
@@ -8262,6 +8296,9 @@ if __name__ == "__main__":
 
     # 당일 parts/FINAL → _ema_state, _price_buf 지표 복원 (재시작 연속성)
     _restore_state_on_startup()
+
+    # 시작 시 base_codes를 월별 구독 이력 CSV에 기록
+    _log_base_codes_on_startup()
 
     # 워커 시작
     t_writer = threading.Thread(target=writer_loop, daemon=True)

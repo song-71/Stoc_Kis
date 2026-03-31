@@ -5454,7 +5454,10 @@ def _price_request_loop() -> None:
             )
             _price_req_count += 1
             last_req_ts = time.time()
-            _rest_fail_backoff.pop(code, None)  # 성공 → 거래정지 의심 해제
+            prev_fc = _rest_fail_backoff.pop(code, None)  # 성공 → 거래정지 의심 해제
+            if prev_fc:
+                name = code_name_map.get(code, code)
+                logger.info(f"{ts_prefix()} [price] REST 복구: {name}({code}) fc={prev_fc}→0")
             _halted_codes.discard(code)
             if is_stale_check:
                 _handle_stale_check_result(code, output)
@@ -7716,6 +7719,8 @@ def ingest_loop():
             )
             for df_code in tmp2.partition_by(code_col, maintain_order=True):
                 code = str(df_code[code_col][0])
+                if not code or code == "None" or code == "000000":
+                    continue
                 if prdy_col:
                     try:
                         _last_prdy_ctrt[code] = float(df_code[prdy_col][-1])
@@ -7952,7 +7957,11 @@ def _send_subscribe(kws, req, data, tr_type: str) -> None:
                 f"종목={', '.join(sorted(code_names))}"
             )
         except Exception as e:
-            logger.warning(f"{ts_prefix()} [{action} 실패] TR_ID={rid} err={e}")
+            code_names = [f"{code_name_map.get(c, c)}({c})" for c in chunk]
+            logger.warning(
+                f"{ts_prefix()} [{action} 실패] TR_ID={rid or 'unknown'} "
+                f"종목={', '.join(sorted(code_names))} err={e}"
+            )
 
 def _apply_subscriptions(kws, desired: dict, force: bool = False) -> None:
     """

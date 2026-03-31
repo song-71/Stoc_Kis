@@ -2609,7 +2609,7 @@ def _run_closing_buy_orders() -> None:
 
         # 10건씩 배치 (KIS API 초당 10건 제한)
         batches = [_closing_buy_prepared[i:i+10] for i in range(0, len(_closing_buy_prepared), 10)]
-        deferred_logs = []  # 후처리용 (notify + ledger)
+        ledger_records = []  # ledger 후처리용
 
         for batch_idx, batch in enumerate(batches):
             if batch_idx > 0:
@@ -2638,11 +2638,12 @@ def _run_closing_buy_orders() -> None:
                             "account_id": prep.get("account_id", "main"), "alias": alias,
                         })
                         acct_tag = f"[{alias}]" if alias else ""
-                        deferred_logs.append({
-                            "log_msg": (
-                                f"{ts_prefix()} [종가매수주문]{acct_tag} 종목명={name} | 주문유형=시장가 | 수량={qty} | "
-                                f"금액={amount_net:,} (상한가*수량-수수료) | {elapsed:.3f}s"
-                            ),
+                        # 주문 완료 즉시 로그 (체결통보보다 먼저 기록되도록)
+                        _notify(
+                            f"{ts_prefix()} [종가매수주문]{acct_tag} 종목명={name} | 주문유형=시장가 | 수량={qty} | "
+                            f"금액={amount_net:,} (상한가*수량-수수료) | {elapsed:.3f}s"
+                        )
+                        ledger_records.append({
                             "code": code, "name": name, "limit_up": float(limit_up),
                             "qty": qty, "ordno": ordno, "acct_tag": acct_tag,
                             "prdy_ctrt": float(prep.get("prdy_ctrt", 0.0)),
@@ -2651,9 +2652,8 @@ def _run_closing_buy_orders() -> None:
                     except Exception as e:
                         logger.warning(f"{ts_prefix()} [종가매수실패] {code} {alias}: {e}")
 
-        # 후처리 일괄 (주문 완료 후)
-        for rec in deferred_logs:
-            _notify(rec["log_msg"])
+        # ledger 기록 (주문 완료 후 일괄)
+        for rec in ledger_records:
             _append_ledger(
                 order_type="buy_order",
                 code=rec["code"], name=rec["name"],

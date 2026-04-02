@@ -92,7 +92,7 @@ def check_realtime_sell(
     highest_since_buy: float = 0.0,
     buy_price: float = 0.0,
     trail_activate_pct: float = 0.03,
-    trail_stop_pct: float = 0.008,
+    trail_stop_pct: float = 0.03,
 ) -> tuple[bool, str, bool]:
     """
     09:00 이후 실시간 매도 조건 판단 (EMA 데드크로스 + 트레일스톱 통합).
@@ -102,7 +102,7 @@ def check_realtime_sell(
       highest_since_buy: 매수 이후 최고 매수호가 (트레일스톱용)
       buy_price: 매입단가 (트레일스톱용)
       trail_activate_pct: 트레일스톱 활성화 기준 (매수가 대비 상승률, 기본 3%)
-      trail_stop_pct: 트레일스톱 하락 기준 (최고가 대비 하락률, 기본 0.8%)
+      trail_stop_pct: 트레일스톱 하락 기준 (최고가 대비 하락률, 기본 3%)
 
     Returns (should_sell, reason, is_up_trend):
       - should_sell : True이면 매도 주문
@@ -210,7 +210,7 @@ def check_vi_sell(
     buy_price: float,
     minutes_since_buy: float,
     trail_activate_pct: float = 0.03,
-    trail_stop_pct: float = 0.008,
+    trail_stop_pct: float = 0.03,
 ) -> tuple[bool, str]:
     """
     VI 매수 포지션 매도 조건.

@@ -52,19 +52,22 @@ def ts_prefix() -> str:
 
 
 # NXT 시간 범위: 프리마켓(08:00~08:50) + 애프터마켓(15:40~20:00)
+# 프리마켓은 50분이므로 10분 간격, 애프터마켓은 30분 간격 + 마지막 20:00 보장
 QUERY_TIMES = []
-# 프리마켓
+# 프리마켓 (10분 간격: 08:00, 08:10, 08:20, 08:30, 08:40, 08:50)
 _cur = datetime.strptime("080000", "%H%M%S")
 _pre_end = datetime.strptime("085000", "%H%M%S")
 while _cur <= _pre_end:
     QUERY_TIMES.append(_cur.strftime("%H%M%S"))
-    _cur += timedelta(minutes=30)
-# 애프터마켓
+    _cur += timedelta(minutes=10)
+# 애프터마켓 (30분 간격 + 20:00 보장)
 _cur = datetime.strptime("154000", "%H%M%S")
 _after_end = datetime.strptime("200000", "%H%M%S")
 while _cur <= _after_end:
     QUERY_TIMES.append(_cur.strftime("%H%M%S"))
     _cur += timedelta(minutes=30)
+if "200000" not in QUERY_TIMES:
+    QUERY_TIMES.append("200000")
 
 # NXT 허용 시간 범위 (이 범위 밖 데이터는 필터링)
 NXT_TIME_RANGES = [

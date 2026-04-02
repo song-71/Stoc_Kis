@@ -448,8 +448,8 @@ def main():
     # ── S3 업로드 (1m_nxt 경로) ──
     try:
         layout = load_kis_data_layout()
-        date_str = datetime.now(timezone(timedelta(hours=9))).strftime("%Y-%m-%d")
-        # 기존 1m 경로에서 1m_nxt로 변경
+        # biz_date(영업일) 기준으로 S3 경로 결정 (실행 시각이 아닌 데이터 날짜)
+        date_str = f"{biz_date[:4]}-{biz_date[4:6]}-{biz_date[6:8]}"
         s3_url = layout.s3_1m_date(date_str).replace("/1m/", "/1m_nxt/")
         s3_parts = s3_url.replace("s3://", "").split("/", 1)
         s3_bucket, s3_key = s3_parts[0], s3_parts[1]

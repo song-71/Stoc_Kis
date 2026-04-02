@@ -1,0 +1,232 @@
+# Stoc_Kis 프로그램 개선 이력
+
+---
+
+## [2026-04-02] 14594bf
+
+### 1. feat: FHPST01390000 REST 폴링 기반 전체 시장 VI 감지 추가
+- **카테고리**: feat
+- **파일**: `ws_realtime_trading.py`, `ws_monitoring_research_260402-2.md`
+- **사유**: WSS(H0STMKO0)는 구독 슬롯 한계(40개)로 전체 시장 VI를 감지할 수 없음. WSS 미수신 구간에서도 비구독 종목의 VI 발동을 감지하기 위해 REST API 폴링 방식을 추가 구현. 또한 a2 계좌 별도 WSS 연결 검토를 위한 TODO 추가 (고객센터 H0STMKO0 슬롯 카운트 확인 대기 중)
+- **주요 변경**:
+  1. **`_vi_poll_check()` 신규 함수** — FHPST01390000 API로 전체 종목 VI 현황 1회 조회. `_price_watchdog_loop`에서 WSS 5초 이상 전체 미수신 시 호출. 5초 이내 재호출 방지(중복 호출 차단)
+  2. **신규 VI 발동 감지 → 예상체결가 전환** — API 응답에서 vi_cls_code가 Y/1/2/3인 종목 추출. 구독 중인 종목이면 `_vi_exp_sub_add()` 호출로 즉시 예상체결가 전환. 비구독 종목은 모니터링 로그만 출력
+  3. **발동시각+2분 자동 해제** — `_vi_poll_expire_check()` 신규 함수. `_VI_DURATION_SEC=120`초 경과 시 `_vi_exp_sub_unsub()` 호출로 실시간체결가 복귀
+  4. **REST 응답 소멸 종목 즉시 해제** — 이전 폴링에 있던 종목이 다음 응답에서 사라지면(해제 확정) `_vi_poll_active_codes`에서 제거 후 구독 복귀
+  5. **TODO 주석 추가** — H0STMKO0가 WSS 구독 40슬롯에 포함되는지 고객센터 확인 중. 결과에 따라 kis_auth_llm.py 인스턴스별 open_map/approval_key 분리 검토
+- **영향**: WSS 구독 슬롯 외 전체 종목에 대한 VI 발동을 REST 폴링으로 보완. WSS 연결 단절 구간에서도 VI 감지 지속 가능
+
+---
+
+## [2026-04-02] 7feecd3
+
+### 1. fix: VI 예상체결가 타임아웃 단축 + 해제 시 실시간체결가 즉시 전환
+- **카테고리**: fix
+- **파일**: `ws_realtime_trading.py`
+- **사유**: VI 발동~해제 통상 소요 시간이 2:03~2:20초임을 확인. 기존 타임아웃 300초는 과도하여 150초(2분30초)로 단축. 또한 VI 해제 수신 시 실시간 체결가 구독이 즉시 복원되지 않아 일시적 데이터 공백이 발생하는 문제 수정
+- **주요 변경**:
+  1. **예상체결가 자동해제 타임아웃 단축** — `_price_watchdog_loop`의 fallback 타임아웃 300초 → 150초로 변경. H0STMKO0 해제 통보 미수신 시에도 2분30초 내 자동 해제
+  2. **VI 해제 후 실시간체결가 즉시 전환** — `_vi_exp_sub_worker`에서 tr_type="2"(해제) 처리 후 REGULAR_REAL 모드이고 구독 대상 종목이면 즉시 ccnl_krx(H0STCNT0) 재구독. VI 해제~실시간체결가 수신 사이 공백 제거
+  3. **name 변수 위치 이동** — try 블록 밖으로 이동하여 except 분기에서도 종목명 로그 출력 가능하도록 정리
+- **영향**: VI 해제 후 실시간 체결가 복원 지연 없음. 예상체결가 fallback 타임아웃이 줄어 비정상 구독 잔존 시간 단축
+
+---
+
+## [2026-04-02] ae92c53
+
+### 1. fix: VI감지/구독/장운영 안정성 6건 개선
+- **카테고리**: fix
+- **파일**: `ws_realtime_trading.py`, `ws_monitoring_research_260402-2.md`
+- **사유**: 260402 모니터링 리서치(Issue 4~8)에서 발견된 VI 감지 오동작, 데드락, 구독 누락, 종가매매 WSS 조기종료, 사이드카/서킷브레이크 미감지, 사전구독해제 후 재구독 문제 6건을 일괄 수정
+- **주요 변경**:
+  1. **vi_cls_code 분기 수정** — `!= "0"` 비교를 `== "Y"` / `== "N"` 으로 교체. H0STMKO0 PDF 확인 결과 실제 값은 Y/N (숫자 아님). 미정의 값은 별도 info 로그로 처리
+  2. **_vi_exp_sub_add/unsub 데드락 해결** — asyncio 이벤트 루프 내 on_result 콜백에서 `_kws_lock` 직접 취득 시 데드락 발생. `_vi_exp_sub_worker()` 함수 신규 추가, 구독/해제를 `threading.Thread(daemon=True)`로 위임하여 해결
+  3. **_desired_subscription_map에 _vi_active_codes 반영** — VI 발동 중 종목(`_vi_active_codes`)이 구독맵에서 누락되어 WSS 재연결 시 예상체결가 구독이 사라지는 문제 수정. `vi_codes = (_vi_delayed_codes | _vi_active_codes) & all_codes`
+  4. **run_ws_forever 종가매매 구간 WSS 유지** — 보유종목이 없을 때 WSS를 즉시 종료하던 로직에서, `15:20~15:31` 또는 `_closing_codes` 존재 시 예외 처리 추가. 종가매매 예상체결가 모니터링 지속
+  5. **H0STMKO0 mkop_cls_code 처리 추가** — 사이드카(187/388/397/398), 서킷브레이크(174/175/182/184/185), 임시정지(164) 코드 감지 시 `logger.warning` + 텔레그램 알림. 해제 코드 수신 시 `_market_event` 자동 클리어. `_enqueue_rest_price_row`에 `new_mkop_cls_code`, `market_event` 컬럼 추가
+  6. **15:19~15:20 사전구독해제 후 재구독 방지** — `_pre_unsub_closing_done=True` 이후 `RunMode.REGULAR_REAL` 상태에서 scheduler가 구독을 재적용하는 문제 차단
+- **영향**: VI 발동/해제가 정확히 감지되고 예상체결가 구독이 안정적으로 유지됨. 사이드카/서킷브레이크 등 장운영 이벤트 텔레그램 알림 추가. 종가매매 구간 모니터링 안정성 향상
+
+---
+
+## [2026-03-31] ed281b2
+- **Category**: fix
+- **Title**: 종가매수 주문 로그 즉시 출력 + 일일 리뷰 로그 순서 역전 감지 추가
+- **Files**: `ws_realtime_trading.py`, `ws_log_monitor.py`
+- **Changes**:
+  1. `ws_realtime_trading.py`: `_run_closing_buy_orders` 내 `deferred_logs` 방식 폐기
+     → `as_completed` 루프 내에서 `_notify` 즉시 호출, 체결통보 WSS 콜백보다 주문send 로그가 먼저 기록되도록 출력 시점 수정
+     → ledger 기록(`_append_ledger`)만 `ledger_records`로 후처리 유지, 병렬전송 구조 변경 없음
+  2. `ws_log_monitor.py`: 일일 리뷰 프롬프트에 "로그 순서 역전 감지" 분석 항목 추가
+     → 주문send/체결통보 등 논리적 선후관계가 뒤바뀐 로그 쌍을 식별하고 원인/개선방안 제시 요청
+- **Impact**: 종가매수 주문 로그가 체결통보보다 먼저 기록되어 로그 흐름의 논리적 순서 복원, 일일 분석 품질 향상
+
+---
+
+## [2026-03-31] 6eb749c
+- **Category**: fix
+- **Title**: 260331 모니터링 이슈 3건 개선
+- **Files**: `ws_realtime_trading.py`
+- **Changes**:
+  1. `_send_subscribe` except절에 종목코드/이름 추가 — 구독 실패 시 어떤 종목인지 로그에 기록
+  2. `ingest_loop` partition_by 루프에 `None`/`000000` 코드 필터링 추가 — mkop변경 처리 중 유령 코드 유입 방지
+  3. `_rest_fail_backoff.pop` 시 REST 복구 확인 로그 추가 — 거래정지 의심 해제 후 복구 추적 가능
+- **Impact**: 구독 실패/REST 복구 디버깅 가능성 향상, `mkop변경 None(None)` 유령 로그 제거
+
+---
+
+## 2026-03-31
+
+### 1. analysis: 거래 로그 정밀 분석 (wss_TR_260331.log)
+- **파일**: `out/monitor/review_260331.md` (신규)
+- **분석 대상**: `wss_TR_260331.log` (18,305줄)
+- **발견 이슈**:
+  1. REST RemoteDisconnected ×1, Read Timeout ×1, WS send timeout ×1 — 모두 자동 복구 확인
+  2. 구독 해제 close frame 경합 ×3 (15:20 종가전환 시점)
+- **LOG_WEAK 발견**:
+  1. `mkop변경 None(None)` 유령 로그 — ws_realtime_trading.py:7718 필터링 필요
+  2. 구독 실패 시 종목코드 미기록 — 디버깅 불가
+  3. REST 실패 복구 확인 로그 부재
+- **코드 개선 방안 4건 제안**:
+  1. mkop None 필터링 (ws_realtime_trading.py:7718)
+  2. 구독 실패 로그에 종목코드 추가
+  3. REST 실패 복구 로그 추가
+  4. 15:20 종가전환 WS close 경합 방지
+- **종합**: CRITICAL 에러 없음, 종가매수 8건 정상, 시간외 1건 체결, 691,522행 데이터 정상
+- **영향**: 4건의 코드 개선 방안이 도출되어 향후 로그 품질 및 안정성 향상 예정
+
+---
+
+## [2026-03-30] de281f6
+- **Category**: feat
+- **Title**: 실시간 거래 로그 모니터링 스크립트 추가 (log_monitor.py)
+- **Files**: `log_monitor.py` (신규), `.claude/agent-memory/changelog-manager/MEMORY.md` (신규), `.claude/agent-memory/changelog-manager/feedback_changelog_file.md` (신규)
+- **Changes**:
+  - `tail -F`로 `wss_TR_{yymmdd}.log` 실시간 감시
+  - CRITICAL / MODERATE / LOG_WEAK 심각도 3단계 분류
+  - CRITICAL 발생 시 즉시 텔레그램 알림 + Claude CLI로 긴급 수정안 파일 생성
+  - MODERATE는 30분 배치 집계 후 텔레그램 + Claude 일일 수정안 생성
+  - 18:10 자동으로 Claude가 전체 로그 정밀 분석 실행
+  - 5분 윈도우 중복 억제로 알림 스팸 방지
+  - 18:35 자동 종료, `--dry-run` 옵션으로 테스트 모드 지원
+  - 수정안 및 리뷰 파일은 `out/monitor/` 디렉토리에 저장
+- **Impact**: 장중 이상 로그 발생 시 자동으로 감지·분류·알림하여 수동 모니터링 부담 감소. CRITICAL 이슈는 즉시 수정안까지 자동 생성
+
+---
+
+## 2026-03-23
+
+### 1. fix: PNL 계산 버그 수정
+- **파일**: `ws_realtime_trading.py` (라인 1677, 1790 부근)
+- **문제**: `calc_sell_pnl(ref_price, ref_price, qty)` — buy_price 대신 ref_price를 2번 전달하여 수수료+세금만큼 항상 마이너스 PNL 표시
+- **수정**: `_str1_sell_state`에서 buy_price를 먼저 조회한 후 `calc_sell_pnl(buy_price, ref_price, qty)` 호출. 2곳(일반매도, 재주문) 모두 수정
+- **영향**: 매도 체결 시 정확한 PNL/수익률 계산
+
+### 2. fix: 중복 텔레그램 알림 제거
+- **파일**: `ws_realtime_trading.py` (라인 2202~2203 부근)
+- **문제**: 동일 매도체결 1건에 대해 `_on_result()` + `_on_ccnl_notice_filled()` 양쪽에서 텔레그램 발송 → 중복 알림
+- **수정**: `_on_ccnl_notice_filled()` 내 `_notify(tele=True)` → `logger.info()` 변경
+- **영향**: 텔레그램 중복 알림 제거, 로그는 유지
+
+### 3. feat: 매도체결 알림에 수익률(PNL) 표시
+- **파일**: `ws_realtime_trading.py` (라인 7237~7245 부근, `_on_result` 함수)
+- **내용**: 매도체결(`seln=="01"/"1"`) 시 `_str1_sell_state`에서 buy_price 조회 → `calc_sell_pnl()` 호출 → 텔레그램 메시지에 `PNL≈+1,234원(+2.50%)` 형태 추가
+- **영향**: 매도체결 시 실시간 수익률 확인 가능
+
+### 4. feat: 외부주문 target_price에 "상한가"/"하한가" 키워드 지원
+- **파일**: `ws_realtime_trading.py` (`_exec_external_order` 함수)
+- **내용**: `target_price` 필드에 숫자 대신 `"상한가"` 또는 `"하한가"` 문자열을 입력하면 REST API(`inquire_price`)로 해당 종목의 `stck_mxpr`(상한가) 또는 `stck_llam`(하한가)을 자동 조회하여 지정가(00) 주문
+- **사용 예시**: `{"symbol": "005930", "order": 1, "qty": 10, "target_price": "상한가"}`
+- **영향**: 상한가/하한가 가격을 몰라도 키워드로 간편 주문 가능
+
+---
+
+## 2026-03-24
+
+### 1. fix: 외부주문 시간 체크 추가 — 장 시간 전 주문 방지
+- **파일**: `ws_realtime_trading.py` (`_exec_external_order` 함수)
+- **문제**: 외부주문이 접수되면 시간 체크 없이 즉시 KIS API에 주문 전송 → 장 시간 전(예: 08:28)에 시장가 주문 시 거부됨
+- **수정**: ord_dvsn별 주문 가능 시간대 체크 추가. 시간 미도래 시 `result="접수"` 유지하며 매 사이클 재시도
+  - 시장가(01): 09:00~15:30
+  - 지정가(00): 08:30~15:30 (동시호가 포함)
+  - 장전시간외(05): 08:30~08:40
+  - 장후시간외(06): 15:40~16:00
+  - 시간외단일가(07): 16:00~18:00
+- **영향**: 프로그램 시작 전에 외부주문을 미리 설정해도 적절한 시간까지 자동 대기 후 주문
+
+### 2. fix(치명적): 매수 체결 시 매도전략 자동등록 + 실시간 구독 추가
+- **파일**: `ws_realtime_trading.py` (`_on_ccnl_notice_filled` 함수, 라인 2226 부근)
+- **문제**: 외부주문/장전시간외/장후시간외/시간외단일가 등 VI매수 이외의 경로로 매수된 종목이 `_str1_sell_state`에 등록되지 않아 트레일스톱/손절이 전혀 작동하지 않음. 또한 `codes` 리스트에 추가되지 않아 H0STCNT0 실시간 체결가 구독도 안 됨 (WSS 틱 0건 수신 확인됨)
+- **실제 사례**: 192410(오늘이엔엠) 매수가 4,290원 → 고가 4,780원(+11.4%) → 저가 3,965원(-7.6%) — 트레일스톱 미발동
+- **수정**: 체결통보(H0STCNI0) 매수체결 수신 시 일괄 처리:
+  1. `_str1_sell_state[code]` 자동 등록 (미등록 시 신규, 기등록 시 수량 누적)
+  2. `_ensure_code_structs([code])` + `_base_codes.add(code)` → `codes` 리스트 추가
+  3. `_trigger_ws_rebuild()` → H0STCNT0 실시간 구독 즉시 갱신
+- **영향**: 어떤 경로(종가/VI/외부/시간외 등)로 매수되든 체결통보 수신 시 자동으로 매도전략 등록 + 실시간 구독. 트레일스톱/손절 정상 작동 보장
+
+### 3. feat: 외부주문 디버그 로그 강화
+- **파일**: `ws_realtime_trading.py` (`_check_external_orders`, `_exec_external_order`)
+- **내용**: config.json에서 읽은 raw order dict를 접수 시점 + 실행 시작 시점에 로그 출력
+- **영향**: ord_type/target_price/target 등 값 파싱 문제를 즉시 진단 가능
+
+### 4. fix: 잔고조회 시 미구독 보유종목 자동 감지 + 구독 추가
+- **파일**: `ws_realtime_trading.py` (`_run_closing_balance_verification` 함수)
+- **문제**: 잔고에 보유 중이지만 `codes` 리스트에 없는 종목은 실시간 체결가(H0STCNT0) 구독 대상에서 제외 → 트레일스톱 미작동
+- **수정**: 잔고조회 결과에서 `codes`에 없는 종목 감지 → `_str1_sell_state` 등록 + `_ensure_code_structs` + `_trigger_ws_rebuild()` → 실시간 구독 즉시 추가 + 텔레그램 알림
+- **영향**: 어떤 경로로 매수되든 잔고조회 시점에 미구독 종목이 자동으로 구독에 포함
+
+### 5. fix: "시작잔고 누락 보충" 로그에 종목 상세 추가
+- **파일**: `ws_realtime_trading.py` (라인 3805 부근)
+- **문제**: "3종목 발견"이라고만 표시되고 어떤 종목인지 알 수 없었음
+- **수정**: 종목코드/종목명 목록을 로그 및 텔레그램에 포함
+- **영향**: 로그만으로 어떤 종목이 누락 보충되었는지 즉시 확인 가능
+
+### 6. fix: 30분 단일가 판정 — 첫 틱 즉시 확정 → 15초 관찰 후 확정으로 변경
+- **파일**: `ws_realtime_trading.py` (라인 7455~7495 부근, scheduler_loop 라인 4165 부근)
+- **문제**: KRX DB에 59(단기과열)로 등록된 종목이 Top30 추가 → 정시 윈도우에 첫 틱 도착 → 1틱만 보고 즉시 "30분 단일가 확정". 실제로는 매분 연속 틱이 오는 일반 연속 거래였음 (스코넥 276040 사례: 10:00~10:59 매분 2~4건 연속 틱)
+- **수정**: `_single_price_observe` 딕셔너리 도입. 정시 윈도우 첫 틱 → 15초간 관찰 → 3건 이상 틱 수신 시 "연속거래 판정(일반종목)", 15초 경과 + 3건 미만이면 "단일가 확정". scheduler_loop에서 타임아웃 체크도 추가
+- **영향**: 단기과열 종목이 실제로 연속 거래 중인 경우 오판 방지. 예상체결가 대신 실시간체결가 정상 구독
+
+---
+
+## 2026-03-30
+
+### 1. feat: 당일 아침 전일 상한가 종목 기반 구독/매수 대상 교체 + 로그 개선
+- **커밋**: `05c257a`
+- **파일**: `ws_realtime_trading.py`, `ws_realtime_tr_str1.py`, `research_260330-1.md`
+- **사유**: 기존 15:19 시점 top30 기반 "예상 상한가"가 부정확하여 실제 상한가가 아닌 종목이 매수/구독됨. 재구독/초기구독 로그에 종목 정보가 없어 디버깅이 어려웠던 문제도 함께 해결
+- **주요 변경**:
+  1. **`_load_morning_target_codes()` 신규 함수** — 프로그램 시작 시 `Select_Tr_target_list_symulation_pdy_ctrt.py`를 subprocess로 실행 → `Select_Tr_target_list.csv`에서 마지막 날짜 + group=ST 종목 추출. 기존 전일 15:19 예상 상한가 대신 정확한 전일 상한가 종목을 사용. 실패 시 기존 `_load_prev_closing_codes()` fallback
+  2. **`_base_codes` 보호 로직 변경** — `_base_codes = set(_morning_target_codes)`로 고정. morning target 종목은 top30 추가/삭제와 무관하게 하루 종일(15:19까지) 구독 보호
+  3. **재구독 로그 개선** — force 재구독 시 구독타입/종목 수/종목명 리스트 출력. 미수신 경고 로그에도 구독타입별 종목 수 추가
+  4. **초기 구독 리스트 로그 추가** — 08:50 예상체결가/09:00 실시간체결가 모드 전환 시 구독 종목명 리스트 표시
+- **영향**: 매수/구독 대상이 정확한 전일 상한가 종목으로 교체되어 불필요한 매수 방지. 구독 상태 디버깅 용이
+
+---
+
+## 2026-03-30
+
+### 1. feat: 당일 아침 전일 상한가 종목 기반 구독/매수 대상 교체 + 로그 개선
+- **커밋**: `05c257a`
+- **파일**: `ws_realtime_trading.py`, `ws_realtime_tr_str1.py`, `research_260330-1.md`
+- **사유**: 기존 15:19 시점 top30 기반 "예상 상한가"가 부정확하여 실제 상한가가 아닌 종목이 매수/구독됨. 재구독/초기구독 로그에 종목 정보가 없어 디버깅이 어려웠던 문제도 함께 해결
+- **주요 변경**:
+  1. **`_load_morning_target_codes()` 신규 함수** — 프로그램 시작 시 `Select_Tr_target_list_symulation_pdy_ctrt.py`를 subprocess로 실행 → `Select_Tr_target_list.csv`에서 마지막 날짜 + group=ST 종목 추출. 기존 전일 15:19 예상 상한가 대신 정확한 전일 상한가 종목을 사용. 실패 시 기존 `_load_prev_closing_codes()` fallback
+  2. **`_base_codes` 보호 로직 변경** — `_base_codes = set(_morning_target_codes)`로 고정. morning target 종목은 top30 추가/삭제와 무관하게 하루 종일(15:19까지) 구독 보호
+  3. **재구독 로그 개선** — force 재구독 시 구독타입/종목 수/종목명 리스트 출력. 미수신 경고 로그에도 구독타입별 종목 수 추가
+  4. **초기 구독 리스트 로그 추가** — 08:50 예상체결가/09:00 실시간체결가 모드 전환 시 구독 종목명 리스트 표시
+- **영향**: 매수/구독 대상이 정확한 전일 상한가 종목으로 교체되어 불필요한 매수 방지. 구독 상태 디버깅 용이
+
+### 2. feat: 월별 구독 이력 CSV + research-analyst/commit-manager 에이전트 추가
+- **커밋**: `3aa8fa6`
+- **파일**: `ws_realtime_trading.py`, `.claude/agents/research-analyst.md`, `.claude/agents/commit-manager.md`
+- **사유**: 날짜가 지나면 config의 구독 리스트가 덮어써져서 이전 일자의 base_codes와 top30 변동 이력이 유실됨. 월별 CSV로 영구 보관하여 사후 분석 가능하도록 함
+- **주요 변경**:
+  1. **월별 구독 이력 CSV** — `wss_subscription_log_YYMM.csv` (`data/fetch_top_list/`)
+     - `_log_subscription_event(code, name, sub_type, action)`: date, time, type, code, name, action 컬럼
+     - `_log_base_codes_on_startup()`: 시작 시 base_codes를 "base/시작"으로 기록
+     - `_log_top_sub_event()`에서 기존 일별 CSV + 월별 CSV 동시 기록 (type=top30)
+     - 기존 일별 `wss_sub_add_top10_list_{yymmdd}.csv`는 그대로 유지
+  2. **research-analyst 에이전트** — 로그/문제 분석 → `research_YYMMDD-N.md` 작성, 구현 후 결과 요약 추가
+  3. **commit-manager 에이전트** — diff 분석 → 커밋 → `history_code_dev.md` 일괄 처리
+- **영향**: 구독 변동 이력이 월 단위로 영구 보관되어 사후 분석 가능. 에이전트 기반 워크플로우 자동화

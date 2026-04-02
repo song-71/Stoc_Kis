@@ -448,8 +448,9 @@ def main():
     # ── S3 업로드 (1m_nxt 경로) ──
     try:
         layout = load_kis_data_layout()
-        # biz_date(영업일) 기준으로 S3 경로 결정 (실행 시각이 아닌 데이터 날짜)
-        date_str = f"{biz_date[:4]}-{biz_date[4:6]}-{biz_date[6:8]}"
+        # 파일명에서 날짜 추출 (20260402_1m_chart_DB_parquet_NXT.parquet → 2026-04-02)
+        file_date = parquet_path.name[:8]  # "20260402"
+        date_str = f"{file_date[:4]}-{file_date[4:6]}-{file_date[6:8]}"
         s3_url = layout.s3_1m_date(date_str).replace("/1m/", "/1m_nxt/")
         s3_parts = s3_url.replace("s3://", "").split("/", 1)
         s3_bucket, s3_key = s3_parts[0], s3_parts[1]

@@ -179,3 +179,19 @@ REST 보충 행에 `new_mkop_cls_code` + `market_event` 컬럼 추가.
 ### 수정 6: 15:19~15:20 구독 패턴 최적화 (Issue 7 해결)
 - `_pre_unsub_closing_done` 후 REGULAR_REAL 모드에서 `_apply_subscriptions` 호출 억제
 - **파일:** `ws_realtime_trading.py` line 4208~4210
+
+### 수정 7: VI 타임아웃 단축 + 해제 시 즉시 전환
+- fallback 타임아웃 300초 → 150초 (VI 발동~해제 통상 2:03~2:20초)
+- VI 해제 시 `_vi_exp_sub_worker`에서 즉시 ccnl_krx(실시간체결가) 구독
+
+### 수정 8: FHPST01390000 REST 폴링 기반 전체 VI 감지
+- `_vi_poll_check()`: WSS 5초 미수신 시 FHPST01390000으로 전체 VI 현황 1회 조회
+- 발동 감지 → 구독종목이면 예상체결가(H0STANC0) 전환
+- 발동시각 + 2분 경과 or API 응답에서 사라짐 → 실시간체결가(H0STCNT0) 복귀
+- WSS 슬롯 0개 사용, H0STMKO0 구독 확대 불필요
+- `_price_watchdog_loop`의 `not wss_alive` 구간에서 호출
+
+### TODO: a2 계좌 별도 WSS (보류)
+- 고객센터에 H0STMKO0 WSS 구독 카운트 포함 여부 확인 중 (2026-04-02)
+- 결과에 따라 kis_auth_llm.py 인스턴스별 open_map/approval_key 분리 검토
+- ws_realtime_trading.py 파일 상단에 TODO로 기록

@@ -1,4 +1,10 @@
 """
+# ── TODO ──
+# [ ] H0STMKO0를 a2 계좌 별도 WSS 연결로 전체 구독 종목 확대 검토
+#     → 고객센터에 H0STMKO0가 WSS 구독 카운트(40슬롯)에 포함되는지 확인 중 (2026-04-02)
+#     → 현재는 FHPST01390000 REST 폴링으로 전체 VI 감지 구현
+#     → 결과에 따라 kis_auth_llm.py 인스턴스별 open_map/approval_key 분리 필요
+
 [260309] fix: 잔고조회 REST API를 별도 스레드로 분리 → ingest_loop 블로킹 해소
   - _print_opening_call_auction_monitor에서 _query_and_print_balance 동기 호출 → threading.Thread로 비동기 실행
   - 매 60초 잔고조회 시 ingest_loop 2-3초 멈춤 → 수신 데이터 처리/저장 지연 해소
@@ -4893,6 +4899,130 @@ def _vi_exp_sub_worker(code: str, tr_type: str) -> None:
                 logger.warning(f"{ts_prefix()} [VI감지] exp_ccnl {action} 실패: {name}({code}) {e}")
 
 
+# ── VI REST 폴링 (FHPST01390000) — 전체 종목 VI 감지 ──
+_VI_POLL_INTERVAL = 7.0                     # VI 현황 폴링 간격(초)
+_VI_DURATION_SEC = 120                      # VI 발동~해제 기본 2분(120초)
+_vi_poll_active_codes: dict[str, float] = {}  # code -> 발동시각(epoch) — REST 폴링으로 감지된 VI
+
+_VI_POLL_API_URL = "/uapi/domestic-stock/v1/quotations/inquire-vi-status"
+_VI_POLL_TR_ID = "FHPST01390000"
+
+
+_vi_poll_last_ts: float = 0.0  # 마지막 VI 폴링 시각
+
+
+def _vi_poll_check() -> None:
+    """FHPST01390000 REST API로 전체 시장 VI 현황 1회 조회.
+    _price_watchdog_loop()에서 종목별 데이터 5초 미수신 시 호출됨.
+    발동 감지 시 해당 종목 예상체결가 구독, 발동시각+2분 후 실시간체결가로 전환.
+    """
+    global _vi_poll_last_ts
+    now = time.time()
+
+    # 최소 5초 간격 (중복 호출 방지)
+    if (now - _vi_poll_last_ts) < 5.0:
+        # 시간 경과 체크만 수행 (API 호출 없이)
+        _vi_poll_expire_check(now)
+        return
+    _vi_poll_last_ts = now
+
+    client = _price_client or _top_client
+    if client is None:
+        return
+
+    now_dt = datetime.now(KST)
+    t = now_dt.time()
+    if not (dtime(9, 0) <= t < dtime(15, 20)):
+        return
+
+    # ── 1) REST API 호출 ──
+    try:
+        today_str = now_dt.strftime("%Y%m%d")
+        url = f"{client.cfg.base_url}{_VI_POLL_API_URL}"
+        params = {
+            "FID_COND_SCR_DIV_CODE": "20139",
+            "FID_INPUT_ISCD": "",           # 전체 종목
+            "FID_MRKT_CLS_CODE": "0",       # 전체 시장
+            "FID_DIV_CLS_CODE": "0",        # 전체 방향
+            "FID_RANK_SORT_CLS_CODE": "0",  # 전체 VI종류
+            "FID_INPUT_DATE_1": today_str,
+            "FID_TRGT_CLS_CODE": "",
+            "FID_TRGT_EXLS_CLS_CODE": "",
+        }
+        headers = client._headers(tr_id=_VI_POLL_TR_ID)
+        headers["tr_cont"] = ""
+        r = client.session.get(url, headers=headers, params=params, timeout=10)
+        r.raise_for_status()
+        j = r.json()
+    except Exception as e:
+        logger.debug(f"{ts_prefix()} [VI폴링] API 호출 실패: {e}")
+        return
+
+    if str(j.get("rt_cd")) != "0":
+        return
+
+    output = j.get("output") or []
+
+    # ── 2) 현재 발동 중인 종목 추출 ──
+    active_now: dict[str, float] = {}  # code -> 발동시각(epoch)
+    for row in output:
+        vi_cls = str(row.get("vi_cls_code", "")).strip()
+        if vi_cls not in ("Y", "1", "2", "3"):
+            continue  # 해제된 건 스킵
+        code = str(row.get("mksc_shrn_iscd", "")).strip()
+        if not code:
+            continue
+        # 발동시각 파싱 (HHMMSS)
+        vi_hour_str = str(row.get("cntg_vi_hour", "")).strip()
+        if len(vi_hour_str) >= 6:
+            try:
+                vi_time = datetime.strptime(f"{today_str}{vi_hour_str[:6]}", "%Y%m%d%H%M%S")
+                vi_time = vi_time.replace(tzinfo=KST)
+                active_now[code] = vi_time.timestamp()
+            except ValueError:
+                active_now[code] = now
+        else:
+            active_now[code] = now
+
+    # ── 3) 신규 VI 발동 감지 → 예상체결가 구독 ──
+    for code, vi_ts in active_now.items():
+        if code not in _vi_poll_active_codes:
+            _vi_poll_active_codes[code] = vi_ts
+            name = code_name_map.get(code, code)
+            vi_time_str = datetime.fromtimestamp(vi_ts, tz=KST).strftime("%H:%M:%S")
+            logger.info(f"{ts_prefix()} [VI폴링] VI 발동 감지: {name}({code}) 발동시각={vi_time_str}")
+            # 구독 종목이면 예상체결가로 전환
+            if code in set(codes):
+                _vi_exp_sub_add(code)
+            else:
+                logger.info(f"{ts_prefix()} [VI폴링] {name}({code}) 비구독종목 → 모니터링만")
+
+    # ── 4) REST 응답에서 사라진 종목(해제 확정) 처리 ──
+    for code in list(_vi_poll_active_codes):
+        if code not in active_now:
+            name = code_name_map.get(code, code)
+            logger.info(f"{ts_prefix()} [VI폴링] VI 해제 확인 (API 미포함): {name}({code})")
+            del _vi_poll_active_codes[code]
+            if code in _vi_active_codes:
+                _vi_exp_sub_unsub(code)
+
+    # ── 5) 발동시각+2분 경과 체크 ──
+    _vi_poll_expire_check(now)
+
+
+def _vi_poll_expire_check(now: float) -> None:
+    """발동시각+2분 경과 종목 → 실시간체결가 복귀."""
+    for code in list(_vi_poll_active_codes):
+        vi_ts = _vi_poll_active_codes[code]
+        elapsed = now - vi_ts
+        if elapsed >= _VI_DURATION_SEC:
+            name = code_name_map.get(code, code)
+            logger.info(f"{ts_prefix()} [VI폴링] VI 해제 추정 ({elapsed:.0f}초 경과): {name}({code})")
+            del _vi_poll_active_codes[code]
+            if code in _vi_active_codes:
+                _vi_exp_sub_unsub(code)
+
+
 # ── VI 발동 중 예상체결가 모니터링 ──
 _vi_exp_last_notify: dict[str, float] = {}  # 종목별 마지막 알림 시각 (초단위 스팸 방지)
 _VI_EXP_NOTIFY_INTERVAL = 10.0              # 같은 종목 알림 최소 간격(초)
@@ -5436,6 +5566,8 @@ def _price_watchdog_loop() -> None:
                     _vi_exp_sub_unsub(c)
 
         if not wss_alive:
+            # WSS 5초 이상 전체 미수신 → VI 폴링 (전체 종목 VI 발동 여부 확인)
+            _vi_poll_check()
             # WSS 5초 이상 전체 미수신 → 연결 이상, 종목별 60초 간격 REST 상태확인
             with _lock:
                 for c in list(codes):

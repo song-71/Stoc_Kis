@@ -4873,16 +4873,23 @@ def _vi_exp_sub_unsub(code: str) -> None:
     threading.Thread(target=_vi_exp_sub_worker, args=(code, "2"), daemon=True).start()
 
 def _vi_exp_sub_worker(code: str, tr_type: str) -> None:
-    """별도 스레드에서 VI 예상체결가 구독/해제 (asyncio 데드락 방지)."""
+    """별도 스레드에서 VI 예상체결가 구독/해제 (asyncio 데드락 방지).
+    해제(tr_type="2") 시 즉시 실시간체결가(ccnl_krx)로 전환.
+    """
     action = "구독 추가" if tr_type == "1" else "구독 해제"
+    name = code_name_map.get(code, code)
     with _kws_lock:
         if _active_kws is not None:
             try:
                 _send_subscribe(_active_kws, exp_ccnl_krx, [code], tr_type)  # noqa: F405
-                name = code_name_map.get(code, code)
                 logger.info(f"{ts_prefix()} [VI감지] 예상체결가 {action}: {name}({code})")
+                # VI 해제 → 즉시 실시간체결가(H0STCNT0)로 전환
+                if tr_type == "2" and code in set(codes):
+                    mode = _get_mode()
+                    if mode == RunMode.REGULAR_REAL:
+                        _send_subscribe(_active_kws, ccnl_krx, [code], "1")  # noqa: F405
+                        logger.info(f"{ts_prefix()} [VI감지] 실시간체결가 즉시 전환: {name}({code})")
             except Exception as e:
-                name = code_name_map.get(code, code)
                 logger.warning(f"{ts_prefix()} [VI감지] exp_ccnl {action} 실패: {name}({code}) {e}")
 
 
@@ -5422,9 +5429,10 @@ def _price_watchdog_loop() -> None:
                     except Exception:
                         pass
 
-            # VI 예상체결가 구독 자동 해제 (300초 경과 — H0STMKO0 감지 실패 시 fallback)
+            # VI 예상체결가 구독 자동 해제 (150초 경과 — H0STMKO0 해제 통보 미수신 시 fallback)
+            # VI 발동~해제 통상 2:03~2:20초 → 150초(2분30초) 안전 마진
             for c in list(_vi_exp_sub_ts):
-                if (now - _vi_exp_sub_ts[c]) >= 300:
+                if (now - _vi_exp_sub_ts[c]) >= 150:
                     _vi_exp_sub_unsub(c)
 
         if not wss_alive:

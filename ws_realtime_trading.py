@@ -3043,8 +3043,7 @@ def _run_overtime_buy_orders() -> None:
             return
         # [DISABLED 2026-04-02] 상한가 종목 시간외단일가 매수 비활성화
         # 상한가 종목은 매도 물량이 안 나오다가 하락 시 손실 위험 → 매수 로직 비활성화
-        unfilled_names = [f"{o.get('name', o['code'])}({o['code']})" for o in unfilled]
-        _notify(f"{ts_prefix()} [시간외단일가] 매수 비활성화 (상한가 매수 전략 중단) — {len(unfilled)}건 스킵: {', '.join(unfilled_names)}", tele=True)
+        logger.info(f"{ts_prefix()} [시간외단일가] 매수 비활성화 (상한가 매수 전략 중단) — {len(unfilled)}건 스킵")
         # try:
         #     client = _top_client or _init_top_client()
         #     tr_id = "TTTC0802U"
@@ -3316,6 +3315,74 @@ def _load_morning_target_codes() -> list[str]:
     return _load_prev_closing_codes()
 
 
+def _load_nxt_target_codes_pre() -> set[str]:
+    """NXT 프리마켓 대상: 전일 상한가 CSV 중 nxt=Y 종목 필터."""
+    global _nxt_target_codes
+    try:
+        csv_path = Path("/home/ubuntu/Stoc_Kis/symulation/Select_Tr_target_list.csv")
+        if not csv_path.exists():
+            logger.info("[nxt] Select_Tr_target_list.csv 없음 → NXT 대상 0종목")
+            return set()
+        df = pd.read_csv(csv_path, dtype=str, encoding="utf-8-sig")
+        if df.empty or "symbol" not in df.columns:
+            return set()
+        last_date = df["date"].max() if "date" in df.columns else None
+        if last_date:
+            df = df[df["date"] == last_date]
+        raw_codes = df["symbol"].str.strip().str.zfill(6).unique().tolist()
+
+        # nxt=Y 필터 (KRX_code.csv)
+        krx_path = Path("/home/ubuntu/Stoc_Kis/data/admin/symbol_master/KRX_code.csv")
+        nxt_set = set()
+        if krx_path.exists():
+            krx_df = pd.read_csv(krx_path, dtype=str)
+            if "code" in krx_df.columns and "nxt" in krx_df.columns:
+                krx_df["code"] = krx_df["code"].str.strip().str.zfill(6)
+                nxt_set = set(krx_df.loc[krx_df["nxt"].str.strip().str.upper() == "Y", "code"])
+        if nxt_set:
+            result = {c for c in raw_codes if c in nxt_set}
+        else:
+            logger.warning("[nxt] KRX_code에 nxt 컬럼 없음 → 전일 상한가 전체를 NXT 대상으로 사용")
+            result = set(raw_codes)
+        names = [code_name_map.get(c, c) for c in sorted(result)]
+        logger.info(f"{ts_prefix()} [nxt] 프리마켓 대상: {len(result)}종목 (전일상한가 {len(raw_codes)}종목 중 nxt=Y) {names}")
+        _nxt_target_codes = result
+        return result
+    except Exception as e:
+        logger.warning(f"[nxt] 프리마켓 대상 로드 실패: {e}")
+        return set()
+
+
+def _refresh_nxt_target_codes_after() -> set[str]:
+    """NXT 애프터마켓 대상: 당일 prdy_ctrt >= 29.5% + nxt=Y 종목."""
+    global _nxt_target_codes
+    try:
+        candidates = {c for c, v in _last_prdy_ctrt.items() if v >= 29.5}
+        if not candidates:
+            logger.info(f"{ts_prefix()} [nxt] 애프터마켓 대상: 당일 상한가(>=29.5%) 종목 없음")
+            _nxt_target_codes = set()
+            return set()
+        # nxt=Y 필터
+        krx_path = Path("/home/ubuntu/Stoc_Kis/data/admin/symbol_master/KRX_code.csv")
+        nxt_set = set()
+        if krx_path.exists():
+            krx_df = pd.read_csv(krx_path, dtype=str)
+            if "code" in krx_df.columns and "nxt" in krx_df.columns:
+                krx_df["code"] = krx_df["code"].str.strip().str.zfill(6)
+                nxt_set = set(krx_df.loc[krx_df["nxt"].str.strip().str.upper() == "Y", "code"])
+        if nxt_set:
+            result = candidates & nxt_set
+        else:
+            result = candidates
+        names = [code_name_map.get(c, c) for c in sorted(result)]
+        logger.info(f"{ts_prefix()} [nxt] 애프터마켓 대상 갱신: {len(result)}종목 (당일 상한가 {len(candidates)}종목 중 nxt=Y) {names}")
+        _nxt_target_codes = result
+        return result
+    except Exception as e:
+        logger.warning(f"[nxt] 애프터마켓 대상 갱신 실패: {e}")
+        return set()
+
+
 _loaded_top_added: list[str] = []  # config에서 복원한 top_added (초기화 전 임시 저장)
 
 def _load_codes_from_cfg(base_codes: list[str]) -> list[str]:
@@ -3412,12 +3479,14 @@ _flags_lock = threading.RLock()
 # =============================================================================
 class RunMode(Enum):
     PREOPEN_WAIT = auto()
+    NXT_PRE = auto()          # 08:00~08:50 NXT 프리마켓
     PREOPEN_EXP = auto()
     REGULAR_REAL = auto()
     CLOSE_EXP = auto()
     CLOSE_REAL = auto()
     OVERTIME_EXP = auto()
     OVERTIME_REAL = auto()
+    NXT_AFTER = auto()        # 15:40~20:00 NXT 애프터마켓
     STOP = auto()
     EXIT = auto()
 
@@ -3456,8 +3525,8 @@ def _trigger_ws_rebuild():
     #         _request_ws_close(_active_kws)
 
 
-END_TIME = dtime(18, 0)
-_end_time_reached = False   # 18:00 종료 시도 시 True (WS 지연 종료 시 병합 판단용)
+END_TIME = dtime(20, 1)     # NXT 애프터마켓 20:00 종료 + 1분 여유
+_end_time_reached = False   # 종료 시도 시 True (WS 지연 종료 시 병합 판단용)
 _regular_real_seen: set[str] = set()
 _close_force_stopped = False          # 15:30 유예시간 후 강제 구독 중단 1회 로그용
 _last_overtime_buy_min: int = -1  # 마지막 실행 분(minute) - 10분당 1회
@@ -3475,28 +3544,36 @@ _last_prdy_ctrt: dict[str, float] = {c: 0.0 for c in codes}
 _last_mkop_cls_code: dict[str, str] = {}  # code -> new_mkop_cls_code (종목상태, WS 수신값)
 _last_trid_per_code: dict[str, str] = {}  # code → 마지막 수신 tr_id
 _last_stck_prpr: dict[str, float] = {}  # code -> 최근 체결가 (모니터링용)
+_nxt_target_codes: set[str] = set()    # NXT 프리/애프터마켓 대상 종목 (전일 상한가 + nxt=Y)
 _subscribed: dict[str, set[str]] = {}
 
 def calc_mode(now: datetime) -> RunMode:
     t = now.time()
-    if t < dtime(8, 50):
+    if t < dtime(8, 0):
         return RunMode.PREOPEN_WAIT
+    if dtime(8, 0) <= t < dtime(8, 50):
+        return RunMode.NXT_PRE
     if dtime(8, 50) <= t < dtime(9, 0):
         return RunMode.PREOPEN_EXP
     if dtime(9, 0) <= t < dtime(15, 20):
         return RunMode.REGULAR_REAL
     if dtime(15, 20) <= t < dtime(15, 30):
         return RunMode.CLOSE_EXP
-    if dtime(15, 30) <= t < dtime(16, 0):
+    if dtime(15, 30) <= t < dtime(15, 40):
         return RunMode.CLOSE_REAL
-    if dtime(16, 0) <= t < END_TIME:
-        return RunMode.OVERTIME_EXP if not _overtime_real_active else RunMode.OVERTIME_REAL
+    if dtime(15, 40) <= t < dtime(20, 0):
+        return RunMode.NXT_AFTER
+    if t >= dtime(20, 0):
+        return RunMode.EXIT
     return RunMode.EXIT
 
 def _log_mode_transition(prev: RunMode | None, cur: RunMode) -> None:
     sys.stdout.write("\n")  # 제자리 출력 줄바꿈
     if cur == RunMode.PREOPEN_WAIT:
         _notify(f"{ts_prefix()} 장 개시전까지 대기/", tele=True)
+    elif cur == RunMode.NXT_PRE:
+        nxt_names = [code_name_map.get(c, c) for c in sorted(_nxt_target_codes)]
+        _notify(f"{ts_prefix()} NXT 프리마켓 시작 (08:00~08:50): {len(_nxt_target_codes)}종목 {nxt_names}", tele=True)
     elif cur == RunMode.PREOPEN_EXP:
         _sub_names = [code_name_map.get(c, c) for c in codes]
         _notify(f"{ts_prefix()} 08:50 예상체결가 구독 시작: {len(codes)}종목 {_sub_names}", tele=True)
@@ -3514,6 +3591,9 @@ def _log_mode_transition(prev: RunMode | None, cur: RunMode) -> None:
             _notify(f"{ts_prefix()} [시간외] 예상체결가 구독 시작", tele=True)
     elif cur == RunMode.OVERTIME_REAL:
         _notify(f"{ts_prefix()} [시간외] 예상체결가 → 체결가 전환")
+    elif cur == RunMode.NXT_AFTER:
+        nxt_names = [code_name_map.get(c, c) for c in sorted(_nxt_target_codes)]
+        _notify(f"{ts_prefix()} NXT 애프터마켓 시작 (15:40~20:00): {len(_nxt_target_codes)}종목 {nxt_names}", tele=True)
     elif cur == RunMode.STOP:
         _notify(f"{ts_prefix()} 모든 구독 종료")
     elif cur == RunMode.EXIT:
@@ -3904,6 +3984,23 @@ def scheduler_loop():
     while not _stop_event.is_set():
         try:
             now = datetime.now(KST)
+            # 07:50~08:00 NXT 프리마켓 준비: 전일 상한가 + nxt=Y 종목 로드 (1일 1회)
+            if dtime(7, 50) <= now.time() < dtime(8, 0):
+                today = now.date()
+                if getattr(scheduler_loop, '_nxt_pre_loaded_date', None) != today:
+                    scheduler_loop._nxt_pre_loaded_date = today
+                    try:
+                        _load_nxt_target_codes_pre()
+                    except Exception as e:
+                        logger.warning(f"{ts_prefix()} [nxt] 프리마켓 준비 실패: {e}")
+            # 15:30~15:40 NXT 애프터마켓 준비: 당일 상한가 종목 갱신 (1일 1회)
+            if dtime(15, 30) <= now.time() < dtime(15, 40):
+                if getattr(scheduler_loop, '_nxt_after_loaded_date', None) != now.date():
+                    scheduler_loop._nxt_after_loaded_date = now.date()
+                    try:
+                        _refresh_nxt_target_codes_after()
+                    except Exception as e:
+                        logger.warning(f"{ts_prefix()} [nxt] 애프터마켓 준비 실패: {e}")
             # 08:29:59 체결통보 구독: 08:30 이전 연결 시 ccnl_notice 미구독 → 기존 연결에 구독 추가 (1일 1회)
             if dtime(8, 29, 59) <= now.time() < dtime(8, 30, 5):
                 global _ccnl_early_add_date
@@ -4111,8 +4208,11 @@ def scheduler_loop():
                     if new_mode == RunMode.OVERTIME_REAL:
                         _overtime_real_seen.clear()
                     if new_mode == RunMode.EXIT:
-                        # ① 마지막 17:50 단일가 결과 집계 출력
-                        _log_closing_order_aggregation("17:50단일가")
+                        # ① 마지막 단일가 결과 집계 출력 (시간외단일가가 활성이었을 경우)
+                        try:
+                            _log_closing_order_aggregation("17:50단일가")
+                        except Exception:
+                            pass
                         # ② 시간외 단일가 마감 총 거래 내역 통보 (텔레그램)
                         try:
                             _notify_overtime_single_price_final()
@@ -4125,8 +4225,8 @@ def scheduler_loop():
                             if _active_kws is not None:
                                 _request_ws_close(_active_kws)
                         time.sleep(1.0)
-                        # ② 버퍼 flush + parts 병합 (18:00 장 종료 시에만 병합)
-                        _flush_part_buffer("18:00_shutdown", force_full=True)
+                        # ② 버퍼 flush + parts 병합 (EXIT 시에만 병합)
+                        _flush_part_buffer("20:00_shutdown", force_full=True)
                         _merge_parts_to_final()
                         # ②-1 거래장부 연도별 parquet 갱신
                         _append_daily_ledger_to_yearly()
@@ -4135,7 +4235,7 @@ def scheduler_loop():
                         _notify(_final_summary())
                         time.sleep(1.0)
                         # ④ 프로그램 종료 안내 (텔레그램)
-                        _notify(f"{ts_prefix()} 18:00 이후 시간외 단일가 종료로 프로그램 종료", tele=True)
+                        _notify(f"{ts_prefix()} 20:00 NXT 애프터마켓 종료로 프로그램 종료", tele=True)
                         _end_time_reached = True
                         _stop_event.set()
                         break
@@ -6552,6 +6652,8 @@ KNOWN_TRID_MAP: dict[str, tuple[str, str]] = {
     "H0STANC0": ("regular_exp", "N"),
     "H0STOUP0": ("overtime_real", "Y"),
     "H0STOAC0": ("overtime_exp", "N"),
+    "H0NXCNT0": ("nxt_real", "Y"),       # NXT 실시간체결가
+    "H0NXANC0": ("nxt_exp", "N"),        # NXT 실시간예상체결
 }
 
 def _infer_tr_kind(trid: str, is_real: str | None) -> str:
@@ -6562,6 +6664,8 @@ def _infer_tr_kind(trid: str, is_real: str | None) -> str:
         return "regular_real"
     if cur in (RunMode.OVERTIME_EXP, RunMode.OVERTIME_REAL):
         return "overtime_exp" if is_real == "N" else "overtime_real"
+    if cur in (RunMode.NXT_PRE, RunMode.NXT_AFTER):
+        return "nxt_exp" if is_real == "N" else "nxt_real"
     return "unknown"
 
 
@@ -7807,6 +7911,8 @@ def ingest_loop():
                 save = SAVE_REAL_OVERTIME
             elif kind == "overtime_exp":
                 save = SAVE_EXP_OVERTIME
+            elif kind in ("nxt_real", "nxt_exp"):
+                save = True  # NXT 체결가는 항상 저장
             else:
                 save = (SAVE_MODE == "always")
 
@@ -8226,7 +8332,13 @@ def _desired_subscription_map(now: datetime) -> dict:
     t = now.time()
     all_codes = set(codes)
 
-    if t < dtime(8, 50) or not all_codes:
+    # NXT 프리마켓 (08:00~08:50)
+    if dtime(8, 0) <= t < dtime(8, 50):
+        if _nxt_target_codes:
+            return {ccnl_nxt: set(_nxt_target_codes)}  # noqa: F405
+        return {}
+
+    if t < dtime(8, 0) or not all_codes:
         return {}
     if dtime(8, 50) <= t < dtime(9, 0):
         # 08:59:29~09:00:05 57/59(30분 단일가)는 실시간 체결가(09:00 단일가 수신)
@@ -8263,7 +8375,7 @@ def _desired_subscription_map(now: datetime) -> dict:
     if dtime(15, 20) <= t < dtime(15, 30):
         return {exp_ccnl_krx: all_codes}  # noqa: F405
 
-    if dtime(15, 30) <= t < dtime(16, 0):
+    if dtime(15, 30) <= t < dtime(15, 40):
         # 전 종목 종가 체결 수신 완료 → 구독 종료
         if len(_regular_real_seen) >= len(codes):
             return {}
@@ -8273,9 +8385,11 @@ def _desired_subscription_map(now: datetime) -> dict:
         # 15:30~15:31: 종가 체결가 수신 대기
         return {ccnl_krx: all_codes}  # noqa: F405
 
-    if dtime(16, 0) <= t < END_TIME:
-        req = overtime_ccnl_krx if _overtime_real_active else overtime_exp_ccnl_krx  # noqa: F405
-        return {req: all_codes}
+    # NXT 애프터마켓 (15:40~20:00)
+    if dtime(15, 40) <= t < dtime(20, 0):
+        if _nxt_target_codes:
+            return {ccnl_nxt: set(_nxt_target_codes)}  # noqa: F405
+        return {}
 
     return {}
 
@@ -8289,15 +8403,16 @@ def run_ws_forever():
         if mode == RunMode.EXIT:
             break
 
-        # ── 보유종목 없으면 WSS 구독 불필요 → 18:00까지 대기 ──
-        # 단, 종가매매(15:20~15:30) 시간에는 보유종목 없어도 WSS 유지 (예상체결가 모니터링)
+        # ── 보유종목 없으면 WSS 구독 불필요 → END_TIME까지 대기 ──
+        # 단, 종가매매(15:20~15:30) 또는 NXT 모드에서는 보유종목 없어도 WSS 유지
         with _str1_sell_state_lock:
             _has_held = any(not st.get("sold") for st in _str1_sell_state.values())
         if not _has_held:
             now_t = datetime.now(KST).time()
             in_closing = (dtime(15, 20) <= now_t < dtime(15, 31)) or bool(_closing_codes)
-            if in_closing:
-                logger.info(f"{ts_prefix()} [ws] 보유종목 없지만 종가매매 구간 → WSS 유지")
+            in_nxt = mode in (RunMode.NXT_PRE, RunMode.NXT_AFTER) and bool(_nxt_target_codes)
+            if in_closing or in_nxt:
+                logger.info(f"{ts_prefix()} [ws] 보유종목 없지만 {'NXT' if in_nxt else '종가매매'} 구간 → WSS 유지")
             elif now_t < END_TIME:
                 logger.info(f"{ts_prefix()} [ws] 보유종목 없음 → WSS 구독 생략, {END_TIME.strftime('%H:%M')}까지 대기")
                 while not _stop_event.is_set():

@@ -2,6 +2,73 @@
 
 ---
 
+## [2026-04-02] 8885254
+
+### 1. feat: NXT 프리마켓/애프터마켓 1분봉 다운로드 스크립트 추가
+- **카테고리**: feat
+- **파일**: `kis_1m_API_to_Parquet_NXT.py` (신규)
+- **사유**: 넥스트레이드(NXT) 프리마켓(08:00~08:50)과 애프터마켓(15:40~20:00) 구간의 1분봉 OHLCV 데이터를 KRX 정규장 데이터와 분리 수집할 필요. 기존 `kis_1m_API_to_Parquet_all_code.py`는 J(KRX) 마켓 전용이므로 NXT 전용 스크립트를 별도 신설
+- **주요 변경**:
+  1. **MARKET_CODE="NX"** — `inquire_time_itemchartprice` 호출 시 `fid_cond_mrkt_div_code="NX"` 고정
+  2. **QUERY_TIMES 분리** — 프리마켓 08:00~08:50, 애프터마켓 15:40~20:00 구간을 30분 단위로 분할 조회
+  3. **`_in_nxt_time()` 필터** — API 응답 중 NXT 시간 범위 외 캔들 제거 (정규장 데이터 혼입 방지)
+  4. **출력 파일명** — `{date}_1m_chart_DB_parquet_NXT.parquet` (기존 `_all_code` 파일과 완전 분리)
+  5. **S3 경로 분리** — `layout.s3_1m_date()`의 `/1m/` 경로를 `/1m_nxt/`로 치환하여 업로드
+  6. **temp 디렉토리** — `temp_1m_nxt/` 사용 (기존 `temp_1m/`과 충돌 없음)
+  7. **로컬 NXT 파일 정리** — `*_NXT.parquet` 최근 2일치만 유지, 이전 파일 자동 삭제
+  8. **체크포인트** — `temp_1m_nxt/checkpoints/{date}_nxt_checkpoint.csv`로 중단/재개 지원
+- **영향**: NXT 거래 시간대 1분봉 데이터를 독립 parquet 파일 및 S3 경로(`market_data/1m_nxt/`)에 저장. `Daily_fetch_auto_run.sh`에 실행 구문 추가 시 자동화 완성
+
+---
+
+## [2026-04-02] a07e6e2
+
+### 1. fix: NXT 재시작 시 대상 종목 비어있는 버그 수정
+- **카테고리**: fix
+- **파일**: `ws_realtime_trading.py`
+- **사유**: 프로세스 재시작 시 `_last_prdy_ctrt`가 전부 0.0으로 초기화되어 당일 상한가 기준 필터(>=29.5%)를 통과하는 종목이 없어지면서 `_nxt_target_codes`가 빈 set으로 확정되던 문제 수정
+- **주요 변경**:
+  1. **_refresh_nxt_target_codes_after() 폴백 추가** — `candidates`(당일 상한가 후보)가 비어있으면 빈 set을 반환하던 기존 동작 대신 `_load_nxt_target_codes_pre()`(전일 상한가 CSV)를 호출해 대상을 복원
+  2. **_log_mode_transition NXT_AFTER 자동 갱신** — `_nxt_target_codes`가 비어있을 경우 `_refresh_nxt_target_codes_after()` 자동 호출 후 텔레그램 알림 출력
+- **영향**: NXT 애프터마켓 진입 시 재시작 여부와 무관하게 대상 종목이 정상 설정됨. 재시작 직후 NXT_AFTER 모드에 진입해도 구독/매수 대상이 비어있지 않음
+
+---
+
+## [2026-04-02] b54e369
+
+### 1. feat: NXT(넥스트레이드) 틱데이터 WSS 수신 1단계 구현
+- **카테고리**: feat
+- **파일**: `ws_realtime_trading.py`
+- **사유**: 넥스트레이드(NXT) 프리마켓(08:00~08:50)과 애프터마켓(15:40~20:00) 틱데이터 수신 기반 마련. 한국거래소(KRX) 외 NXT 거래소 종목의 실시간 체결가를 WSS로 수신하여 parquet 저장까지 1단계 구현
+- **주요 변경**:
+  1. **RunMode 추가** — `NXT_PRE`(08:00~08:50 프리마켓), `NXT_AFTER`(15:40~20:00 애프터마켓) 신규 추가. 기존 OVERTIME_EXP/OVERTIME_REAL은 NXT_AFTER로 대체
+  2. **END_TIME 연장** — 18:00 → 20:01 (NXT 애프터마켓 20:00 종료 + 1분 여유)
+  3. **calc_mode() 개편** — NXT 시간대 분기 추가. 15:30~15:40 CLOSE_REAL, 15:40~20:00 NXT_AFTER, 20:00 이후 EXIT
+  4. **KNOWN_TRID_MAP 추가** — `H0NXCNT0`(nxt_real 실시간체결), `H0NXANC0`(nxt_exp 예상체결) 등록
+  5. **_desired_subscription_map()** — NXT 모드에서 `ccnl_nxt(H0NXCNT0)`로 NXT 대상 종목 구독. 기존 overtime_ccnl_krx 구독 제거
+  6. **_load_nxt_target_codes_pre()** — 07:50 실행. `Select_Tr_target_list.csv` 전일 상한가 중 `KRX_code.csv`의 `nxt=Y` 종목 필터링
+  7. **_refresh_nxt_target_codes_after()** — 15:30 실행. `_last_prdy_ctrt >= 29.5%`(당일 상한가)이면서 `nxt=Y`인 종목으로 갱신. `_nxt_target_codes` 전역변수에 반영
+  8. **ingest_loop parquet 저장** — `kind in ("nxt_real", "nxt_exp")`이면 `save=True`로 항상 저장
+  9. **run_ws_forever WSS 유지** — NXT 모드에서 보유종목이 없어도 `_nxt_target_codes`가 있으면 WSS 연결 유지
+  10. **시간외단일가 텔레그램 알림 제거** — `_run_overtime_buy_orders()`의 비활성화 알림을 `_notify(tele=True)` → `logger.info`로 전환 (이전 커밋 보완)
+  11. **EXIT 처리 문구 수정** — "18:00 이후 시간외 단일가 종료" → "20:00 NXT 애프터마켓 종료"
+- **영향**: NXT 프리/애프터마켓 틱데이터 수신 및 parquet 저장 가능. 운영 시간이 20:01까지 연장되어 전체 장 커버리지 확대. NXT 매수/매도 로직은 미구현(2단계 예정)
+
+---
+
+## [2026-04-02] 45ac0b8
+
+### 1. refactor: 상한가 종목 장전/장후 시간외 매수 로직 비활성화
+- **카테고리**: refactor
+- **파일**: `ws_realtime_trading.py`
+- **사유**: 상한가 종목은 매도 물량이 나오지 않다가 하락 시 손실 위험. 장전시간외종가(08:30)와 시간외단일가(16:00~18:00) 매수를 모두 비활성화. 코드는 주석으로 보존하여 전략 재활성화 시 즉시 복원 가능
+- **주요 변경**:
+  1. **`_run_morning_extra_closing_buy()`** — 08:30 장전시간외종가 매수 루프 전체 주석 처리. 스킵 알림 메시지(`[08:30시간외종가] 매수 비활성화`)는 유지하여 실행 여부를 로그에서 확인 가능
+  2. **`_run_overtime_buy_orders()`** — 16:00~18:00 시간외단일가 매수 루프 전체 주석 처리. 스킵 대상 종목명/코드 목록을 텔레그램으로 알림
+- **영향**: 상한가 추종 매수 전략 완전 중단. 기존 구독/모니터링 로직에는 영향 없음. 주석 해제만으로 전략 재활성화 가능
+
+---
+
 ## [2026-04-02] 14594bf
 
 ### 1. feat: FHPST01390000 REST 폴링 기반 전체 시장 VI 감지 추가

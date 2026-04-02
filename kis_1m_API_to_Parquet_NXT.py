@@ -178,10 +178,16 @@ def main():
     try:
         sdf = load_symbol_master()
         sdf["code"] = sdf["code"].astype(str).str.zfill(6)
-        # 전체 종목 대상 (ST 필터 없음)
         name_map = dict(zip(sdf["code"], sdf["name"]))
         name_to_code = dict(zip(sdf["name"].astype(str), sdf["code"]))
-        target_codes = sdf["code"].tolist()
+        # NXT 종목만 필터 (nxt=Y)
+        if "nxt" in sdf.columns:
+            nxt_df = sdf[sdf["nxt"].astype(str).str.strip().str.upper() == "Y"]
+            target_codes = nxt_df["code"].tolist()
+            _log(f"[1m_NXT] NXT 종목 {len(target_codes)}개 (전체 {len(sdf)}개 중 nxt=Y)")
+        else:
+            target_codes = sdf["code"].tolist()
+            _log(f"[1m_NXT] 종목마스터에 nxt 컬럼 없음 → 전체 {len(target_codes)}종목 대상")
     except Exception as e:
         logging.warning("%s 종목마스터 로드 실패: %s", ts_prefix(), e)
         target_codes = TARGET_CODES

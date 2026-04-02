@@ -3354,14 +3354,17 @@ def _load_nxt_target_codes_pre() -> set[str]:
 
 
 def _refresh_nxt_target_codes_after() -> set[str]:
-    """NXT 애프터마켓 대상: 당일 prdy_ctrt >= 29.5% + nxt=Y 종목."""
+    """NXT 애프터마켓 대상: 당일 prdy_ctrt >= 29.5% + nxt=Y 종목.
+    재시작 시 _last_prdy_ctrt가 비어있으면 프리마켓 대상(전일 상한가)으로 폴백.
+    """
     global _nxt_target_codes
     try:
         candidates = {c for c, v in _last_prdy_ctrt.items() if v >= 29.5}
         if not candidates:
-            logger.info(f"{ts_prefix()} [nxt] 애프터마켓 대상: 당일 상한가(>=29.5%) 종목 없음")
-            _nxt_target_codes = set()
-            return set()
+            # 폴백: 재시작 시 _last_prdy_ctrt가 초기화되어 비어있을 수 있음
+            # → 프리마켓 대상(전일 상한가 CSV)으로 대체
+            logger.info(f"{ts_prefix()} [nxt] 당일 상한가 정보 없음 → 전일 상한가 CSV로 폴백")
+            return _load_nxt_target_codes_pre()
         # nxt=Y 필터
         krx_path = Path("/home/ubuntu/Stoc_Kis/data/admin/symbol_master/KRX_code.csv")
         nxt_set = set()
@@ -3592,6 +3595,8 @@ def _log_mode_transition(prev: RunMode | None, cur: RunMode) -> None:
     elif cur == RunMode.OVERTIME_REAL:
         _notify(f"{ts_prefix()} [시간외] 예상체결가 → 체결가 전환")
     elif cur == RunMode.NXT_AFTER:
+        if not _nxt_target_codes:
+            _refresh_nxt_target_codes_after()  # 재시작 시 대상 자동 갱신
         nxt_names = [code_name_map.get(c, c) for c in sorted(_nxt_target_codes)]
         _notify(f"{ts_prefix()} NXT 애프터마켓 시작 (15:40~20:00): {len(_nxt_target_codes)}종목 {nxt_names}", tele=True)
     elif cur == RunMode.STOP:

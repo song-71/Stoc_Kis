@@ -2802,38 +2802,40 @@ def _run_morning_extra_closing_buy() -> None:
         client = _top_client or _init_top_client()
         code_info = state.get("code_info") or {}
 
-        _notify(f"{ts_prefix()} [08:30시간외종가] 추가 매수 시작 {len(to_order)}건")
-        for o in to_order:
-            code    = str(o["code"]).zfill(6)
-            remain  = int(o.get("remain_qty", 0))
-            held    = int(o.get("actual_held", -1))
-            info    = code_info.get(code, {})
-            name    = o.get("name", info.get("name", code))
-            if remain <= 0:
-                continue
-            # KIS API에서 전일종가 실시간 조회 (저장값 대신 최신 값 사용)
-            prev_close = 0.0
-            for _attempt in range(3):
-                prev_close = _get_close_from_kis_api(client, code, use_today=False)
-                if prev_close > 0:
-                    break
-                time.sleep(1)
-            if prev_close <= 0:
-                prev_close = _get_prev_close_from_1d([code]).get(code, 0)
-            if prev_close <= 0:
-                logger.warning(f"{ts_prefix()} [08:30시간외종가] {code} 전일종가 조회 실패(API+1d폴백) → 스킵")
-                continue
-            held_txt = f" (잔고보유={held})" if held >= 0 else ""
-            try:
-                _buy_order_cash(client, cano, acnt, "TTTC0802U", code, remain, prev_close, ord_dvsn="05")
-                _notify(
-                    f"{ts_prefix()} [08:30시간외종가_매수] {name}({code})"
-                    f"  수량={remain}{held_txt}  전일종가={prev_close:,.0f}  ORD_DVSN=05(장전시간외종가)",
-                    tele=True,
-                )
-            except Exception as e:
-                logger.warning(f"{ts_prefix()} [08:30시간외종가실패] {code}: {e}")
-                _notify(f"{ts_prefix()} [08:30시간외종가실패] {name}({code}) {e}", tele=True)
+        # [DISABLED 2026-04-02] 상한가 종목 장전시간외종가 매수 비활성화
+        # 상한가 종목은 매도 물량이 안 나오다가 하락 시 손실 위험 → 매수 로직 비활성화
+        _notify(f"{ts_prefix()} [08:30시간외종가] 매수 비활성화 (상한가 매수 전략 중단) — {len(to_order)}건 스킵")
+        # for o in to_order:
+        #     code    = str(o["code"]).zfill(6)
+        #     remain  = int(o.get("remain_qty", 0))
+        #     held    = int(o.get("actual_held", -1))
+        #     info    = code_info.get(code, {})
+        #     name    = o.get("name", info.get("name", code))
+        #     if remain <= 0:
+        #         continue
+        #     # KIS API에서 전일종가 실시간 조회 (저장값 대신 최신 값 사용)
+        #     prev_close = 0.0
+        #     for _attempt in range(3):
+        #         prev_close = _get_close_from_kis_api(client, code, use_today=False)
+        #         if prev_close > 0:
+        #             break
+        #         time.sleep(1)
+        #     if prev_close <= 0:
+        #         prev_close = _get_prev_close_from_1d([code]).get(code, 0)
+        #     if prev_close <= 0:
+        #         logger.warning(f"{ts_prefix()} [08:30시간외종가] {code} 전일종가 조회 실패(API+1d폴백) → 스킵")
+        #         continue
+        #     held_txt = f" (잔고보유={held})" if held >= 0 else ""
+        #     try:
+        #         _buy_order_cash(client, cano, acnt, "TTTC0802U", code, remain, prev_close, ord_dvsn="05")
+        #         _notify(
+        #             f"{ts_prefix()} [08:30시간외종가_매수] {name}({code})"
+        #             f"  수량={remain}{held_txt}  전일종가={prev_close:,.0f}  ORD_DVSN=05(장전시간외종가)",
+        #             tele=True,
+        #         )
+        #     except Exception as e:
+        #         logger.warning(f"{ts_prefix()} [08:30시간외종가실패] {code}: {e}")
+        #         _notify(f"{ts_prefix()} [08:30시간외종가실패] {name}({code}) {e}", tele=True)
     except Exception as e:
         logger.warning(f"{ts_prefix()} [08:30시간외종가] 실패: {e}")
 
@@ -3039,55 +3041,59 @@ def _run_overtime_buy_orders() -> None:
         if not unfilled:
             _notify(f"{ts_prefix()} [시간외단일가] 16:00 미체결 종목 없음 → 주문 스킵")
             return
-        try:
-            client = _top_client or _init_top_client()
-            tr_id = "TTTC0802U"
-            # 1) 주문 데이터 사전 준비 (상한가 조회 등)
-            order_items = []
-            for o in unfilled:
-                code = o["code"]
-                remain = int(o.get("remain_qty", 0))
-                if remain <= 0:
-                    continue
-                limit_up = o.get("limit_up") or 0
-                if limit_up <= 0:
-                    prev_close = _get_close_from_kis_api(client, code, use_today=False)
-                    if prev_close <= 0:
-                        name = o.get("name", code_name_map.get(code, code))
-                        _notify(f"{ts_prefix()} [시간외단일가스킵] {name}({code}) 전일종가 조회 실패")
-                        continue
-                    limit_up = calc_limit_up_price(prev_close)
-                name = o.get("name", code_name_map.get(code, code))
-                order_items.append({"code": code, "name": name, "remain": remain, "limit_up": limit_up})
-
-            # 2) 다중계좌 + 10건 단위 배치 발송
-            for acct in _iter_enabled_accounts(trade_only=True):
-                cano = str(acct.get("cano", "")).strip()
-                acnt = str(acct.get("acnt_prdt_cd", "01")).strip() or "01"
-                if not cano:
-                    continue
-                ok_list, fail_list = [], []
-                for idx, item in enumerate(order_items):
-                    if idx > 0 and idx % 10 == 0:
-                        time.sleep(1.0)  # KIS REST API 10건/초 제한 준수
-                    try:
-                        _buy_order_cash(client, cano, acnt, tr_id,
-                                        item["code"], item["remain"], item["limit_up"], ord_dvsn="07")
-                        ok_list.append(item)
-                    except Exception as e:
-                        fail_list.append((item, str(e)))
-                        logger.warning(f"{ts_prefix()} [시간외단일가실패] {item['code']}: {e}")
-
-                # 3) 통합 결과 출력
-                lines = [f"{ts_prefix()} [시간외단일가주문] {len(ok_list)}건 발송완료 ({len(order_items)}건 중) 계좌={cano[-4:]}"]
-                for it in ok_list:
-                    lines.append(f"  {it['name']}({it['code']}) 수량={it['remain']} 상한가={it['limit_up']:,.0f} (ORD_DVSN=07)")
-                for it, err in fail_list:
-                    lines.append(f"  [실패] {it['name']}({it['code']}) {it['remain']}주: {err}")
-                _notify("\n".join(lines), tele=True)
-        except Exception as e:
-            _notify(f"{ts_prefix()} [시간외단일가] 전체 실패: {e}")
-            logger.warning(f"{ts_prefix()} [시간외단일가] 실패: {e}")
+        # [DISABLED 2026-04-02] 상한가 종목 시간외단일가 매수 비활성화
+        # 상한가 종목은 매도 물량이 안 나오다가 하락 시 손실 위험 → 매수 로직 비활성화
+        unfilled_names = [f"{o.get('name', o['code'])}({o['code']})" for o in unfilled]
+        _notify(f"{ts_prefix()} [시간외단일가] 매수 비활성화 (상한가 매수 전략 중단) — {len(unfilled)}건 스킵: {', '.join(unfilled_names)}", tele=True)
+        # try:
+        #     client = _top_client or _init_top_client()
+        #     tr_id = "TTTC0802U"
+        #     # 1) 주문 데이터 사전 준비 (상한가 조회 등)
+        #     order_items = []
+        #     for o in unfilled:
+        #         code = o["code"]
+        #         remain = int(o.get("remain_qty", 0))
+        #         if remain <= 0:
+        #             continue
+        #         limit_up = o.get("limit_up") or 0
+        #         if limit_up <= 0:
+        #             prev_close = _get_close_from_kis_api(client, code, use_today=False)
+        #             if prev_close <= 0:
+        #                 name = o.get("name", code_name_map.get(code, code))
+        #                 _notify(f"{ts_prefix()} [시간외단일가스킵] {name}({code}) 전일종가 조회 실패")
+        #                 continue
+        #             limit_up = calc_limit_up_price(prev_close)
+        #         name = o.get("name", code_name_map.get(code, code))
+        #         order_items.append({"code": code, "name": name, "remain": remain, "limit_up": limit_up})
+        #
+        #     # 2) 다중계좌 + 10건 단위 배치 발송
+        #     for acct in _iter_enabled_accounts(trade_only=True):
+        #         cano = str(acct.get("cano", "")).strip()
+        #         acnt = str(acct.get("acnt_prdt_cd", "01")).strip() or "01"
+        #         if not cano:
+        #             continue
+        #         ok_list, fail_list = [], []
+        #         for idx, item in enumerate(order_items):
+        #             if idx > 0 and idx % 10 == 0:
+        #                 time.sleep(1.0)  # KIS REST API 10건/초 제한 준수
+        #             try:
+        #                 _buy_order_cash(client, cano, acnt, tr_id,
+        #                                 item["code"], item["remain"], item["limit_up"], ord_dvsn="07")
+        #                 ok_list.append(item)
+        #             except Exception as e:
+        #                 fail_list.append((item, str(e)))
+        #                 logger.warning(f"{ts_prefix()} [시간외단일가실패] {item['code']}: {e}")
+        #
+        #         # 3) 통합 결과 출력
+        #         lines = [f"{ts_prefix()} [시간외단일가주문] {len(ok_list)}건 발송완료 ({len(order_items)}건 중) 계좌={cano[-4:]}"]
+        #         for it in ok_list:
+        #             lines.append(f"  {it['name']}({it['code']}) 수량={it['remain']} 상한가={it['limit_up']:,.0f} (ORD_DVSN=07)")
+        #         for it, err in fail_list:
+        #             lines.append(f"  [실패] {it['name']}({it['code']}) {it['remain']}주: {err}")
+        #         _notify("\n".join(lines), tele=True)
+        # except Exception as e:
+        #     _notify(f"{ts_prefix()} [시간외단일가] 전체 실패: {e}")
+        #     logger.warning(f"{ts_prefix()} [시간외단일가] 실패: {e}")
     else:
         # 16:10~17:50: 체결 확인만 수행 (추가 주문 없음)
         if unfilled:

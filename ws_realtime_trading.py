@@ -1273,7 +1273,9 @@ def _get_balance_holdings() -> dict[str, dict]:
                     qty = int(float(str(row.get("hldg_qty", 0) or 0).replace(",", "") or 0))
                     psbl = int(float(str(row.get("ord_psbl_qty", 0) or 0).replace(",", "") or 0))
                     pchs = float(str(row.get("pchs_avg_pric", 0) or 0).replace(",", "") or 0)
-                    effective_qty = psbl if psbl > 0 else qty
+                    effective_qty = psbl if psbl > 0 else 0  # 주문가능수량 기준 (매도완료 T+2 결제 전 hldg_qty 잔존 방지)
+                    if effective_qty <= 0:
+                        continue
                     if c not in hold_map:
                         hold_map[c] = {"qty": effective_qty, "buy_price": pchs}
                         _code_account_map[c] = acct  # 해당 종목을 보유한 계좌 기록

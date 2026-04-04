@@ -3456,6 +3456,15 @@ codes = _load_codes_from_cfg(_code_text_codes)
 if not codes:
     raise RuntimeError("CODE_TEXT에서 종목코드를 찾지 못했습니다.")
 code_name_map = _code_name_map()
+# code → market 매핑 (KOSPI/KOSDAQ) — 사이드카/써킷 마켓 전파용
+try:
+    _sdf_mkt = load_symbol_master()
+    _sdf_mkt["code"] = _sdf_mkt["code"].astype(str).str.zfill(6)
+    _code_market_map = dict(zip(_sdf_mkt["code"], _sdf_mkt["market"].astype(str)))
+    logger.info(f"[codes] code_market_map 로드: {len(_code_market_map)}종목")
+    del _sdf_mkt
+except Exception as _e:
+    logger.warning(f"[codes] code_market_map 로드 실패: {_e}")
 logger.info(f"[codes] count={len(codes)} codes={codes}")
 _codes_lock = threading.RLock()
 # base_codes = morning_target 종목 (하루 종일 보호, top30에 의한 해제 방지)
@@ -4578,6 +4587,13 @@ _vi_exp_sub_ts: dict[str, float] = {}         # VI 종목 예상체결가 구독
 _vi_stnd_prc: dict[str, float] = {}           # 종목별 VI기준가 (실시간체결 VI_STND_PRC)
 _vi_trigger_count: dict[str, int] = {}        # 종목별 VI 발동 횟수 (당일 누적)
 _vi_history: list[dict] = []                  # VI 발동 이력 [{code, name, vi_type, stnd_prc, price, time}, ...]
+# ── VI/마켓 이벤트 시각 추적 (parquet 저장용) ──
+_vi_start_ts: dict[str, str] = {}             # code → VI 발동 ISO timestamp
+_vi_end_ts: dict[str, str] = {}               # code → VI 해제 ISO timestamp
+_code_market_map: dict[str, str] = {}         # code → "KOSPI"/"KOSDAQ"
+_market_wide_event: dict[str, str] = {}       # "KOSPI"/"KOSDAQ" → 이벤트명
+_market_wide_mkop: dict[str, str] = {}        # "KOSPI"/"KOSDAQ" → mkop_cls_code
+_market_wide_start_ts: dict[str, str] = {}    # "KOSPI"/"KOSDAQ" → 발동 ISO timestamp
 _rest_fail_backoff: dict[str, int] = {}       # REST 500 에러 연속 횟수 (백오프용)
 _single_price_codes: dict[str, str] = {}       # code → iscd_stat ("57" or "59") 30분 단일가 매매 종목
 _single_price_pending: dict[str, str] = {}     # code → iscd_stat, 틱 확인 전 대기 종목
@@ -4912,8 +4928,12 @@ def _enqueue_rest_price_row(code: str, output: dict, use_antc: bool | None = Non
         "wghn_avrg_stck_prc": output.get("wghn_avrg_stck_prc"),
         "prdy_ctrt": output.get("prdy_ctrt"),
         # 장운영상태 컬럼 (WSS 데이터와 일관성 유지)
-        "new_mkop_cls_code": _last_mkop_cls_code.get(code, ""),
-        "market_event": _market_event.get(code, ""),
+        "new_mkop_cls_code": _market_wide_mkop.get(_code_market_map.get(code, ""), "") or _last_mkop_cls_code.get(code, ""),
+        "market_event": _market_wide_event.get(_code_market_map.get(code, ""), "") or _market_event.get(code, ""),
+        # VI 이벤트 컬럼
+        "vi_yn": "Y" if code in _vi_active_codes else "",
+        "vi_start_ts": _vi_start_ts.get(code, ""),
+        "vi_end_ts": _vi_end_ts.get(code, ""),
     }
     df = pl.DataFrame([row])
     mode = _get_mode()
@@ -5103,7 +5123,11 @@ def _vi_poll_check() -> None:
             _vi_poll_active_codes[code] = vi_ts
             name = code_name_map.get(code, code)
             vi_time_str = datetime.fromtimestamp(vi_ts, tz=KST).strftime("%H:%M:%S")
+            vi_time_iso = datetime.fromtimestamp(vi_ts, tz=KST).strftime("%Y-%m-%d %H:%M:%S")
             logger.info(f"{ts_prefix()} [VI폴링] VI 발동 감지: {name}({code}) 발동시각={vi_time_str}")
+            # VI 발동 시각 기록 (parquet 저장용)
+            _vi_start_ts[code] = vi_time_iso
+            _vi_end_ts.pop(code, None)
             # 구독 종목이면 예상체결가로 전환
             if code in set(codes):
                 _vi_exp_sub_add(code)
@@ -5116,6 +5140,7 @@ def _vi_poll_check() -> None:
             name = code_name_map.get(code, code)
             logger.info(f"{ts_prefix()} [VI폴링] VI 해제 확인 (API 미포함): {name}({code})")
             del _vi_poll_active_codes[code]
+            _vi_end_ts[code] = datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S")
             if code in _vi_active_codes:
                 _vi_exp_sub_unsub(code)
 
@@ -5132,6 +5157,7 @@ def _vi_poll_expire_check(now: float) -> None:
             name = code_name_map.get(code, code)
             logger.info(f"{ts_prefix()} [VI폴링] VI 해제 추정 ({elapsed:.0f}초 경과): {name}({code})")
             del _vi_poll_active_codes[code]
+            _vi_end_ts[code] = datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S")
             if code in _vi_active_codes:
                 _vi_exp_sub_unsub(code)
 
@@ -5362,6 +5388,16 @@ def _on_market_status_krx(result) -> None:
 
         # 장운영구분코드 (mkop_cls_code) 감지 — 사이드카/서킷브레이크/임시정지
         mkop = str(row.get("mkop_cls_code", "")).strip()
+        # EXCH_CLS_CODE로 마켓 식별 (fallback: _code_market_map)
+        exch_cls = str(row.get("EXCH_CLS_CODE", "")).strip()
+        market = _code_market_map.get(code, "")
+        if exch_cls:
+            # EXCH_CLS_CODE 값 → 마켓 매핑 (실제 값 확인 후 조정 필요)
+            if exch_cls in ("1", "K"):
+                market = "KOSPI"
+            elif exch_cls in ("2", "Q"):
+                market = "KOSDAQ"
+            logger.debug(f"[장운영] {name}({code}) EXCH_CLS_CODE={exch_cls} → market={market}")
         if mkop:
             prev_mkop = _last_mkop_event.get(code, "")
             if mkop != prev_mkop:
@@ -5373,6 +5409,13 @@ def _on_market_status_krx(result) -> None:
                            f"mkop={mkop} ({event_name})")
                     logger.warning(msg)
                     _notify(msg, tele=True)
+                    # 사이드카/써킷 발동 → 마켓 전체 전파
+                    if mkop in ("187", "397", "174", "184", "164") and market:
+                        now_iso = datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S")
+                        _market_wide_event[market] = event_name
+                        _market_wide_mkop[market] = mkop
+                        _market_wide_start_ts[market] = now_iso
+                        logger.warning(f"{ts_prefix()} [장운영] 마켓전파: {market} ← {event_name} (발동시각={now_iso})")
                 elif mkop in ("112", "121", "129"):
                     # 일반 장운영 상태 변경 (동시호가 등) — 로깅만
                     _market_event.pop(code, None)  # 이벤트 해소
@@ -5380,6 +5423,12 @@ def _on_market_status_krx(result) -> None:
                 # 사이드카/서킷브레이크 해제 시 이벤트 클리어
                 if mkop in ("175", "185", "388", "398"):
                     _market_event.pop(code, None)
+                    # 마켓 전파 해제
+                    if market:
+                        _market_wide_event.pop(market, None)
+                        _market_wide_mkop.pop(market, None)
+                        _market_wide_start_ts.pop(market, None)
+                        logger.info(f"{ts_prefix()} [장운영] 마켓전파 해제: {market} (mkop={mkop})")
 
         # iscd_stat 갱신 — H0STMKO0의 값은 KRX DB와 다를 수 있으므로 교차검증
         if iscd_stat in ("57", "59") and code not in _single_price_codes and code not in _single_price_pending:
@@ -5408,12 +5457,17 @@ def _on_market_status_krx(result) -> None:
                     cnt = _vi_trigger_count.get(code, 0) + 1
                     _vi_trigger_count[code] = cnt
                     _vi_exp_sub_add(code)
+                    # VI 발동 시각 기록 (parquet 저장용)
+                    _vi_start_ts[code] = datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S")
+                    _vi_end_ts.pop(code, None)
                     msg = (f"{ts_prefix()} [VI발동] {name}({code}) "
                            f"vi_cls={vi_cls} ({cnt}회차)")
                     logger.warning(msg)
                     _notify(msg, tele=True)
                 elif vi_cls == "N":  # VI 해제
                     _vi_exp_sub_unsub(code)
+                    # VI 해제 시각 기록
+                    _vi_end_ts[code] = datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S")
                     msg = (f"{ts_prefix()} [VI해제] {name}({code}) "
                            f"vi_cls={vi_cls}")
                     logger.info(msg)
@@ -8117,6 +8171,17 @@ def ingest_loop():
                                     df_code = df_code.with_columns(
                                         ind_df[col_name].alias(col_name)
                                     )
+                        # ── VI/마켓 이벤트 컬럼 추가 (parquet 저장용) ──
+                        _mkt = _code_market_map.get(code, "")
+                        _mkt_evt = _market_wide_event.get(_mkt, "") or _market_event.get(code, "")
+                        _mkt_mkop = _market_wide_mkop.get(_mkt, "") or _last_mkop_cls_code.get(code, "")
+                        df_code = df_code.with_columns([
+                            pl.lit("Y" if code in _vi_active_codes else "").alias("vi_yn"),
+                            pl.lit(_vi_start_ts.get(code, "")).alias("vi_start_ts"),
+                            pl.lit(_vi_end_ts.get(code, "")).alias("vi_end_ts"),
+                            pl.lit(_mkt_evt).alias("market_event"),
+                            pl.lit(_mkt_mkop).alias("new_mkop_cls_code"),
+                        ])
                         chunks.append(df_code)
                 # _part_buffer 에 추가 (1000행 또는 1분마다 part 파일로 flush)
                 if chunks:

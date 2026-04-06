@@ -1011,6 +1011,16 @@ def _query_and_print_balance(label: str, *, trade_only: bool = True,
         return {}
 
 
+def _run_balance_0758() -> dict[str, dict]:
+    """07:58 잔고조회 → NXT 프리마켓 보유종목 파악."""
+    global _balance_0758_done
+    if _balance_0758_done:
+        return {}
+    hold_map = _query_and_print_balance("07:58 잔고조회(NXT)", trade_only=True, tele_label="07:58 NXT잔고")
+    _balance_0758_done = True
+    return hold_map
+
+
 def _run_balance_0858() -> None:
     """08:58 계좌잔고조회 1회 실행, 결과 출력. 모든 활성 계좌 순회."""
     global _balance_0858_done
@@ -3318,36 +3328,60 @@ def _load_morning_target_codes() -> list[str]:
 
 
 def _load_nxt_target_codes_pre() -> set[str]:
-    """NXT 프리마켓 대상: 전일 상한가 CSV 중 nxt=Y 종목 필터."""
-    global _nxt_target_codes
+    """NXT 프리마켓 대상: 전일 상한가 CSV 중 nxt=Y 종목 + 보유종목."""
+    global _nxt_target_codes, _nxt_target_info
+    _nxt_target_info.clear()
     try:
         csv_path = Path("/home/ubuntu/Stoc_Kis/symulation/Select_Tr_target_list.csv")
-        if not csv_path.exists():
-            logger.info("[nxt] Select_Tr_target_list.csv 없음 → NXT 대상 0종목")
-            return set()
-        df = pd.read_csv(csv_path, dtype=str, encoding="utf-8-sig")
-        if df.empty or "symbol" not in df.columns:
-            return set()
-        last_date = df["date"].max() if "date" in df.columns else None
-        if last_date:
-            df = df[df["date"] == last_date]
-        raw_codes = df["symbol"].str.strip().str.zfill(6).unique().tolist()
+        upper_codes: set[str] = set()
+        if csv_path.exists():
+            df = pd.read_csv(csv_path, dtype=str, encoding="utf-8-sig")
+            if not df.empty and "symbol" in df.columns:
+                last_date = df["date"].max() if "date" in df.columns else None
+                if last_date:
+                    df = df[df["date"] == last_date]
+                raw_codes = df["symbol"].str.strip().str.zfill(6).unique().tolist()
 
-        # nxt=Y 필터 (KRX_code.csv)
-        krx_path = Path("/home/ubuntu/Stoc_Kis/data/admin/symbol_master/KRX_code.csv")
-        nxt_set = set()
-        if krx_path.exists():
-            krx_df = pd.read_csv(krx_path, dtype=str)
-            if "code" in krx_df.columns and "nxt" in krx_df.columns:
-                krx_df["code"] = krx_df["code"].str.strip().str.zfill(6)
-                nxt_set = set(krx_df.loc[krx_df["nxt"].str.strip().str.upper() == "Y", "code"])
-        if nxt_set:
-            result = {c for c in raw_codes if c in nxt_set}
+                # nxt=Y 필터 (KRX_code.csv)
+                krx_path = Path("/home/ubuntu/Stoc_Kis/data/admin/symbol_master/KRX_code.csv")
+                nxt_set = set()
+                if krx_path.exists():
+                    krx_df = pd.read_csv(krx_path, dtype=str)
+                    if "code" in krx_df.columns and "nxt" in krx_df.columns:
+                        krx_df["code"] = krx_df["code"].str.strip().str.zfill(6)
+                        nxt_set = set(krx_df.loc[krx_df["nxt"].str.strip().str.upper() == "Y", "code"])
+                if nxt_set:
+                    upper_codes = {c for c in raw_codes if c in nxt_set}
+                else:
+                    logger.warning("[nxt] KRX_code에 nxt 컬럼 없음 → 전일 상한가 전체를 NXT 대상으로 사용")
+                    upper_codes = set(raw_codes)
+
+                # CSV에서 종목별 정보 추출
+                for c in upper_codes:
+                    row = df[df["symbol"].str.strip().str.zfill(6) == c].iloc[0] if c in df["symbol"].str.strip().str.zfill(6).values else None
+                    if row is not None:
+                        try:
+                            pdy_ctrt = float(row.get("pdy_ctrt", 0)) * 100 if row.get("pdy_ctrt") else 0
+                            close = float(row.get("close", 0)) if row.get("close") else 0
+                        except (ValueError, TypeError):
+                            pdy_ctrt, close = 0, 0
+                        _nxt_target_info[c] = {
+                            "name": code_name_map.get(c, c), "pdy_close": close,
+                            "pdy_ctrt": pdy_ctrt, "source": "상한가",
+                        }
+                    else:
+                        _nxt_target_info[c] = {"name": code_name_map.get(c, c), "source": "상한가"}
         else:
-            logger.warning("[nxt] KRX_code에 nxt 컬럼 없음 → 전일 상한가 전체를 NXT 대상으로 사용")
-            result = set(raw_codes)
-        names = [code_name_map.get(c, c) for c in sorted(result)]
-        logger.info(f"{ts_prefix()} [nxt] 프리마켓 대상: {len(result)}종목 (전일상한가 {len(raw_codes)}종목 중 nxt=Y) {names}")
+            logger.info("[nxt] Select_Tr_target_list.csv 없음")
+
+        # 보유종목 추가 (nxt=Y 필터 없이 무조건 포함 — 방어 목적)
+        held_added = _nxt_held_codes - upper_codes
+        for c in held_added:
+            _nxt_target_info[c] = {"name": code_name_map.get(c, c), "source": "보유"}
+
+        result = upper_codes | _nxt_held_codes
+        logger.info(f"{ts_prefix()} [nxt] 프리마켓 대상: {len(result)}종목 "
+                     f"(상한가 {len(upper_codes)} + 보유 {len(held_added)})")
         _nxt_target_codes = result
         return result
     except Exception as e:
@@ -3359,7 +3393,7 @@ def _refresh_nxt_target_codes_after() -> set[str]:
     """NXT 애프터마켓 대상: 당일 prdy_ctrt >= 29.5% + nxt=Y 종목.
     재시작 시 _last_prdy_ctrt가 비어있으면 프리마켓 대상(전일 상한가)으로 폴백.
     """
-    global _nxt_target_codes
+    global _nxt_target_codes, _nxt_target_info
     try:
         candidates = {c for c, v in _last_prdy_ctrt.items() if v >= 29.5}
         if not candidates:
@@ -3376,11 +3410,23 @@ def _refresh_nxt_target_codes_after() -> set[str]:
                 krx_df["code"] = krx_df["code"].str.strip().str.zfill(6)
                 nxt_set = set(krx_df.loc[krx_df["nxt"].str.strip().str.upper() == "Y", "code"])
         if nxt_set:
-            result = candidates & nxt_set
+            upper_codes = candidates & nxt_set
         else:
-            result = candidates
-        names = [code_name_map.get(c, c) for c in sorted(result)]
-        logger.info(f"{ts_prefix()} [nxt] 애프터마켓 대상 갱신: {len(result)}종목 (당일 상한가 {len(candidates)}종목 중 nxt=Y) {names}")
+            upper_codes = candidates
+
+        # _nxt_target_info 갱신
+        _nxt_target_info.clear()
+        for c in upper_codes:
+            _nxt_target_info[c] = {"name": code_name_map.get(c, c), "source": "상한가"}
+
+        # 보유종목 추가 (방어 목적)
+        held_added = _nxt_held_codes - upper_codes
+        for c in held_added:
+            _nxt_target_info[c] = {"name": code_name_map.get(c, c), "source": "보유"}
+
+        result = upper_codes | _nxt_held_codes
+        logger.info(f"{ts_prefix()} [nxt] 애프터마켓 대상 갱신: {len(result)}종목 "
+                     f"(상한가 {len(upper_codes)} + 보유 {len(held_added)})")
         _nxt_target_codes = result
         return result
     except Exception as e:
@@ -3559,6 +3605,8 @@ _last_mkop_cls_code: dict[str, str] = {}  # code -> new_mkop_cls_code (종목상
 _last_trid_per_code: dict[str, str] = {}  # code → 마지막 수신 tr_id
 _last_stck_prpr: dict[str, float] = {}  # code -> 최근 체결가 (모니터링용)
 _nxt_target_codes: set[str] = set()    # NXT 프리/애프터마켓 대상 종목 (전일 상한가 + nxt=Y)
+_nxt_held_codes: set[str] = set()      # NXT 프리마켓 보유종목 (07:58 잔고조회)
+_nxt_target_info: dict[str, dict] = {} # code -> {name, pdy_close, pdy_ctrt, source}
 _subscribed: dict[str, set[str]] = {}
 
 def calc_mode(now: datetime) -> RunMode:
@@ -3586,8 +3634,28 @@ def _log_mode_transition(prev: RunMode | None, cur: RunMode) -> None:
     if cur == RunMode.PREOPEN_WAIT:
         _notify(f"{ts_prefix()} 장 개시전까지 대기/", tele=True)
     elif cur == RunMode.NXT_PRE:
-        nxt_names = [code_name_map.get(c, c) for c in sorted(_nxt_target_codes)]
-        _notify(f"{ts_prefix()} NXT 프리마켓 시작 (08:00~08:50): {len(_nxt_target_codes)}종목 {nxt_names}", tele=True)
+        lines = [f"{ts_prefix()} NXT 프리마켓 시작 (08:00~08:50): {len(_nxt_target_codes)}종목 모니터링 시작"]
+        upper = [c for c in sorted(_nxt_target_codes) if _nxt_target_info.get(c, {}).get("source") == "상한가"]
+        held = [c for c in sorted(_nxt_target_codes) if _nxt_target_info.get(c, {}).get("source") == "보유"]
+        if upper:
+            lines.append(f"  ▶ 전일 상한가(nxt=Y): {len(upper)}종목")
+            for c in upper:
+                info = _nxt_target_info.get(c, {})
+                name = info.get("name", code_name_map.get(c, c))
+                pdy_ctrt = info.get("pdy_ctrt")
+                pdy_close = info.get("pdy_close")
+                detail = f"  - {name}({c})"
+                if pdy_close:
+                    detail += f" 전일종가 {int(pdy_close):,}"
+                if pdy_ctrt:
+                    detail += f" ({'+' if pdy_ctrt >= 0 else ''}{pdy_ctrt:.1f}%)"
+                lines.append(detail)
+        if held:
+            lines.append(f"  ▶ 보유종목: {len(held)}종목")
+            for c in held:
+                name = _nxt_target_info.get(c, {}).get("name", code_name_map.get(c, c))
+                lines.append(f"  - {name}({c})")
+        _notify("\n".join(lines), tele=True)
     elif cur == RunMode.PREOPEN_EXP:
         _sub_names = [code_name_map.get(c, c) for c in codes]
         _notify(f"{ts_prefix()} 08:50 예상체결가 구독 시작: {len(codes)}종목 {_sub_names}", tele=True)
@@ -3608,8 +3676,20 @@ def _log_mode_transition(prev: RunMode | None, cur: RunMode) -> None:
     elif cur == RunMode.NXT_AFTER:
         if not _nxt_target_codes:
             _refresh_nxt_target_codes_after()  # 재시작 시 대상 자동 갱신
-        nxt_names = [code_name_map.get(c, c) for c in sorted(_nxt_target_codes)]
-        _notify(f"{ts_prefix()} NXT 애프터마켓 시작 (15:40~20:00): {len(_nxt_target_codes)}종목 {nxt_names}", tele=True)
+        lines = [f"{ts_prefix()} NXT 애프터마켓 시작 (15:40~20:00): {len(_nxt_target_codes)}종목 모니터링 시작"]
+        upper = [c for c in sorted(_nxt_target_codes) if _nxt_target_info.get(c, {}).get("source") != "보유"]
+        held = [c for c in sorted(_nxt_target_codes) if _nxt_target_info.get(c, {}).get("source") == "보유"]
+        if upper:
+            lines.append(f"  ▶ 당일 상한가(nxt=Y): {len(upper)}종목")
+            for c in upper:
+                name = _nxt_target_info.get(c, {}).get("name", code_name_map.get(c, c))
+                lines.append(f"  - {name}({c})")
+        if held:
+            lines.append(f"  ▶ 보유종목: {len(held)}종목")
+            for c in held:
+                name = _nxt_target_info.get(c, {}).get("name", code_name_map.get(c, c))
+                lines.append(f"  - {name}({c})")
+        _notify("\n".join(lines), tele=True)
     elif cur == RunMode.STOP:
         _notify(f"{ts_prefix()} 모든 구독 종료")
     elif cur == RunMode.EXIT:
@@ -4070,6 +4150,17 @@ def scheduler_loop():
                         _sell_state_supplement_done = True
                     except Exception as e:
                         logger.warning(f"{ts_prefix()} [str1_sell] 매도 상태 보충 실패: {e}")
+            # 07:58 잔고조회 → NXT 프리마켓 보유종목 파악
+            if dtime(7, 58) <= now.time() < dtime(7, 59):
+                try:
+                    hold_map = _run_balance_0758()
+                    if hold_map:
+                        global _nxt_held_codes
+                        _nxt_held_codes = set(hold_map.keys())
+                        logger.info(f"{ts_prefix()} [잔고0758] NXT 보유종목: {len(_nxt_held_codes)}종목 "
+                                    f"{[code_name_map.get(c, c) for c in sorted(_nxt_held_codes)]}")
+                except Exception as e:
+                    logger.warning(f"{ts_prefix()} [잔고0758] {e}")
             # 08:58 계좌잔고조회 1회 (lock 밖에서 실행, HTTP 호출 있음)
             if dtime(8, 58) <= now.time() < dtime(8, 59):
                 try:
@@ -5961,6 +6052,7 @@ _watchdog_removed_codes: set[str] = set()  # watchdog WSS 미수신으로 해제
 _top_sub_log_path = TOP_RANK_OUT_DIR / f"wss_sub_add_top10_list_{today_yymmdd}.csv"
 _closing_codes: list[str] = []       # 15:19 선정된 종가매매 종목 (Select_Tr_target_list 조건)
 _closing_code_info: dict[str, dict] = {}  # code -> {prev_close, name} (매수 시 상한가 산정용)
+_balance_0758_done = False           # 07:58 잔고조회 1회 실행 플래그 (NXT 보유종목)
 _balance_0858_done = False           # 08:58 잔고조회 1회 실행 플래그
 _closing_buy_placed: list[dict] = [] # 15:20 주문 건 (15:30 체결 알림용)
 _closing_buy_filled_done = False     # 15:30 체결 메시지 1회 플래그

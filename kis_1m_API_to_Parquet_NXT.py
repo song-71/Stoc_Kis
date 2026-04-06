@@ -427,6 +427,13 @@ def main():
     merged = merged.drop_duplicates(subset=key_cols, keep="first").reset_index(drop=True)
     merged = merged.drop(columns=["_v_ok", "_a_ok", "_c_ok", "_score"], errors="ignore")
 
+    # volume 합계가 0이면 유효 데이터 없음 (개장 전 더미 데이터 방지)
+    total_vol = merged["volume"].fillna(0).sum() if "volume" in merged.columns else 0
+    if total_vol == 0:
+        _log(f"[1m_NXT] ⚠ 전체 volume 합계가 0 → 유효 데이터 없음. 저장 스킵 (biz_date={biz_date})")
+        _log("[1m_NXT] 프로그램 종료 (개장 전 또는 NXT 거래 없는 날)")
+        return
+
     _log(f"[1m_NXT] parquet 저장 (총 {len(merged)}건)")
     merged.to_parquet(parquet_path, index=False)
 

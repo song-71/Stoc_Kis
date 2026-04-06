@@ -82,6 +82,9 @@ VI_TRADE_MODE = "off"
 # 상한가 스톱 연속 이탈 확인 틱 수 (서버 스톱지정가 대신 클라이언트에서 N틱 연속 확인 후 매도)
 STOP_LIMIT_CONFIRM_TICKS = 30
 
+# NXT 애프터마켓 모니터링 대상이 없으면 조기 종료 (True: 즉시 종료 프로세스 실행, False: 20:00까지 대기)
+NXT_AFTER_EARLY_EXIT = True
+
 # 직전 영업일 종가매수 선정 종목을 당일 base codes로 자동 사용
 AUTO_CODE_FROM_PREV_CLOSING = True
 
@@ -3629,6 +3632,9 @@ def calc_mode(now: datetime) -> RunMode:
         return RunMode.EXIT
     return RunMode.EXIT
 
+# NXT 애프터마켓 조기 종료 플래그 (NXT_AFTER 진입 시 대상 없으면 설정)
+_nxt_after_early_exit: bool = False
+
 def _log_mode_transition(prev: RunMode | None, cur: RunMode) -> None:
     sys.stdout.write("\n")  # 제자리 출력 줄바꿈
     if cur == RunMode.PREOPEN_WAIT:
@@ -3674,8 +3680,13 @@ def _log_mode_transition(prev: RunMode | None, cur: RunMode) -> None:
     elif cur == RunMode.OVERTIME_REAL:
         _notify(f"{ts_prefix()} [시간외] 예상체결가 → 체결가 전환")
     elif cur == RunMode.NXT_AFTER:
+        global _nxt_after_early_exit
         if not _nxt_target_codes:
             _refresh_nxt_target_codes_after()  # 재시작 시 대상 자동 갱신
+        if not _nxt_target_codes and NXT_AFTER_EARLY_EXIT:
+            _nxt_after_early_exit = True
+            _notify(f"{ts_prefix()} NXT 애프터마켓: 모니터링 대상 0종목 → 조기 종료 진행", tele=True)
+            return
         lines = [f"{ts_prefix()} NXT 애프터마켓 시작 (15:40~20:00): {len(_nxt_target_codes)}종목 모니터링 시작"]
         upper = [c for c in sorted(_nxt_target_codes) if _nxt_target_info.get(c, {}).get("source") != "보유"]
         held = [c for c in sorted(_nxt_target_codes) if _nxt_target_info.get(c, {}).get("source") == "보유"]
@@ -4072,6 +4083,41 @@ def _exec_external_order(cfg: dict, order: dict, idx: int) -> None:
         order["result"] = f"failed: {len(target_accounts)}계좌 전부 실패"
 
 
+def _run_exit_shutdown(reason: str) -> None:
+    """프로그램 종료 프로세스 (EXIT 또는 NXT 조기 종료 시 공통 실행)."""
+    global _end_time_reached
+    # ① 마지막 단일가 결과 집계 출력
+    try:
+        _log_closing_order_aggregation("17:50단일가")
+    except Exception:
+        pass
+    # ② 시간외 단일가 마감 총 거래 내역 통보
+    try:
+        _notify_overtime_single_price_final()
+    except Exception as e:
+        logger.warning(f"{ts_prefix()} [시간외단일가 마감통보] {e}")
+    # ③ 구독 종료 + WS 닫기
+    sys.stdout.write("\n")
+    _notify(f"{ts_prefix()} 시간외 체결가 구독 종료")
+    with _kws_lock:
+        if _active_kws is not None:
+            _request_ws_close(_active_kws)
+    time.sleep(1.0)
+    # ④ 버퍼 flush + parts 병합
+    _flush_part_buffer("shutdown", force_full=True)
+    _merge_parts_to_final()
+    # ⑤ 거래장부 연도별 parquet 갱신
+    _append_daily_ledger_to_yearly()
+    time.sleep(1.0)
+    # ⑥ 최종 요약
+    _notify(_final_summary())
+    time.sleep(1.0)
+    # ⑦ 프로그램 종료 안내
+    _notify(f"{ts_prefix()} {reason}로 프로그램 종료", tele=True)
+    _end_time_reached = True
+    _stop_event.set()
+
+
 def scheduler_loop():
     global _current_mode, _last_rebuild_ts, _last_no_data_warn_ts
     global _overtime_real_active, _overtime_real_last_progress_ts, _vi_delayed_codes, _vi_delay_until, _last_overtime_real_slot
@@ -4314,37 +4360,12 @@ def scheduler_loop():
                         _close_force_stopped = False
                     if new_mode == RunMode.OVERTIME_REAL:
                         _overtime_real_seen.clear()
+                    # NXT 애프터마켓 조기 종료: 대상 0종목 → EXIT 프로세스 즉시 실행
+                    if new_mode == RunMode.NXT_AFTER and _nxt_after_early_exit:
+                        _run_exit_shutdown("NXT 대상 0종목 조기 종료")
+                        break
                     if new_mode == RunMode.EXIT:
-                        # ① 마지막 단일가 결과 집계 출력 (시간외단일가가 활성이었을 경우)
-                        try:
-                            _log_closing_order_aggregation("17:50단일가")
-                        except Exception:
-                            pass
-                        # ② 시간외 단일가 마감 총 거래 내역 통보 (텔레그램)
-                        try:
-                            _notify_overtime_single_price_final()
-                        except Exception as e:
-                            logger.warning(f"{ts_prefix()} [시간외단일가 마감통보] {e}")
-                        # ③ 구독 종료 + WS 닫기
-                        sys.stdout.write("\n")
-                        _notify(f"{ts_prefix()} 시간외 체결가 구독 종료")
-                        with _kws_lock:
-                            if _active_kws is not None:
-                                _request_ws_close(_active_kws)
-                        time.sleep(1.0)
-                        # ② 버퍼 flush + parts 병합 (EXIT 시에만 병합)
-                        _flush_part_buffer("20:00_shutdown", force_full=True)
-                        _merge_parts_to_final()
-                        # ②-1 거래장부 연도별 parquet 갱신
-                        _append_daily_ledger_to_yearly()
-                        time.sleep(1.0)
-                        # ③ 최종 요약
-                        _notify(_final_summary())
-                        time.sleep(1.0)
-                        # ④ 프로그램 종료 안내 (텔레그램)
-                        _notify(f"{ts_prefix()} 20:00 NXT 애프터마켓 종료로 프로그램 종료", tele=True)
-                        _end_time_reached = True
-                        _stop_event.set()
+                        _run_exit_shutdown("20:00 NXT 애프터마켓 종료")
                         break
 
                 # ── VI 종목별 구독 관리: 09:00에 prdy_ctrt>=10% 종목만 예상체결 유지 ──

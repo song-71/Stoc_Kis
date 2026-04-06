@@ -252,6 +252,9 @@ def main():
     if biz_date:
         done_codes = _load_checkpoint(biz_date)
 
+    MAX_CONSECUTIVE_EMPTY = 20  # 연속 빈 응답 한도 (초과 시 API 장애로 판단하여 조기 종료)
+    consecutive_empty = 0
+
     for idx, code in enumerate(target_codes, 1):
         if biz_date and code in done_codes:
             logging.info("%s 체크포인트 skip: %s", ts_prefix(), code)
@@ -336,9 +339,14 @@ def main():
             code_rows.append(output2)
 
         if not code_rows:
+            consecutive_empty += 1
+            if consecutive_empty >= MAX_CONSECUTIVE_EMPTY:
+                _log(f"[1m_NXT] ⚠ 연속 {MAX_CONSECUTIVE_EMPTY}개 종목 빈 응답 → API 장애로 판단, 조기 종료")
+                break
             _report_progress(idx)
             continue
 
+        consecutive_empty = 0  # 데이터 수신 성공 시 리셋
         code_df = pd.concat(code_rows, ignore_index=True)
 
         if not code_df.empty:

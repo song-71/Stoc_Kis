@@ -10,6 +10,7 @@ from pathlib import Path
 from datetime import datetime, timedelta, timezone
 
 import pandas as pd
+import boto3
 
 sys.path.extend(['../..', '.'])
 import kis_auth as ka
@@ -201,10 +202,7 @@ def main():
     try:
         sdf = load_symbol_master()
         sdf["code"] = sdf["code"].astype(str).str.zfill(6)
-        if "group" in sdf.columns:
-            sdf = sdf[sdf["group"] == "ST"]
-        else:
-            logging.warning("%s 종목마스터에 group 컬럼이 없어 전체 종목으로 진행합니다.", ts_prefix())
+        # 전체 종목 대상 (ST 필터 제거)
         name_map = dict(zip(sdf["code"], sdf["name"]))
         name_to_code = dict(zip(sdf["name"].astype(str), sdf["code"]))
         target_codes = sdf["code"].tolist()
@@ -273,6 +271,9 @@ def main():
     done_codes: set[str] = set()
     if biz_date:
         done_codes = _load_checkpoint(biz_date)
+
+    MAX_CONSECUTIVE_EMPTY = 20  # 연속 빈 응답 한도 (초과 시 API 장애로 판단하여 조기 종료)
+    consecutive_empty = 0
 
     for idx, code in enumerate(target_codes, 1):
         if biz_date and code in done_codes:
@@ -363,10 +364,15 @@ def main():
             code_rows.append(output2)
 
         if not code_rows:
+            consecutive_empty += 1
+            if consecutive_empty >= MAX_CONSECUTIVE_EMPTY:
+                _log(f"[1m] ⚠ 연속 {MAX_CONSECUTIVE_EMPTY}개 종목 빈 응답 → API 장애로 판단, 조기 종료")
+                break
             logging.warning("%s 데이터 없음: %s", ts_prefix(), code)
             _report_progress(idx)
             continue
 
+        consecutive_empty = 0  # 데이터 수신 성공 시 리셋
         code_df = pd.concat(code_rows, ignore_index=True)
         if "time" in code_df.columns:
             time_norm = (
@@ -551,6 +557,42 @@ def main():
     time.sleep(0.2)
     logging.info("%s 저장 완료: %s", ts_prefix(), parquet_path)
     _log_tm_and_info(f"[1m_ohlcv] 저장 완료: {parquet_path.name}")
+
+    # ── S3 업로드 ──
+    try:
+        layout = load_kis_data_layout()
+        date_str = datetime.now(timezone(timedelta(hours=9))).strftime("%Y-%m-%d")
+        s3_url = layout.s3_1m_date(date_str)
+        # s3_url 형식: s3://bucket/prefix/.../ohlcv.parquet
+        s3_parts = s3_url.replace("s3://", "").split("/", 1)
+        s3_bucket, s3_key = s3_parts[0], s3_parts[1]
+        s3 = boto3.client("s3")
+        s3.upload_file(str(parquet_path), s3_bucket, s3_key)
+        logging.info("%s [S3] uploaded %s -> %s", ts_prefix(), parquet_path.name, s3_url)
+        _log_tm_and_info(f"[1m_ohlcv] S3 업로드 완료: {s3_url}")
+    except Exception as e:
+        logging.error("%s [S3] 업로드 실패: %s", ts_prefix(), e)
+
+    # ── EC2 로컬 1m 파일 정리 (최근 2일치만 유지) ──
+    try:
+        data_dir = Path("data/1m_data")
+        if data_dir.exists():
+            parquet_files = sorted(data_dir.glob("*_1m_chart_DB_parquet.parquet"))
+            dated_files = []
+            for f in parquet_files:
+                try:
+                    d = datetime.strptime(f.name[:8], "%Y%m%d")
+                    dated_files.append((d, f))
+                except ValueError:
+                    continue
+            if len(dated_files) > 2:
+                dated_files.sort(key=lambda x: x[0], reverse=True)
+                for _, old_file in dated_files[2:]:
+                    old_file.unlink()
+                    logging.info("%s [cleanup] 삭제: %s", ts_prefix(), old_file.name)
+    except Exception as e:
+        logging.error("%s [cleanup] 로컬 정리 실패: %s", ts_prefix(), e)
+
     _log_tm_and_info("[1m_ohlcv_All_code_download] 프로그램 종료")
 
 

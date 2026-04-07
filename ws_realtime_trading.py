@@ -5482,6 +5482,9 @@ _MKOP_EVENT_NAMES = {
     "182": "서킷브레이크장종동시마감", "184": "서킷브레이크개시", "185": "서킷브레이크해제",
     "164": "시장임시정지",
 }
+# 서킷브레이크 발동 중 상태 판별용 (거래중단 → 동시호가 전환 감지)
+_CIRCUIT_BREAK_ACTIVE_EVENTS = {"서킷브레이크발동", "서킷브레이크개시"}
+_CIRCUIT_BREAK_ALL_EVENTS = {"서킷브레이크발동", "서킷브레이크개시", "서킷브레이크동시호가"}
 
 def _on_market_status_krx(result) -> None:
     """H0STMKO0 장운영정보 수신 → 종목상태 갱신."""
@@ -5505,6 +5508,7 @@ def _on_market_status_krx(result) -> None:
 
         # 장운영구분코드 (mkop_cls_code) 감지 — 사이드카/서킷브레이크/임시정지
         mkop = str(row.get("mkop_cls_code", "")).strip()
+        antc_mkop = str(row.get("antc_mkop_cls_code", row.get("ANTC_MKOP_CLS_CODE", ""))).strip()
         # EXCH_CLS_CODE로 마켓 식별 (fallback: _code_market_map)
         exch_cls = str(row.get("EXCH_CLS_CODE", "")).strip()
         market = _code_market_map.get(code, "")
@@ -5515,6 +5519,22 @@ def _on_market_status_krx(result) -> None:
             elif exch_cls in ("2", "Q"):
                 market = "KOSDAQ"
             logger.debug(f"[장운영] {name}({code}) EXCH_CLS_CODE={exch_cls} → market={market}")
+
+        # ── ANTC_MKOP_CLS_CODE: 서킷브레이크 동시호가 전환 감지 ──
+        if antc_mkop == "311":
+            # 311=장전예상시작 → 서킷브레이크 진행 중이면 동시호가 단계 전환
+            cur_evt = _market_wide_event.get(market, "") if market else _market_event.get(code, "")
+            if cur_evt in _CIRCUIT_BREAK_ACTIVE_EVENTS:
+                auction_evt = "서킷브레이크동시호가"
+                _market_event[code] = auction_evt
+                if market:
+                    _market_wide_event[market] = auction_evt
+                    _market_wide_mkop[market] = "311"
+                msg = (f"{ts_prefix()} [장운영] {name}({code}) "
+                       f"antc_mkop=311 서킷브레이크 → 동시호가 전환")
+                logger.warning(msg)
+                _notify(msg, tele=True)
+
         if mkop:
             prev_mkop = _last_mkop_event.get(code, "")
             if mkop != prev_mkop:
@@ -5534,9 +5554,25 @@ def _on_market_status_krx(result) -> None:
                         _market_wide_start_ts[market] = now_iso
                         logger.warning(f"{ts_prefix()} [장운영] 마켓전파: {market} ← {event_name} (발동시각={now_iso})")
                 elif mkop in ("112", "121", "129"):
-                    # 일반 장운영 상태 변경 (동시호가 등) — 로깅만
-                    _market_event.pop(code, None)  # 이벤트 해소
-                    logger.info(f"{ts_prefix()} [장운영] {name}({code}) mkop={mkop}")
+                    # 서킷브레이크 진행 중이면 동시호가 전환 (클리어하지 않음)
+                    cur_evt = _market_wide_event.get(market, "") if market else _market_event.get(code, "")
+                    if cur_evt in _CIRCUIT_BREAK_ACTIVE_EVENTS:
+                        auction_evt = "서킷브레이크동시호가"
+                        _market_event[code] = auction_evt
+                        if market:
+                            _market_wide_event[market] = auction_evt
+                            _market_wide_mkop[market] = mkop
+                        msg = (f"{ts_prefix()} [장운영] {name}({code}) "
+                               f"mkop={mkop} 서킷브레이크 → 동시호가 전환")
+                        logger.warning(msg)
+                        _notify(msg, tele=True)
+                    elif cur_evt in _CIRCUIT_BREAK_ALL_EVENTS:
+                        # 이미 동시호가 상태에서 112(종료) → 175/185 해제까지 유지
+                        logger.info(f"{ts_prefix()} [장운영] {name}({code}) mkop={mkop} (동시호가 유지)")
+                    else:
+                        # 서킷 아닌 일반 장운영 상태 변경
+                        _market_event.pop(code, None)
+                        logger.info(f"{ts_prefix()} [장운영] {name}({code}) mkop={mkop}")
                 # 사이드카/서킷브레이크 해제 시 이벤트 클리어
                 if mkop in ("175", "185", "388", "398"):
                     _market_event.pop(code, None)

@@ -8645,27 +8645,6 @@ def run_ws_forever():
         if mode == RunMode.EXIT:
             break
 
-        # ── 보유종목 없으면 WSS 구독 불필요 → END_TIME까지 대기 ──
-        # 단, 종가매매(15:20~15:30) 또는 NXT 모드에서는 보유종목 없어도 WSS 유지
-        with _str1_sell_state_lock:
-            _has_held = any(not st.get("sold") for st in _str1_sell_state.values())
-        if not _has_held:
-            now_t = datetime.now(KST).time()
-            in_closing = (dtime(15, 20) <= now_t < dtime(15, 31)) or bool(_closing_codes)
-            in_nxt = mode in (RunMode.NXT_PRE, RunMode.NXT_AFTER) and bool(_nxt_target_codes)
-            if in_closing or in_nxt:
-                logger.info(f"{ts_prefix()} [ws] 보유종목 없지만 {'NXT' if in_nxt else '종가매매'} 구간 → WSS 유지")
-            elif now_t < END_TIME:
-                logger.info(f"{ts_prefix()} [ws] 보유종목 없음 → WSS 구독 생략, {END_TIME.strftime('%H:%M')}까지 대기")
-                while not _stop_event.is_set():
-                    if datetime.now(KST).time() >= END_TIME:
-                        break
-                    time.sleep(1800.0)  # 30분
-                logger.info(f"{ts_prefix()} [ws] {END_TIME.strftime('%H:%M')} 도달 → 마무리 진행")
-                break
-            else:
-                break
-
         attempt += 1
         kws = None
         try:

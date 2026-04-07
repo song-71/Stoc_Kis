@@ -155,3 +155,17 @@ while not _stop_event.is_set():
 - `/home/ubuntu/Stoc_Kis/ws_realtime_trading.py` (line 8648-8665: WSS 생략 로직, line 4509: no data watchdog)
 - `/home/ubuntu/Stoc_Kis/data/wss_data/` (WSS 실시간 데이터 저장)
 - `/home/ubuntu/Stoc_Kis/out/logs/wss_TR_2604*.log` (실행 로그)
+
+---
+
+## 구현 완료 (5596e38)
+
+**수정**: `run_ws_forever()` line 8648-8667의 "보유종목 없으면 WSS 생략" 블록 전체 삭제.
+
+**점검 결과**: 전일상한가 종목 구독 유지 정상 확인.
+- `_morning_target_codes`(전일상한가 전체)가 `codes` + `_base_codes`에 설정
+- 08:50~15:19까지 `all_codes = set(codes)`에 포함되어 구독 유지
+- `_base_codes`가 top30 해제 로직에서 보호
+- NXT_AFTER 조기 종료는 `_nxt_after_early_exit` 플래그로 별도 처리 (영향 없음)
+
+**원인 이력**: `05c257a` (2026-03-30, Claude 작성)에서 잘못 추가. `b54e369` (2026-04-02, NXT 구현)에서 종가매매/NXT 예외만 추가했으나 정규장 문제는 미해결.

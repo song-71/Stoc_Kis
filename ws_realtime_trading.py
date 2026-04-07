@@ -2208,6 +2208,11 @@ _opening_call_auction_watch: dict[str, dict] = {}
 _opening_call_auction_last_summary_ts: float = 0.0   # 1분 주기 출력용
 OPENING_CALL_AUCTION_SUMMARY_INTERVAL = 60.0         # 주기적 출력 간격 (초)
 _opening_call_auction_order_summary_done: bool = False  # 08:59:50 주문현황 정리 1회 출력용
+
+# ── 장전 예상체결가 시계열 모니터링 ──
+# code → {"0851": price, "0855": price, ..., "0900": price}
+_antc_prce_timeline: dict[str, dict[str, float]] = {}
+_ANTC_SNAPSHOT_TIMES = ["0851", "0855", "0856", "0857", "0858", "0859", "0900"]
 _opening_call_auction_cancelled_log: list[tuple[str, str, str]] = []  # (code, name, reason) 장전 취소 완료
 
 
@@ -7716,9 +7721,57 @@ def _check_str1_sell_conditions(
                 "reason": f"전일종가하락({prdy_v:.2f}%)" if prdy_v < 0 else "",
             }
 
+    # ── 장전 예상체결가 시계열 스냅샷 수집 ──
+    if is_opening_call_auction and _opening_call_auction_watch:
+        _hhmm = datetime.now(KST).strftime("%H%M")
+        if _hhmm in _ANTC_SNAPSHOT_TIMES:
+            for _code, _w in _opening_call_auction_watch.items():
+                _ap = _w.get("antc_prce", 0)
+                if _ap > 0:
+                    _antc_prce_timeline.setdefault(_code, {})[_hhmm] = _ap
+
     # ── Str1 모니터링 출력 (장전 08:29~09:00 / 장중 09:00~15:20 / 장마감 15:20~15:30) ──
     if (is_opening_call_auction or is_regular) and _opening_call_auction_watch:
         _print_opening_call_auction_monitor(newly_triggered, now_ts, is_opening_call_auction=is_opening_call_auction)
+
+
+def _print_antc_prce_timeline() -> None:
+    """장전 예상체결가 시계열 테이블 출력."""
+    try:
+        # 수집된 시각 컬럼만 표시 (시간순)
+        all_times = set()
+        for ts_map in _antc_prce_timeline.values():
+            all_times.update(ts_map.keys())
+        time_cols = [t for t in _ANTC_SNAPSHOT_TIMES if t in all_times]
+        if not time_cols:
+            return
+
+        rows = []
+        for code in sorted(_antc_prce_timeline.keys()):
+            w = _opening_call_auction_watch.get(code, {})
+            name = w.get("name", code)
+            qty = w.get("qty", 0)
+            buy_price = w.get("buy_price", 0)
+            row = {"종목명": name, "보유": f"{qty:,}", "매수단가": f"{buy_price:,.0f}"}
+            ts_map = _antc_prce_timeline[code]
+            for i, t in enumerate(time_cols):
+                col_label = f"예상:{t}" if i == 0 else t
+                row[col_label] = f"{ts_map[t]:,.0f}" if t in ts_map else "-"
+            rows.append(row)
+
+        columns = ["종목명", "보유", "매수단가"] + [f"예상:{time_cols[0]}"] + time_cols[1:]
+        align = {c: "right" for c in columns}
+        align["종목명"] = "left"
+
+        now_str = datetime.now(KST).strftime("%H:%M:%S")
+        tbl = print_table(rows, columns, align, no_print=True)
+        header = f"\n<예상체결가 현황> {now_str}"
+        output = f"{header}\n{tbl}"
+        sys.stdout.write(f"{output}\n")
+        sys.stdout.flush()
+        logger.info(output)
+    except Exception as e:
+        logger.warning(f"{ts_prefix()} [antc_timeline] {e}")
 
 
 def _run_balance_monitor_bg(sell_lines: list[str]) -> None:
@@ -7731,6 +7784,10 @@ def _run_balance_monitor_bg(sell_lines: list[str]) -> None:
             bal_label = "장마감 예상체결가 모니터링"
         else:
             bal_label = "보유종목 모니터링"
+
+        # ── 장전 예상체결가 시계열 테이블 출력 ──
+        if dtime(8, 29) <= nt < dtime(9, 0) and _antc_prce_timeline:
+            _print_antc_prce_timeline()
 
         hold_map = _query_and_print_balance(bal_label)
 

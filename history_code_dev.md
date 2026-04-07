@@ -2,6 +2,85 @@
 
 ---
 
+## [2026-04-07] 5596e38
+
+### 1. fix: 보유종목 없을 때 WSS 연결 건너뛰는 버그 수정
+- **카테고리**: fix
+- **파일**: `ws_realtime_trading.py`, `ws_monitoring_research_260407.md`
+- **사유**: 260403(수), 260406(월) 양일 WSS 실시간 데이터 0건 수신 현상 원인 분석 결과, `run_ws_forever()` 내 "보유종목 없으면 WSS 구독 생략 → 30분 sleep" 블록이 장 시작 시 보유종목이 없을 경우 WSS 연결 자체를 건너뛰도록 동작하는 것이 근본 원인으로 확인됨. 보유종목이 없어도 장중 신규 VI 매수 체결을 받아야 하므로 WSS는 항상 유지되어야 함
+- **주요 변경**:
+  1. **`run_ws_forever()` 내 조건 블록 제거** (기존 line 8648~8667): `_has_held` 판단 → WSS 구독 생략 → `time.sleep(1800)` 루프 전체 삭제
+  2. 이제 `RunMode.EXIT`가 아닌 이상 보유종목 유무와 관계없이 항상 WSS 연결 시도
+- **영향**: 장 시작 시 보유종목이 없어도 WSS가 정상 연결되어 VI 실시간 체결 수신 가능. 260403·260406 재발 방지
+
+---
+
+## [2026-04-06] 5f928a5
+
+### 1. feat: NXT 애프터마켓 대상 없을 시 조기 종료 옵션 추가 (NXT_AFTER_EARLY_EXIT)
+- **카테고리**: feat
+- **파일**: `ws_realtime_trading.py`
+- **사유**: 상한가 종목이 없고 보유종목도 없는 날 NXT 애프터마켓(15:40~20:00)을 불필요하게 대기하는 낭비를 제거. 조기 종료 옵션으로 즉시 정리 프로세스를 실행할 수 있도록 함
+- **주요 변경**:
+  1. **`NXT_AFTER_EARLY_EXIT` 옵션 추가** (상단 상수 영역): True이면 애프터마켓 진입 시 대상 0종목일 경우 즉시 종료 프로세스 실행, False이면 20:00까지 대기 (기존 동작)
+  2. **`_nxt_after_early_exit` 전역 플래그 추가**: `_log_mode_transition()` NXT_AFTER 분기에서 대상 0종목 + 옵션 활성 시 True로 설정하고 텔레그램 통보
+  3. **`_run_exit_shutdown(reason)` 함수 신설**: EXIT 및 조기 종료 공통 종료 프로세스를 단일 함수로 통합 (단일가 집계 → WS 닫기 → flush → parts 병합 → 거래장부 갱신 → 최종 요약 → 텔레그램 종료 안내 → `_stop_event.set()`)
+  4. **`scheduler_loop()` NXT_AFTER 진입 직후**: `_nxt_after_early_exit` 플래그 감지 시 `_run_exit_shutdown()` 즉시 호출 후 루프 탈출
+  5. **기존 EXIT 인라인 종료 블록 제거**: `_run_exit_shutdown("20:00 NXT 애프터마켓 종료")` 단일 호출로 대체
+- **영향**: 애프터마켓 대상이 없는 날 20:00까지 프로세스가 idle 상태로 유지되던 문제 해결. 종료 로직 중복 제거로 코드 유지보수성 향상
+
+---
+
+## [2026-04-06] 1072143
+
+### 1. fix: NXT 1분봉 개장 전 더미 데이터 저장 방지 + crontab 스케줄 수정
+- **카테고리**: fix
+- **파일**: `kis_1m_API_to_Parquet_NXT.py`, crontab
+- **사유**: 4.6(월) KST 06:30에 crontab이 NXT 다운로드를 실행했으나, NXT 프리마켓(08:00) 전이라 KIS API가 전일종가 기반 더미 데이터(volume=0, O=H=L=C)를 반환하여 빈 20260406 파일이 생성됨
+- **주요 변경**:
+  1. **volume=0 가드 추가**: 병합 후 저장 전 전체 volume 합계=0이면 저장 스킵 + 경고 로그
+  2. **crontab 시간 변경**: `30 21 * * 0-4` (KST 06:30) → `01 11 * * 1-5` (KST 20:01, NXT 애프터마켓 종료 직후)
+  3. **crontab 중복 제거**: 동일 NXT 명령이 `&nohup`으로 2번 실행되던 문제 수정
+  4. **잘못된 파일 삭제**: `20260406_1m_chart_DB_parquet_NXT.parquet` 삭제
+- **영향**: NXT 거래 없는 시간대에 빈 parquet 파일이 생성되는 문제 방지. 애프터마켓 종료 후 정상 수집
+
+---
+
+## [2026-04-06] 2177ea8
+
+### 1. feat: NXT 프리마켓 로그 상세화 + 보유종목 NXT 구독 추가
+- **카테고리**: feat
+- **파일**: `ws_realtime_trading.py`
+- **사유**: NXT 프리/애프터마켓 시작 시 로그가 종목명 나열만 하여 가독성이 낮고, 보유종목이 NXT 대상에 포함되지 않아 프리마켓 중 보유종목 가격 감시가 불가능했음
+- **주요 변경**:
+  1. **`_nxt_held_codes` / `_nxt_target_info` 전역변수 추가**: 보유종목 코드셋과 종목별 메타(이름·전일종가·등락률·출처) 저장
+  2. **`_run_balance_0758()` 신설**: 07:58 구간 1회 잔고조회로 NXT 프리마켓 시작 전 보유종목을 `_nxt_held_codes`에 저장
+  3. **`scheduler_loop()` 07:58 구간 추가**: `_run_balance_0758()` 호출 후 `_nxt_held_codes` 갱신 및 로그 출력
+  4. **`_load_nxt_target_codes_pre()` 개선**: 상한가(nxt=Y) 종목 정보를 `_nxt_target_info`에 저장하고, `_nxt_held_codes`를 합산하여 `_nxt_target_codes` 구성
+  5. **`_refresh_nxt_target_codes_after()` 개선**: 동일 패턴으로 `_nxt_target_info` 갱신 + 보유종목 합산
+  6. **`_log_mode_transition(NXT_PRE)` 개선**: 상한가 종목(전일종가·등락률 포함)과 보유종목을 구분하여 멀티라인 출력
+  7. **`_log_mode_transition(NXT_AFTER)` 개선**: 동일 패턴으로 애프터마켓 로그 상세화
+- **영향**: NXT 프리/애프터마켓 시작 시 어떤 종목이 왜 구독되는지 명확히 파악 가능. 보유종목이 NXT 대상에 포함되어 프리마켓 중 가격 변동 감시 가능
+
+---
+
+## [2026-04-04] 4671c78
+
+### 1. feat: VI/사이드카/써킷브레이크 이벤트 정보를 parquet 컬럼으로 저장
+- **카테고리**: feat
+- **파일**: `ws_realtime_trading.py`, `ws_monitoring_research_260404.md` (신규)
+- **사유**: 실시간 VI 발동/해제 시각 및 마켓 전체 이벤트(사이드카/써킷브레이크)를 parquet에 기록하여 백테스트·분석에서 이벤트 구간을 식별할 수 있도록 함
+- **주요 변경**:
+  1. **메모리 변수 6개 추가**: `_vi_start_ts`, `_vi_end_ts` (종목별 VI 발동·해제 ISO timestamp), `_code_market_map` (code→KOSPI/KOSDAQ), `_market_wide_event`, `_market_wide_mkop`, `_market_wide_start_ts` (마켓 전체 이벤트 전파용)
+  2. **symbol_master 초기화**: `code→market` 매핑(`_code_market_map`) 기동 시 로드
+  3. **`_on_market_status_krx`**: `EXCH_CLS_CODE` 파싱으로 마켓 식별; 사이드카/써킷 발동 시 `_market_wide_*` 전파, 해제 시 클리어; VI 발동·해제 시각 `_vi_start_ts`/`_vi_end_ts` 기록
+  4. **`_vi_poll_check` / `_vi_poll_expire_check`**: REST 폴링 경로에서도 VI 발동·해제 시각 기록
+  5. **WSS `ingest_loop`**: `vi_yn`, `vi_start_ts`, `vi_end_ts`, `market_event`, `new_mkop_cls_code` 5개 컬럼을 parquet에 추가
+  6. **REST `_enqueue_rest_price_row`**: 동일 5개 컬럼 추가, `market_wide` 데이터 우선 적용 후 종목별 값 fallback
+- **영향**: 모든 1분봉 parquet에 VI/마켓 이벤트 컬럼이 포함되어 사후 분석 시 VI 발동 구간, 사이드카/써킷 발동 시간대를 직접 조회 가능
+
+---
+
 ## [2026-04-02] 8885254
 
 ### 1. feat: NXT 프리마켓/애프터마켓 1분봉 다운로드 스크립트 추가

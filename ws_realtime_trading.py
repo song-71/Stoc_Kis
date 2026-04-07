@@ -3631,7 +3631,9 @@ def calc_mode(now: datetime) -> RunMode:
         return RunMode.CLOSE_EXP
     if dtime(15, 30) <= t < dtime(15, 40):
         return RunMode.CLOSE_REAL
-    if dtime(15, 40) <= t < dtime(20, 0):
+    if dtime(15, 40) <= t < dtime(16, 0):
+        return RunMode.CLOSE_REAL    # 시간외종가 매매 구간 — NXT 진입 전
+    if dtime(16, 0) <= t < dtime(20, 0):
         return RunMode.NXT_AFTER
     if t >= dtime(20, 0):
         return RunMode.EXIT
@@ -3692,7 +3694,7 @@ def _log_mode_transition(prev: RunMode | None, cur: RunMode) -> None:
             _nxt_after_early_exit = True
             _notify(f"{ts_prefix()} NXT 애프터마켓: 모니터링 대상 0종목 → 조기 종료 진행", tele=True)
             return
-        lines = [f"{ts_prefix()} NXT 애프터마켓 시작 (15:40~20:00): {len(_nxt_target_codes)}종목 모니터링 시작"]
+        lines = [f"{ts_prefix()} NXT 애프터마켓 시작 (16:00~20:00): {len(_nxt_target_codes)}종목 모니터링 시작"]
         upper = [c for c in sorted(_nxt_target_codes) if _nxt_target_info.get(c, {}).get("source") != "보유"]
         held = [c for c in sorted(_nxt_target_codes) if _nxt_target_info.get(c, {}).get("source") == "보유"]
         if upper:
@@ -8663,8 +8665,12 @@ def _desired_subscription_map(now: datetime) -> dict:
         # 15:30~15:31: 종가 체결가 수신 대기
         return {ccnl_krx: all_codes}  # noqa: F405
 
-    # NXT 애프터마켓 (15:40~20:00)
-    if dtime(15, 40) <= t < dtime(20, 0):
+    # 15:40~16:00 시간외종가 — WSS 구독 불필요 (REST 주문 + 체결통보)
+    if dtime(15, 40) <= t < dtime(16, 0):
+        return {}
+
+    # NXT 애프터마켓 (16:00~20:00)
+    if dtime(16, 0) <= t < dtime(20, 0):
         if _nxt_target_codes:
             return {ccnl_nxt: set(_nxt_target_codes)}  # noqa: F405
         return {}

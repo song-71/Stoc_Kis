@@ -3295,7 +3295,7 @@ def _load_morning_target_codes() -> list[str]:
     except Exception as e:
         logger.warning(f"[morning_target] 스크립트 실행 예외: {e}")
 
-    # ── 2) CSV 읽기 → 마지막 날짜 + group=ST 필터 ──
+    # ── 2) CSV 읽기 → 마지막 날짜 + group=ST + 500원 이상 필터 ──
     try:
         if not csv_path.exists():
             raise FileNotFoundError(f"CSV 없음: {csv_path}")
@@ -3306,6 +3306,7 @@ def _load_morning_target_codes() -> list[str]:
         last_date = df["date"].max()
         last_day = df[df["date"] == last_date]
         raw_codes = last_day["symbol"].str.strip().str.zfill(6).unique().tolist()
+        logger.info(f"{ts_prefix()} [morning_target] ① CSV({last_date}) 전일 상한가: {len(raw_codes)}종목")
 
         # group=ST 필터링 (모듈 레벨 초기화 전이므로 직접 KRX_code.csv 로드)
         krx_path = Path("/home/ubuntu/Stoc_Kis/data/admin/symbol_master/KRX_code.csv")
@@ -3319,14 +3320,38 @@ def _load_morning_target_codes() -> list[str]:
             st_codes = [c for c in raw_codes if c in st_set]
         else:
             st_codes = raw_codes  # KRX 데이터 없으면 전체 통과
+        logger.info(f"{ts_prefix()} [morning_target] ② ST 필터: {len(raw_codes)} → {len(st_codes)}종목")
+
+        # 단가 500원 이상 필터 (CSV close 컬럼)
+        close_map: dict[str, float] = {}
+        last_day_c = last_day.copy()
+        last_day_c["_code6"] = last_day_c["symbol"].str.strip().str.zfill(6)
+        for _, row in last_day_c.iterrows():
+            try:
+                close_map[row["_code6"]] = float(row.get("close", 0) or 0)
+            except (ValueError, TypeError):
+                close_map[row["_code6"]] = 0.0
+
+        price_filtered = [c for c in st_codes if close_map.get(c, 0) >= 500]
+        excluded_price = [c for c in st_codes if close_map.get(c, 0) < 500]
+        if excluded_price:
+            # 종목명 매핑 (code_name_map이 아직 없을 수 있으므로 CSV name 사용)
+            name_map_tmp = dict(zip(last_day_c["_code6"], last_day["name"].str.strip())) if "name" in last_day.columns else {}
+            excl_detail = ", ".join(
+                f"{name_map_tmp.get(c, c)}({c})={int(close_map.get(c, 0))}원"
+                for c in excluded_price
+            )
+            logger.info(f"{ts_prefix()} [morning_target] ③ 500원 미만 제외: {excl_detail}")
+        logger.info(f"{ts_prefix()} [morning_target] ③ 500원 필터: {len(st_codes)} → {len(price_filtered)}종목")
+
         # 종목명 매핑 (code_name_map이 아직 없을 수 있으므로 CSV name 사용)
-        name_map = dict(zip(last_day["symbol"].str.strip().str.zfill(6), last_day["name"].str.strip())) if "name" in last_day.columns else {}
-        names = [name_map.get(c, c) for c in st_codes]
+        name_map = dict(zip(last_day_c["_code6"], last_day["name"].str.strip())) if "name" in last_day.columns else {}
+        names = [name_map.get(c, c) for c in price_filtered]
         logger.info(
-            f"{ts_prefix()} [morning_target] CSV({last_date}) {len(raw_codes)}종목 중 ST={len(st_codes)}종목: {names}"
+            f"{ts_prefix()} [morning_target] ④ 최종: {len(price_filtered)}종목 {names}"
         )
-        if st_codes:
-            return st_codes
+        if price_filtered:
+            return price_filtered
     except Exception as e:
         logger.warning(f"[morning_target] CSV 읽기 실패: {e}")
 
@@ -3336,7 +3361,14 @@ def _load_morning_target_codes() -> list[str]:
 
 
 def _load_nxt_target_codes_pre() -> set[str]:
-    """NXT 프리마켓 대상: 전일 상한가 CSV 중 nxt=Y 종목 + 보유종목."""
+    """NXT 프리마켓 대상: 전일 상한가 CSV 중 ST종목 + 단가 500원 이상 + 보유종목.
+
+    필터 순서:
+    1) CSV 최신 날짜 전일 상한가 종목 로드
+    2) KRX_code.csv group=ST 필터 (시장구분)
+    3) 단가 500원 이상 필터 (CSV close 컬럼)
+    4) 보유종목 무조건 추가 (방어 목적)
+    """
     global _nxt_target_codes, _nxt_target_info
     _nxt_target_info.clear()
     try:
@@ -3349,24 +3381,48 @@ def _load_nxt_target_codes_pre() -> set[str]:
                 if last_date:
                     df = df[df["date"] == last_date]
                 raw_codes = df["symbol"].str.strip().str.zfill(6).unique().tolist()
+                logger.info(f"{ts_prefix()} [nxt] ① CSV({last_date}) 전일 상한가: {len(raw_codes)}종목")
 
-                # nxt=Y 필터 (KRX_code.csv)
+                # ── ST 필터 (KRX_code.csv group=ST) ──
                 krx_path = Path("/home/ubuntu/Stoc_Kis/data/admin/symbol_master/KRX_code.csv")
-                nxt_set = set()
+                st_set = set()
                 if krx_path.exists():
-                    krx_df = pd.read_csv(krx_path, dtype=str)
-                    if "code" in krx_df.columns and "nxt" in krx_df.columns:
-                        krx_df["code"] = krx_df["code"].str.strip().str.zfill(6)
-                        nxt_set = set(krx_df.loc[krx_df["nxt"].str.strip().str.upper() == "Y", "code"])
-                if nxt_set:
-                    upper_codes = {c for c in raw_codes if c in nxt_set}
+                    krx_df = pd.read_csv(krx_path, dtype=str, usecols=["code", "group"])
+                    krx_df["code"] = krx_df["code"].str.strip().str.zfill(6)
+                    krx_df["group"] = krx_df["group"].str.strip().str.upper()
+                    st_set = set(krx_df.loc[krx_df["group"] == "ST", "code"])
+                if st_set:
+                    st_codes = [c for c in raw_codes if c in st_set]
                 else:
-                    logger.warning("[nxt] KRX_code에 nxt 컬럼 없음 → 전일 상한가 전체를 NXT 대상으로 사용")
-                    upper_codes = set(raw_codes)
+                    logger.warning("[nxt] KRX_code에 group 컬럼 없음 → 전체 통과")
+                    st_codes = list(raw_codes)
+                logger.info(f"{ts_prefix()} [nxt] ② ST 필터: {len(raw_codes)} → {len(st_codes)}종목")
+
+                # ── 단가 500원 이상 필터 (CSV close 컬럼) ──
+                # close 컬럼에서 종목별 종가 매핑
+                df["_code6"] = df["symbol"].str.strip().str.zfill(6)
+                close_map: dict[str, float] = {}
+                for _, row in df.iterrows():
+                    try:
+                        close_map[row["_code6"]] = float(row.get("close", 0) or 0)
+                    except (ValueError, TypeError):
+                        close_map[row["_code6"]] = 0.0
+
+                price_filtered = [c for c in st_codes if close_map.get(c, 0) >= 500]
+                excluded_price = [c for c in st_codes if close_map.get(c, 0) < 500]
+                if excluded_price:
+                    excl_detail = ", ".join(
+                        f"{code_name_map.get(c, c)}({c})={int(close_map.get(c, 0))}원"
+                        for c in excluded_price
+                    )
+                    logger.info(f"{ts_prefix()} [nxt] ③ 500원 미만 제외: {excl_detail}")
+                logger.info(f"{ts_prefix()} [nxt] ③ 500원 필터: {len(st_codes)} → {len(price_filtered)}종목")
+
+                upper_codes = set(price_filtered)
 
                 # CSV에서 종목별 정보 추출
                 for c in upper_codes:
-                    row = df[df["symbol"].str.strip().str.zfill(6) == c].iloc[0] if c in df["symbol"].str.strip().str.zfill(6).values else None
+                    row = df[df["_code6"] == c].iloc[0] if c in df["_code6"].values else None
                     if row is not None:
                         try:
                             pdy_ctrt = float(row.get("pdy_ctrt", 0)) * 100 if row.get("pdy_ctrt") else 0
@@ -3382,14 +3438,14 @@ def _load_nxt_target_codes_pre() -> set[str]:
         else:
             logger.info("[nxt] Select_Tr_target_list.csv 없음")
 
-        # 보유종목 추가 (nxt=Y 필터 없이 무조건 포함 — 방어 목적)
+        # 보유종목 추가 (필터 없이 무조건 포함 — 방어 목적)
         held_added = _nxt_held_codes - upper_codes
         for c in held_added:
             _nxt_target_info[c] = {"name": code_name_map.get(c, c), "source": "보유"}
 
         result = upper_codes | _nxt_held_codes
-        logger.info(f"{ts_prefix()} [nxt] 프리마켓 대상: {len(result)}종목 "
-                     f"(상한가 {len(upper_codes)} + 보유 {len(held_added)})")
+        logger.info(f"{ts_prefix()} [nxt] ④ 최종 프리마켓 대상: {len(result)}종목 "
+                     f"(상한가+ST+500원={len(upper_codes)} + 보유={len(held_added)})")
         _nxt_target_codes = result
         return result
     except Exception as e:
@@ -3398,7 +3454,7 @@ def _load_nxt_target_codes_pre() -> set[str]:
 
 
 def _refresh_nxt_target_codes_after() -> set[str]:
-    """NXT 애프터마켓 대상: 당일 prdy_ctrt >= 29.5% + nxt=Y 종목.
+    """NXT 애프터마켓 대상: 당일 prdy_ctrt >= 29.5% + ST종목 + 500원 이상.
     재시작 시 _last_prdy_ctrt가 비어있으면 프리마켓 대상(전일 상한가)으로 폴백.
     """
     global _nxt_target_codes, _nxt_target_info
@@ -3409,18 +3465,23 @@ def _refresh_nxt_target_codes_after() -> set[str]:
             # → 프리마켓 대상(전일 상한가 CSV)으로 대체
             logger.info(f"{ts_prefix()} [nxt] 당일 상한가 정보 없음 → 전일 상한가 CSV로 폴백")
             return _load_nxt_target_codes_pre()
-        # nxt=Y 필터
+        # ST 필터 (KRX_code.csv group=ST)
         krx_path = Path("/home/ubuntu/Stoc_Kis/data/admin/symbol_master/KRX_code.csv")
-        nxt_set = set()
+        st_set = set()
         if krx_path.exists():
-            krx_df = pd.read_csv(krx_path, dtype=str)
-            if "code" in krx_df.columns and "nxt" in krx_df.columns:
-                krx_df["code"] = krx_df["code"].str.strip().str.zfill(6)
-                nxt_set = set(krx_df.loc[krx_df["nxt"].str.strip().str.upper() == "Y", "code"])
-        if nxt_set:
-            upper_codes = candidates & nxt_set
+            krx_df = pd.read_csv(krx_path, dtype=str, usecols=["code", "group"])
+            krx_df["code"] = krx_df["code"].str.strip().str.zfill(6)
+            krx_df["group"] = krx_df["group"].str.strip().str.upper()
+            st_set = set(krx_df.loc[krx_df["group"] == "ST", "code"])
+        if st_set:
+            upper_codes = candidates & st_set
         else:
             upper_codes = candidates
+        # 500원 이상 필터 (_last_stck_prpr 사용)
+        before_price = len(upper_codes)
+        upper_codes = {c for c in upper_codes if _last_stck_prpr.get(c, 0) >= 500}
+        if before_price != len(upper_codes):
+            logger.info(f"{ts_prefix()} [nxt] 애프터 500원 필터: {before_price} → {len(upper_codes)}종목")
 
         # _nxt_target_info 갱신
         _nxt_target_info.clear()
@@ -3612,7 +3673,7 @@ _last_prdy_ctrt: dict[str, float] = {c: 0.0 for c in codes}
 _last_mkop_cls_code: dict[str, str] = {}  # code -> new_mkop_cls_code (종목상태, WS 수신값)
 _last_trid_per_code: dict[str, str] = {}  # code → 마지막 수신 tr_id
 _last_stck_prpr: dict[str, float] = {}  # code -> 최근 체결가 (모니터링용)
-_nxt_target_codes: set[str] = set()    # NXT 프리/애프터마켓 대상 종목 (전일 상한가 + nxt=Y)
+_nxt_target_codes: set[str] = set()    # NXT 프리/애프터마켓 대상 종목 (전일 상한가 + ST + 500원↑)
 _nxt_held_codes: set[str] = set()      # NXT 프리마켓 보유종목 (07:58 잔고조회)
 _nxt_target_info: dict[str, dict] = {} # code -> {name, pdy_close, pdy_ctrt, source}
 _subscribed: dict[str, set[str]] = {}
@@ -3651,7 +3712,7 @@ def _log_mode_transition(prev: RunMode | None, cur: RunMode) -> None:
         upper = [c for c in sorted(_nxt_target_codes) if _nxt_target_info.get(c, {}).get("source") == "상한가"]
         held = [c for c in sorted(_nxt_target_codes) if _nxt_target_info.get(c, {}).get("source") == "보유"]
         if upper:
-            lines.append(f"  ▶ 전일 상한가(nxt=Y): {len(upper)}종목")
+            lines.append(f"  ▶ 전일 상한가(ST+500원↑): {len(upper)}종목")
             for c in upper:
                 info = _nxt_target_info.get(c, {})
                 name = info.get("name", code_name_map.get(c, c))

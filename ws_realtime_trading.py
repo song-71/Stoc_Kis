@@ -156,11 +156,6 @@ import queue
 import math
 import warnings
 import faulthandler
-
-# freeze 진단용: 60초마다 모든 스레드 스택을 stderr(→nohup out)에 덤프
-# (exit=False → 덤프만 하고 프로세스는 계속 진행)
-faulthandler.enable()
-faulthandler.dump_traceback_later(60, repeat=True, exit=False)
 from collections import deque
 from pathlib import Path
 from datetime import date, datetime, time as dtime, timedelta
@@ -267,6 +262,19 @@ SNAPSHOT_PATH = OUT_DIR / f"{today_yymmdd}_indicator_snapshot.parquet"
 SNAPSHOT_INTERVAL_SEC = 300  # 지표 스냅샷 저장 간격 (5분)
 LOG_PATH = LOG_DIR / f"wss_TR_{today_yymmdd}.log"
 CCNL_NOTICE_CSV_PATH = LOG_DIR / f"ccnl_notice_{today_yymmdd}.csv"
+
+# ── faulthandler: freeze 진단용 스택 덤프 ─────────────────────────────
+# 60초마다 모든 스레드의 호출 스택을 별도 일자 로그파일에 덤프.
+# 정상 시에도 계속 찍히지만 out/wss_realtime_trading.out 는 건드리지 않음.
+# 재발 시 같은 줄에 스택이 고정되어 있으면 → freeze 지점 역추적 가능.
+# 주의: 파일 객체는 faulthandler 가 내부에서 참조하므로 모듈 전역으로 유지해야 GC 되지 않음.
+FAULTHANDLER_LOG_PATH = LOG_DIR / f"faulthandler_{today_yymmdd}.log"
+_faulthandler_log_fp = open(FAULTHANDLER_LOG_PATH, "a", buffering=1, encoding="utf-8")
+_faulthandler_log_fp.write(
+    f"\n===== faulthandler start @ {datetime.now(KST).isoformat()} pid={os.getpid()} =====\n"
+)
+faulthandler.enable(file=_faulthandler_log_fp)
+faulthandler.dump_traceback_later(60, repeat=True, exit=False, file=_faulthandler_log_fp)
 
 # 거래장부 CSV (일자별 누적, 하루치 모든 주문/체결 기록)
 LEDGER_DIR = SCRIPT_DIR / "data" / "ledger"
@@ -8524,7 +8532,7 @@ def _watchdog_loop():
     ingest_loop heartbeat 감시.
     - 10초마다 `_last_ingest_tick_ts` 정체 여부 확인
     - 60초 초과: 텔레그램 경고 1회 발송 (로그 + 시간정보 포함)
-    - 120초 초과: 치명 경고 + faulthandler.dump_traceback(sys.stderr) + os._exit(2)
+    - 120초 초과: 치명 경고 + faulthandler.dump_traceback(_faulthandler_log_fp) + os._exit(2)
     - 최초 tick 세팅 전에는 skip
     """
     logger.info("[watchdog] started")
@@ -8564,11 +8572,11 @@ def _watchdog_loop():
                         pass
                     _safe_notify(msg)
                     try:
-                        faulthandler.dump_traceback(sys.stderr)
-                    except Exception:
-                        pass
-                    try:
-                        sys.stderr.flush()
+                        _faulthandler_log_fp.write(
+                            f"\n===== watchdog forced dump @ {datetime.now(KST).isoformat()} (idle {idle:.1f}s) =====\n"
+                        )
+                        faulthandler.dump_traceback(_faulthandler_log_fp)
+                        _faulthandler_log_fp.flush()
                     except Exception:
                         pass
                     os._exit(2)

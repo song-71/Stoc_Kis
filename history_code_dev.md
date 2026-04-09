@@ -2,6 +2,22 @@
 
 ---
 
+## [2026-04-09] b70a06e
+
+### feat: VI 현황 폴링에 H0STMKO0 실시간 교차 로깅 기능 추가
+- **카테고리**: feat
+- **파일**: `Daily_inquire_vi_status.py`
+- **목적**: 폴링 기반 VI 현황 수집에 더해, 실시간 장운영정보(H0STMKO0)의 수신 신뢰성·지연시간을 검증하기 위한 교차 로깅 기능 추가
+- **주요 변경**:
+  1. **별도 WSS 연결 (a2/syw_2 계좌)**: `kis_auth_llm` + `market_status_krx`를 이용해 syw_2 계좌 approval_key로 독립 WSS 연결. `_init_ws_a2()` 함수가 auth → KISWebSocket 백그라운드 스레드 시작 (빈 open_map에서 시작, 동적 구독). ws_realtime_trading.py(a1/main 계좌)와 approval_key가 달라 40슬롯 한도가 완전 분리됨
+  2. **VI 발동/해제 교차 로깅** (`out/log/VI_status_{YYMMDD}.log`): `_vi_log()` 함수가 `HHMMSS,mmm [태그] ...` 형식으로 append (thread-safe). 폴링에서 신규 VI 감지 → `[VI Status 조회_발동]` 기록 후 즉시 H0STMKO0 구독. 폴링 응답에 해제시각이 채워지면 → `[VI Status 조회_해제]` 기록 (1회만). H0STMKO0 실시간 수신 → `[장운영정보] {종목} VI_CLS_CODE: Y/N` 기록. 구독 ack → `[장운영정보 구독응답]` 기록
+  3. **동적 구독 관리**: `_mk_subscribe_add()` 발동 시 `send_request(tr_type="1")`, `_mk_subscribe_remove()` VI_CLS_CODE=N 실시간 수신 시 `send_request(tr_type="2")` → 40슬롯 회전. `_seen_vi` dict로 `code_발동시각` key 단위 중복 방지
+  4. **상태 추적 자료구조**: `_seen_vi`, `_code_name`, `_subscribed_codes`, `_log_lock`, `_vi_state_lock`, `_ws_lock` 추가
+- **기존 동작 유지**: 1분 주기 CSV 저장, 15:20 병합/backup, 휴일 종료 로직 변경 없음
+- **파급효과**: Daily_inquire_vi_status.py 프로세스가 a2 계좌로 WSS를 하나 점유. ws_realtime_trading.py의 a1 WSS와는 독립이므로 기존 매매 로직에 영향 없음
+
+---
+
 ## [2026-04-09] 51a2687
 
 ### 1. chore: faulthandler 덤프를 전용 일자별 로그파일로 분리 (9103d8b 보완)

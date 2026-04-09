@@ -22,6 +22,7 @@ import json
 import os
 import shutil
 import sys
+import threading
 import time
 import pandas as pd
 from datetime import datetime, timedelta
@@ -36,6 +37,12 @@ try:
 except Exception:
     tmsg = None
 
+# ── a2 계좌 WSS (H0STMKO0 장운영정보 구독)용 모듈 ──
+# domestic_stock_functions_ws가 `import kis_auth as ka`를 참조하므로 sys.modules 덮어쓰기 후 import
+import kis_auth_llm as ka
+sys.modules["kis_auth"] = ka
+from domestic_stock_functions_ws import market_status_krx  # noqa: E402
+
 PROGRAM_NAME = "Daily_inquire_vi_status.py"
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 KST = ZoneInfo("Asia/Seoul")
@@ -48,9 +55,39 @@ OPT_VI_TYPE   = "0"   # VI종류   0:전체 / 1:정적 / 2:동적 / 3:정적&동
 # ── 저장 경로 ──
 OUT_DIR = os.path.join(SCRIPT_DIR, "data", "vi_status", "1m_fetch")
 BACKUP_DIR = os.path.join(OUT_DIR, "backup")
+LOG_DIR = os.path.join(SCRIPT_DIR, "out", "log")
 
 _VI_STATUS = {"N": "해제", "Y": "발동중", "0": "해제", "1": "정적VI", "2": "동적VI", "3": "정적&동적"}
 _VI_KIND   = {"1": "정적VI", "2": "동적VI", "3": "정적&동적"}
+
+# ── VI 로그/상태 추적 ──
+_log_lock = threading.Lock()
+_log_path: str | None = None
+
+_vi_state_lock = threading.Lock()
+_seen_vi: dict[str, dict] = {}          # key=f"{code}_{start}" → {code,name,start,end,released_logged}
+_code_name: dict[str, str] = {}         # code → 종목명
+
+# ── WSS ──
+_kws = None                              # ka.KISWebSocket 인스턴스 (a2 계좌)
+_ws_ready = threading.Event()
+_ws_lock = threading.Lock()
+_subscribed_codes: set[str] = set()
+
+
+def _vi_log(msg: str) -> None:
+    """VI_status_{YYMMDD}.log에 타임스탬프와 함께 append."""
+    now = datetime.now(KST)
+    ts = now.strftime("%H%M%S,") + f"{now.microsecond // 1000:03d}"
+    line = f"{ts} {msg}"
+    with _log_lock:
+        print(line)
+        if _log_path:
+            try:
+                with open(_log_path, "a", encoding="utf-8") as f:
+                    f.write(line + "\n")
+            except Exception as e:
+                print(f"[로그쓰기실패] {e}")
 
 
 def _tele(msg: str) -> None:
@@ -70,6 +107,117 @@ def _init_client() -> KisClient:
         base_url=cfg.get("base_url", DEFAULT_BASE_URL),
         token_cache_path=os.path.join(SCRIPT_DIR, "kis_token_main.json"),
     ))
+
+
+# ══════════════════════════════════════════════════════════════════
+#  a2(syw_2) 계좌 H0STMKO0 WSS 연결 — 장운영정보 실시간 구독
+# ══════════════════════════════════════════════════════════════════
+
+def _on_ws_system(rsp) -> None:
+    """WSS 시스템 응답 (구독 ack 등) 로깅."""
+    try:
+        if rsp.tr_id == "H0STMKO0":
+            code = (rsp.tr_key or "").strip()
+            name = _code_name.get(code, code)
+            _vi_log(f"[장운영정보 구독응답] {name}({code}) {rsp.tr_msg}")
+    except Exception:
+        pass
+
+
+def _on_ws_result(ws, tr_id, df, data_info) -> None:
+    """H0STMKO0 수신 메시지 처리 → VI_CLS_CODE 로깅 + 해제 시 구독 종료."""
+    if tr_id != "H0STMKO0":
+        return
+    try:
+        for _, row in df.iterrows():
+            code = str(row.get("mksc_shrn_iscd", "")).strip().zfill(6)
+            vi_cls = str(row.get("vi_cls_code", "")).strip()
+            if not vi_cls:
+                continue
+            name = _code_name.get(code, code)
+            _vi_log(f'[장운영정보] {name}({code}) VI_CLS_CODE: {vi_cls}')
+            # VI 해제 통보 → 구독 종료 (40슬롯 한도 관리)
+            if vi_cls == "N":
+                _mk_subscribe_remove(code, name)
+    except Exception as e:
+        _vi_log(f"[장운영정보 파싱오류] {e}")
+
+
+def _init_ws_a2() -> None:
+    """config.json → syw_2 계좌로 WSS 인증 + 백그라운드 스레드로 KISWebSocket 시작."""
+    global _kws
+    with open(os.path.join(SCRIPT_DIR, "config.json"), encoding="utf-8") as f:
+        cfg = json.load(f)
+    acct = cfg["users"][cfg["default_user"]]["accounts"].get("syw_2")
+    if not acct or not acct.get("appkey"):
+        _vi_log("[WSS초기화 실패] syw_2 계좌 설정 없음")
+        return
+
+    ka._cfg["my_app"] = acct["appkey"]
+    ka._cfg["my_sec"] = acct["appsecret"]
+    ka.token_tmp = os.path.join(SCRIPT_DIR, "kis_token_syw_2.json")
+    try:
+        ka.auth(svr="prod")
+        ka.auth_ws(svr="prod")
+    except Exception as e:
+        _vi_log(f"[WSS 인증 실패] {e}")
+        return
+
+    if not getattr(ka, "_base_headers_ws", {}).get("approval_key"):
+        _vi_log("[WSS 인증 실패] approval_key 없음")
+        return
+
+    ka.open_map.clear()  # 빈 상태로 시작 → 동적으로 send_request로 추가
+    _kws = ka.KISWebSocket(api_url="", max_retries=100)
+    _kws.on_system = _on_ws_system
+
+    def _run():
+        try:
+            _ws_ready.set()
+            _kws.start(on_result=_on_ws_result)
+        except Exception as e:
+            _vi_log(f"[WSS 스레드 종료] {e}")
+
+    t = threading.Thread(target=_run, name="a2_h0stmko0_ws", daemon=True)
+    t.start()
+    # 연결 수립까지 잠시 대기
+    time.sleep(2.0)
+    _vi_log("[WSS 시작] a2 계좌 H0STMKO0 연결 대기 완료")
+
+
+def _mk_subscribe_add(code: str, name: str) -> None:
+    """H0STMKO0에 종목 동적 구독 추가."""
+    if _kws is None:
+        return
+    with _ws_lock:
+        if code in _subscribed_codes:
+            return
+        # 연결 준비 대기 (최대 5초)
+        for _ in range(50):
+            if _kws._ws is not None and _kws._loop is not None:
+                break
+            time.sleep(0.1)
+        try:
+            _kws.send_request(request=market_status_krx, tr_type="1", data=code)
+            _subscribed_codes.add(code)
+            _vi_log(f"[장운영정보 구독] {name}({code}) 구독 요청")
+        except Exception as e:
+            _vi_log(f"[장운영정보 구독실패] {name}({code}) {e}")
+
+
+def _mk_subscribe_remove(code: str, name: str) -> None:
+    """H0STMKO0 종목 구독 해제 (VI 해제 통보 시 호출)."""
+    if _kws is None:
+        return
+    with _ws_lock:
+        if code not in _subscribed_codes:
+            return
+        try:
+            _kws.send_request(request=market_status_krx, tr_type="2", data=code)
+            _subscribed_codes.discard(code)
+            _vi_log(f"[장운영정보 구독해제] {name}({code})")
+        except Exception as e:
+            _vi_log(f"[장운영정보 구독해제실패] {name}({code}) {e}")
 
 
 def _query_vi(client: KisClient, date: str) -> list[dict]:
@@ -128,14 +276,50 @@ def _fetch_and_save(client: KisClient, now: datetime, date_full: str) -> str | N
         if not str(stnd).strip() or str(stnd).strip() == "0":
             stnd = r.get("vi_dmc_stnd_prc", "")
             dprt = r.get("vi_dmc_dprt", "")
+
+        code = str(r.get("mksc_shrn_iscd", "")).strip().zfill(6)
+        name = str(r.get("hts_kor_isnm", "")).strip()
+        start = str(r.get("cntg_vi_hour", "")).strip()
+        end   = str(r.get("vi_cncl_hour", "")).strip()
+
+        # ── VI 발동/해제 diff 로깅 ──
+        if code and start:
+            if name:
+                _code_name[code] = name
+            key = f"{code}_{start}"
+            with _vi_state_lock:
+                entry = _seen_vi.get(key)
+                if entry is None:
+                    _seen_vi[key] = {
+                        "code": code, "name": name, "start": start,
+                        "end": end, "released_logged": False,
+                    }
+                    _vi_log(
+                        f"[VI Status 조회_발동] {name}({code}) "
+                        f"발동시각 {start} 해제시각 {end or '000000'}"
+                    )
+                    # 발동 시 H0STMKO0 구독 (lock 바깥에서 호출)
+                    need_subscribe = True
+                else:
+                    need_subscribe = False
+                    if end and not entry["released_logged"] and end != "000000":
+                        entry["end"] = end
+                        entry["released_logged"] = True
+                        _vi_log(
+                            f"[VI Status 조회_해제] {name}({code}) "
+                            f"발동시각 {start} 해제시각 {end}"
+                        )
+            if need_subscribe:
+                _mk_subscribe_add(code, name or code)
+
         records.append({
             "fetch_time": now.strftime("%H:%M"),
-            "종목코드": str(r.get("mksc_shrn_iscd", "")).strip(),
-            "종목명": str(r.get("hts_kor_isnm", "")).strip(),
+            "종목코드": code,
+            "종목명": name,
             "상태": _VI_STATUS.get(r.get("vi_cls_code", ""), r.get("vi_cls_code", "")),
             "종류": _VI_KIND.get(r.get("vi_kind_code", ""), r.get("vi_kind_code", "")),
-            "발동시간": str(r.get("cntg_vi_hour", "")).strip(),
-            "해제시간": str(r.get("vi_cncl_hour", "")).strip(),
+            "발동시간": start,
+            "해제시간": end,
             "발동가": r.get("vi_prc", ""),
             "기준가": stnd,
             "괴리율": dprt,
@@ -228,7 +412,15 @@ if __name__ == "__main__":
     print("=" * 60)
     _tele(start_msg)
 
+    # ── VI 이벤트 로그 파일 초기화 ──
+    os.makedirs(LOG_DIR, exist_ok=True)
+    _log_path = os.path.join(LOG_DIR, f"VI_status_{datetime.now(KST).strftime('%y%m%d')}.log")
+    _vi_log(f"[시작] {PROGRAM_NAME} 로그 파일: {_log_path}")
+
     client = _init_client()
+
+    # ── a2 계좌 H0STMKO0 WSS 백그라운드 시작 ──
+    _init_ws_a2()
 
     now = datetime.now(KST)
     today = now.date()

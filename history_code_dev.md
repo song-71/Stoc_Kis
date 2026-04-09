@@ -2,6 +2,60 @@
 
 ---
 
+## [2026-04-09] 51a2687
+
+### 1. chore: faulthandler 덤프를 전용 일자별 로그파일로 분리 (9103d8b 보완)
+- **카테고리**: chore (refactor)
+- **파일**: `ws_realtime_trading.py`
+- **사유**: 직전 커밋(9103d8b)에서 추가한 `faulthandler.dump_traceback_later(60, repeat=True)` 가 기본 출력으로 stderr → `out/wss_realtime_trading.out` 에 쓰여, 정상 가동 중에도 60초마다 스택 덤프가 메인 out 파일에 쌓여 가독성이 크게 저하되는 문제 발생. 전용 일자별 파일로 분리하여 메인 out 파일 오염 방지
+- **주요 변경**:
+  1. **faulthandler 초기화 위치 이동** (L158→L271 이후): `import faulthandler` 만 상단에 남기고, `enable()` + `dump_traceback_later()` 호출을 `LOG_DIR` 정의 이후로 이동. 파일 경로(`FAULTHANDLER_LOG_PATH`) 구성이 `LOG_DIR` / `today_yymmdd` 에 의존하기 때문
+  2. **전용 로그 파일 오픈** (L271~283): `FAULTHANDLER_LOG_PATH = LOG_DIR / f"faulthandler_{today_yymmdd}.log"` 생성. `_faulthandler_log_fp` 를 모듈 전역으로 유지 — faulthandler 내부에서 파일 객체를 참조하므로 GC 방지 필수. 시작 시 `pid` 포함 헤더 기록으로 프로세스 재기동 시점 구분 가능
+  3. **watchdog 강제 덤프 경로 변경** (L8572~): `faulthandler.dump_traceback(sys.stderr)` → `faulthandler.dump_traceback(_faulthandler_log_fp)` 로 통일. 강제 덤프 직전 타임스탬프 + idle 경과시간 헤더 추가. `stall`(미정의 변수 오타) → `idle` 로 수정
+  4. **docstring 수정**: `_watchdog_loop` 함수 설명의 stderr 참조 → `_faulthandler_log_fp` 참조로 갱신
+- **기대 효과**:
+  - `out/wss_realtime_trading.out` 는 정상 출력만 유지, 60초 주기 덤프 오염 없음
+  - freeze 진단 증거는 `out/logs/faulthandler_{yymmdd}.log` 에 집중 — `tail out/logs/faulthandler_{yymmdd}.log` 한 줄로 원인 스택 확인 가능
+  - watchdog 강제 덤프도 동일 파일에 기록되어 진단 증거가 한 곳에 모임
+
+---
+
+## [2026-04-09] 9103d8b
+
+### 1. feat: burst 재접속 silent hang 방지 — faulthandler + watchdog + 배치 크기 상향
+- **카테고리**: feat
+- **파일**: `ws_realtime_trading.py`
+- **사유**: 2026-04-09 09:12 WSS Connection exception 재접속 직후 초당 1000~2000건 burst 유입으로 약 2분 15초간 모든 로그가 멈추는 silent hang 발생. dmesg/journalctl 에 OOM·SIGKILL 증거 없음. `_kws_lock` 데드락(가설 A, 60%) 추정이나 증거 부족. 재발 시 원인 자동 수집 + 자동 재기동을 목표로 다층 방어 패치 적용.
+- **주요 변경**:
+  1. **배치 크기 상향** (L414~417): `PART_FLUSH_THRESHOLD` 1500→3000, `PART_FLUSH_SAVE` 1000→2000. burst 유입 시 flush 호출 빈도를 절반으로 줄여 lock 경합 부담 완화. flush 로그 reason 태그 하드코딩 제거 → `f"{PART_FLUSH_SAVE}rows"` 동적화, docstring 일반화
+  2. **faulthandler 상시 활성화** (L153~159): `import faulthandler` + `faulthandler.enable()` + `dump_traceback_later(60, repeat=True, exit=False)` 추가. freeze 발생 시 60초마다 전 스레드 스택을 stderr(→`out/wss_realtime_trading.out`)에 자동 덤프하여 원인 진단 가능
+  3. **ingest_loop heartbeat** (L4685~4686, L8227): 전역 `_last_ingest_tick_ts: float = 0.0` 선언. `_ingest_queue.get()` 직후 `globals()['_last_ingest_tick_ts'] = time.time()` 갱신. globals() 동적 접근으로 Pylance "_last_ingest_tick_ts is not accessed" 경고는 정상 오탐
+  4. **_watchdog_loop() 신규 daemon thread** (L8519~): 10초 주기로 heartbeat 정체 감시. 60초 초과 → 텔레그램 경고 + logger.error (시간정보 포함). 120초 초과 → 치명 경고 + `faulthandler.dump_traceback(sys.stderr)` + `os._exit(2)` 강제종료(systemd/nohup 재기동 유도). `_safe_notify` 래퍼로 watchdog 자체 hang 방지. startup 지점에서 daemon thread 기동
+- **기대 효과**:
+  - 재발 시 nohup out 파일에 전 스레드 스택 자동 덤프 → 데드락 원인 특정 가능
+  - 120초 이상 hang 시 `os._exit(2)` + 재기동으로 장시간 정지(2분 이상) 방지
+  - 배치 크기 상향으로 burst 구간 flush 빈도 절감
+- **2차 작업 TODO**: `_kws_lock` 데드락 근본 원인 확인 후 timeout 리팩터 (lock acquire 시 timeout 적용, 실패 시 연결 재시작) — 이번 패치로 수집한 faulthandler 덤프 분석 후 진행
+
+---
+
+## [2026-04-08] 578c5aa
+
+### 1. feat: NXT/모닝 대상 필터를 nxt=Y에서 ST+500원이상으로 변경
+- **카테고리**: feat
+- **파일**: `ws_realtime_trading.py`, `ws_monitoring_research_260408.md`
+- **사유**: KRX_code.csv의 `nxt` 컬럼이 NXT 시장 거래 가능 여부를 나타내지만, 실제 거래에서 의미 있는 필터는 시장구분(group=ST)과 단가 기준(500원 이상)임이 로그 분석을 통해 확인됨. 동전주·관리종목 유입 방지 목적으로 필터 기준 변경
+- **주요 변경**:
+  1. **`_load_morning_target_codes()`**: nxt=Y 대신 group=ST + close>=500 이중 필터 적용
+  2. **`_load_nxt_target_codes_pre()`**: 프리마켓 대상 선정을 ST+500원↑ 기준으로 통일, `usecols=["code","group"]` 최적화
+  3. **`_refresh_nxt_target_codes_after()`**: 애프터마켓도 nxt 대신 ST+500원 필터 적용 (`_last_stck_prpr` 기반 실시간 단가 사용)
+  4. **단계별 로그**: ①CSV로드 → ②ST필터 → ③500원필터 → ④최종 순서로 각 단계 종목 수 기록
+  5. **500원 미만 제외 로그**: 제외 종목별 종목명·코드·단가를 상세 로그로 출력
+  6. **주석/변수명 정리**: `nxt_set` → `st_set`, `upper_codes` 설명 문구 갱신
+- **영향**: 동전주(500원 미만) 및 비ST 종목이 NXT 프리/정규/애프터마켓 대상에서 자동 제외됨. 필터 로직이 세 함수 모두 동일 기준으로 통일되어 일관성 확보
+
+---
+
 ## [2026-04-07] 5596e38
 
 ### 1. fix: 보유종목 없을 때 WSS 연결 건너뛰는 버그 수정

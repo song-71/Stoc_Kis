@@ -6,7 +6,7 @@
 동작:
   매 5분마다
     1) out/logs/wss_TR_{YYMMDD}.log 의 지난 5분 청크 수집 (오프셋 유지)
-    2) 현재 시각 + 로그 청크 + docs/trading_project_main_plan.md 경로를
+    2) 현재 시각 + 로그 청크 + rules/trading_project_main_plan.md 경로를
        Claude CLI (`claude -p`) 에 전달
     3) Claude 응답(JSON) 을 파싱
        → severity(OK/WARN/CRITICAL) + 요약 + 근거 로그 라인 + 권장 대응
@@ -56,7 +56,7 @@ LOG_DIR = SCRIPT_DIR / "out" / "logs"
 MONITOR_DIR = SCRIPT_DIR / "out" / "monitor"
 MONITOR_DIR.mkdir(parents=True, exist_ok=True)
 
-MAIN_PLAN_PATH = SCRIPT_DIR / "docs" / "trading_project_main_plan.md"
+MAIN_PLAN_PATH = SCRIPT_DIR / "rules" / "trading_project_main_plan.md"
 SUMMARY_LOG = MONITOR_DIR / f"monitor_summary_{today_yymmdd()}.log"
 OFFSET_FILE = MONITOR_DIR / f".offset_{today_yymmdd()}"
 

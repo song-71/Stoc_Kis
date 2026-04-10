@@ -274,7 +274,8 @@ _faulthandler_log_fp.write(
     f"\n===== faulthandler start @ {datetime.now(KST).isoformat()} pid={os.getpid()} =====\n"
 )
 faulthandler.enable(file=_faulthandler_log_fp)
-faulthandler.dump_traceback_later(60, repeat=True, exit=False, file=_faulthandler_log_fp)
+# dump_traceback_later(60, repeat=True) 제거 — 60초마다 C 확장 실행 중 스택 순회 시 SIGSEGV 유발
+# (4/10 apport.log signal 11 × 3회 확인). watchdog 의 freeze 시 1회 덤프는 별도로 유지.
 
 # 거래장부 CSV (일자별 누적, 하루치 모든 주문/체결 기록)
 LEDGER_DIR = SCRIPT_DIR / "data" / "ledger"

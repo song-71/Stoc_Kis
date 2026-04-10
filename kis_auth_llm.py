@@ -6,6 +6,7 @@ import asyncio
 import copy
 import json
 import logging
+import csv
 import os
 import time
 from base64 import b64decode
@@ -733,8 +734,20 @@ class KISWebSocket:
 
                     dm = data_map[tr_id]
                     d = d1[3]
-                    if dm.get("encrypt", None) == "Y":
-                        d = aes_cbc_base64_dec(dm["key"], dm["iv"], d)
+                    # H0STCNI0 디버깅: encrypt/key/iv 상태 로깅
+                    if tr_id == "H0STCNI0":
+                        logging.info(f"[H0STCNI0] data_map encrypt={dm.get('encrypt')}, key={'SET' if dm.get('key') else 'NONE'}, iv={'SET' if dm.get('iv') else 'NONE'}, data_len={len(d)}")
+                    is_encrypted = dm.get("encrypt") == "Y" or d1[0] == "1"
+                    if is_encrypted:
+                        if dm.get("key") and dm.get("iv"):
+                            d = aes_cbc_base64_dec(dm["key"], dm["iv"], d)
+                            if tr_id == "H0STCNI0":
+                                logging.info(f"[H0STCNI0] 복호화 성공, fields={len(d.split('^'))}")
+                        else:
+                            logging.warning(f"[{tr_id}] 암호화 데이터(d1[0]={d1[0]}, encrypt={dm.get('encrypt')})이나 key/iv 없음 → 복호화 불가")
+                            continue
+                    elif tr_id == "H0STCNI0":
+                        logging.warning(f"[H0STCNI0] encrypt={dm.get('encrypt')}, d1[0]={d1[0]} → 복호화 스킵! 데이터가 암호화 상태일 수 있음")
 
                     # ── 여러 건 데이터 처리: KIS는 N건을 ^로 연결해서 보냄 ──
                     # 컬럼 수로 나눠 각 건을 개별 행으로 분리 (duplicate cols 방지)
@@ -751,7 +764,8 @@ class KISWebSocket:
                         d = "\n".join(rows)
 
                     df = pd.read_csv(
-                        StringIO(d), header=None, sep="^", names=columns, dtype=object
+                        StringIO(d), header=None, sep="^", names=columns, dtype=object,
+                        quoting=csv.QUOTE_NONE,
                     )
 
                     show_result = True
@@ -760,6 +774,8 @@ class KISWebSocket:
                     rsp = system_resp(raw)
 
                     tr_id = rsp.tr_id
+                    if tr_id == "H0STCNI0":
+                        logging.info(f"[H0STCNI0] system_resp: encrypt={rsp.encrypt}, key={'SET' if rsp.ekey else 'NONE'}, iv={'SET' if rsp.iv else 'NONE'}")
                     add_data_map(
                         tr_id=rsp.tr_id, encrypt=rsp.encrypt, key=rsp.ekey, iv=rsp.iv
                     )
@@ -893,7 +909,10 @@ class KISWebSocket:
             raise RuntimeError("WebSocket not connected")
         coro = self.send_multiple(self._ws, request, tr_type, data, kwargs)
         fut = asyncio.run_coroutine_threadsafe(coro, self._loop)
-        return fut.result()
+        try:
+            return fut.result(timeout=5)
+        except TimeoutError:
+            raise RuntimeError("WebSocket send timeout (5s)")
 
     def close(self):
         self._close_requested = True

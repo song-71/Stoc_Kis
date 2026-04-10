@@ -5218,11 +5218,25 @@ def _vi_exp_sub_worker(code: str, tr_type: str) -> None:
     """
     action = "구독 추가" if tr_type == "1" else "구독 해제"
     name = code_name_map.get(code, code)
+    # 로그 헤더를 [VI감지] 계열로 통일 — 기존 별도 [VI감지] 로그와의 중복 제거
+    label = (
+        "예상체결가 구독 추가 성공" if tr_type == "1"
+        else "예상체결가 구독 해제 성공"
+    )
     with _kws_lock:
         if _active_kws is not None:
             try:
-                _send_subscribe(_active_kws, exp_ccnl_krx, [code], tr_type)  # noqa: F405
-                logger.info(f"{ts_prefix()} [VI감지] 예상체결가 {action}: {name}({code})")
+                _send_subscribe(
+                    _active_kws, exp_ccnl_krx, [code], tr_type,  # noqa: F405
+                    label=label,
+                )
+                # _subscribed state 갱신 — force 재구독 루틴이 같은 종목을
+                # 다시 해제/추가하지 않도록. (Chunk 3에서 a2 경로로 전환 예정)
+                # 주의: _subscribed 전용 락은 없음. 현재는 _kws_lock 하에서 수정.
+                if tr_type == "1":
+                    _subscribed.setdefault("exp_ccnl_krx", set()).add(code)
+                else:
+                    _subscribed.get("exp_ccnl_krx", set()).discard(code)
                 # VI 해제 → 즉시 실시간체결가(H0STCNT0)로 전환
                 if tr_type == "2" and code in set(codes):
                     mode = _get_mode()
@@ -6955,6 +6969,19 @@ KNOWN_TRID_MAP: dict[str, tuple[str, str]] = {
     "H0NXANC0": ("nxt_exp", "N"),        # NXT 실시간예상체결
 }
 
+# 함수명 → TR_ID 역매핑 (req가 plain 함수라 속성 검사로 trid를 못 찾을 때 fallback)
+# domestic_stock_functions_ws.py 의 실제 함수명 기준
+_FUNC_NAME_TO_TRID: dict[str, str] = {
+    "ccnl_krx": "H0STCNT0",
+    "exp_ccnl_krx": "H0STANC0",
+    "market_status_krx": "H0STMKO0",
+    "overtime_ccnl_krx": "H0STOUP0",
+    "overtime_exp_ccnl_krx": "H0STOAC0",
+    "ccnl_nxt": "H0NXCNT0",
+    "exp_ccnl_nxt": "H0NXANC0",
+    "ccnl_notice": "H0STCNI0",
+}
+
 def _infer_tr_kind(trid: str, is_real: str | None) -> str:
     cur = _get_mode()
     if cur in (RunMode.PREOPEN_EXP, RunMode.CLOSE_EXP):
@@ -8135,6 +8162,10 @@ def _extract_tr_id(req) -> str | None:
             v = req.get(key)
             if isinstance(v, str) and v:
                 return v
+    # Fallback: plain 함수면 함수명으로 역매핑
+    name = getattr(req, "__name__", None)
+    if name and name in _FUNC_NAME_TO_TRID:
+        return _FUNC_NAME_TO_TRID[name]
     return None
 
 # =============================================================================
@@ -8473,6 +8504,10 @@ def ingest_loop():
                             pl.lit(_vi_end_ts.get(code, "")).alias("vi_end_ts"),
                             pl.lit(_mkt_evt).alias("market_event"),
                             pl.lit(_mkt_mkop).alias("new_mkop_cls_code"),
+                            # 전방호환 컬럼 — Chunk 4의 fill-forward 생성기 추가 전까지는
+                            # 모두 빈 문자열. 스키마 호환성만 선제 확보.
+                            pl.lit("").alias("fill_forward"),
+                            pl.lit("").alias("halt_reason"),
                         ])
                         chunks.append(df_code)
                 # _part_buffer 에 추가 (PART_FLUSH_SAVE 행 또는 1분마다 part 파일로 flush)
@@ -8686,17 +8721,34 @@ def _register_trid(req) -> str | None:
             TRID_TO_KIND[rid] = "unknown"
     return rid
 
-def _send_subscribe(kws, req, data, tr_type: str) -> None:
+def _send_subscribe(
+    kws,
+    req,
+    data,
+    tr_type: str,
+    *,
+    label: str | None = None,
+    quiet: bool = False,
+) -> None:
+    """WSS 구독/해제 전송 (배치).
+
+    Args:
+        label: 성공 로그 헤더를 override. 예: "예상체결가 구독 추가 성공".
+               None 이면 기본 "구독 추가 결과"/"구독 해제 결과" 사용.
+        quiet: True 면 성공 로그 skip. 실패 로그는 항상 기록.
+    """
     rid = _register_trid(req)
     action = "구독 추가" if tr_type == "1" else "구독 해제"
+    success_header = label if label is not None else f"{action} 결과"
     for idx, chunk in enumerate(_chunks(data, MAX_CODES_PER_SESSION), start=1):
         try:
             kws.send_request(request=req, tr_type=tr_type, data=chunk)
-            code_names = [f"{code_name_map.get(c, c)}({c})" for c in chunk]
-            logger.info(
-                f"{ts_prefix()} [{action} 결과] TR_ID={rid or 'unknown'} "
-                f"종목={', '.join(sorted(code_names))}"
-            )
+            if not quiet:
+                code_names = [f"{code_name_map.get(c, c)}({c})" for c in chunk]
+                logger.info(
+                    f"{ts_prefix()} [{success_header}] TR_ID={rid or 'unknown'} "
+                    f"종목={', '.join(sorted(code_names))}"
+                )
         except Exception as e:
             code_names = [f"{code_name_map.get(c, c)}({c})" for c in chunk]
             logger.warning(

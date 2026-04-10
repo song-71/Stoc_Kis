@@ -2,6 +2,42 @@
 
 ---
 
+## [2026-04-10] b08c3df
+
+### fix: 잔고조회 out2 all-zero 문제를 fetch_balance_simple() 경로로 치환
+- **카테고리**: fix
+- **파일**: `ws_realtime_trading.py`, `kis_inquire_balance_simple.py`
+- **목적**: `_query_and_print_balance()` 내부의 `_iter_enabled_accounts + _init_account_client + _get_balance_page` 루프가 토큰/클라이언트 초기화 추정 원인으로 out2 all-zero를 반환하는 증상 해소
+- **주요 변경**:
+  1. `kis_inquire_balance_simple.py`: 모듈 최상위 스크립트를 `fetch_balance_simple(config_path, account_id) -> dict` 재사용 함수로 리팩터링. CLI 진입점은 `_cli_main()` + `if __name__ == "__main__"` 보존
+  2. `ws_realtime_trading.py`: `_query_and_print_balance()` 내부를 `fetch_balance_simple()` 단일 호출로 치환
+- **검증**: main(43444822) 예수금 13,667,957 정상 반환 실측 확인
+- **영향**: 잔고조회 결과가 항상 0으로 표시되던 문제 해소. 심플 경로 단일화로 유지보수 용이
+
+### fix: NXT 프리마켓 전일 상한가 표시 퍼센트 버그 수정
+- **카테고리**: fix
+- **파일**: `ws_realtime_trading.py` (L3447, `_load_nxt_target_codes_pre()`)
+- **목적**: CSV 생성기(str3)가 "해당 date에 tdy_ctrt≥0.28인 종목"을 다음 거래일 대상으로 저장하는 구조에서, 표시 퍼센트를 `pdy_ctrt`(그 전날 ratio)가 아닌 `tdy_ctrt`(전일 상한가 판정 기준값)로 교체
+- **주요 변경**: `row.get("pdy_ctrt")` → `row.get("tdy_ctrt")` 로 1줄 수정
+- **영향**: 퍼스텍(-1.8%), 부국철강(+1.5%), 레이(+3.6%) 등 정상 상한가 종목이 비상한가처럼 오해를 유발하던 표시 버그 해소
+
+---
+
+## [2026-04-10] d4bfbbe
+
+### feat: 메인 플랜 문서 + log_monitor Claude 자동분석 재작성 + intent-tracker 에이전트
+- **카테고리**: feat
+- **파일**: `docs/trading_project_main_plan.md` (신규), `log_monitor.py` (재작성), `.claude/agents/changelog-manager.md` (확장), `.claude/agents/intent-tracker.md` (신규)
+- **목적**: 운영 의사결정 기준을 단일 문서(main plan)로 집약하고, 로그 모니터링을 Claude CLI 기반 자동분석 체계로 전환
+- **주요 변경**:
+  1. `docs/trading_project_main_plan.md`: §0 원칙 / §1 시간대별 / §2 불변설정 / §3 관측포인트 / §4 변경이력 구조로 초안 작성. log_monitor 판정 기준 SOT
+  2. `log_monitor.py`: 정규식 패턴 매칭(CRITICAL/MODERATE/LOG_WEAK) 방식 제거. 5분 청크 수집 + offset 유지 + `claude -p` 호출 + research md 자동 작성 + summary 로그 append + CRITICAL만 Telegram. `--dry-run / --once / --interval` 옵션 제공
+  3. `.claude/agents/intent-tracker.md`: 사용자 의도 추출 → main plan 섹션 갱신 에이전트 신규 정의
+  4. `.claude/agents/changelog-manager.md`: 커밋 시 main plan §4 변경이력 append + 영향받는 섹션 동시 갱신 책임 추가
+- **영향**: 로그 분석 기준이 main plan 문서로 일원화. log_monitor가 LLM 판단 기반으로 전환되어 미정의 패턴도 탐지 가능
+
+---
+
 ## [2026-04-09] b70a06e
 
 ### feat: VI 현황 폴링에 H0STMKO0 실시간 교차 로깅 기능 추가

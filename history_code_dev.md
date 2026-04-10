@@ -2,6 +2,40 @@
 
 ---
 
+## [2026-04-10] d564b23
+- **Category**: feat
+- **Title**: ws_realtime_trading 자동 재시작 래퍼 스크립트 추가
+- **Files**: `ws_realtime_trading_runner.sh` (신규)
+- **Changes**:
+  - `ws_realtime_trading.py`를 foreground로 실행하는 bash 래퍼 스크립트 추가
+  - exit code로 종료 사유 추정(SIGSEGV=139, SIGKILL=137, SIGTERM=143, watchdog=2) → Telegram 알림
+  - exit 0(정상 종료)이면 재시작 없이 루프 종료
+  - 20:10 이후 재시작 중단, 하루 최대 20회 제한, 60초 미만 조기사망 시 10초 백오프
+  - 런너 로그: `out/logs/runner_YYMMDD.log`
+  - **crontab 변경** (git 대상 아님, 수동 적용 필요):
+    - 기존: `50 22 * * 0-4 nohup python ws_realtime_trading.py > out/wss_realtime_trading.out 2>&1 &`
+    - 변경: `50 22 * * 0-4 nohup /bin/bash ws_realtime_trading_runner.sh > /dev/null 2>&1 &`
+- **Impact**: SIGSEGV/데드락 등 비정상 사망 시 수동 개입 없이 자동 복구. 사망 원인을 Telegram으로 즉시 파악 가능
+
+## [2026-04-10] e6c04b9
+- **Category**: fix
+- **Title**: SIGSEGV 원인(dump_traceback_later) 제거 + fut.result 데드락 근본 수정
+- **Files**: `ws_realtime_trading.py`, `kis_auth_llm.py`
+- **Changes**:
+  - `ws_realtime_trading.py`: `faulthandler.dump_traceback_later(60, repeat=True)` 1줄 삭제
+    - 이유: 60초마다 polars/pandas C 확장 실행 중 Python 스택 순회 → SIGSEGV
+    - 4/10 apport.log signal 11 × 3회 확인. `faulthandler.enable()` 은 유지
+  - `kis_auth_llm.py`: `send_request()`의 `fut.result()` → `fut.result(timeout=5)` + TimeoutError 처리
+    - 이유: `_kws_lock` 내부에서 asyncio future를 무한 대기 → 데드락 → 4/9 09:12 silent hang 9시간 원인
+  - `kis_auth_llm.py`: H0STCNI0 encrypt/key/iv 상태 디버그 로그 추가
+  - `kis_auth_llm.py`: `pd.read_csv`에 `quoting=csv.QUOTE_NONE` 추가 (따옴표 파싱 오류 방어)
+  - `kis_auth_llm.py`: `is_encrypted` 로직 개선 — `d1[0]=="1"` 조건 병행 체크, key/iv 없을 때 skip 처리
+- **Impact**:
+  - 원인 체인: fut.result() 무한대기 → _kws_lock 데드락(4/9) → 진단 목적 dump_traceback_later 추가(9103d8b) → C 확장 스택 순회 SIGSEGV(4/10 3회)
+  - 이번 수정으로 SIGSEGV(dump_traceback_later 제거)와 데드락(timeout=5) 양쪽 모두 해소
+
+---
+
 ## [2026-04-10] b08c3df
 
 ### fix: 잔고조회 out2 all-zero 문제를 fetch_balance_simple() 경로로 치환

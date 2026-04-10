@@ -153,3 +153,6 @@ _신규 항목은 `changelog-manager` 에이전트가 append._
 - 2026-04-10 (initial draft) — 메인 플랜 문서 초안 작성. 운영 시간대별 섹션 + 판정 기준 수립
 - 2026-04-10 — 이슈 1: 잔고조회 경로를 `kis_inquire_balance_simple.fetch_balance_simple()` 로 치환 (기존 `_iter_enabled_accounts + _get_balance_page` 경로 폐기)
 - 2026-04-10 — 이슈 2: NXT 프리마켓 대상 표시 퍼센트를 `pdy_ctrt` → `tdy_ctrt` 로 수정
+- 2026-04-10 — 이슈 3 (e6c04b9): SIGSEGV 원인 제거 — `faulthandler.dump_traceback_later(60)` 삭제 (C 확장 스택 순회 → signal 11, 4/10 3회 확인)
+- 2026-04-10 — 이슈 4 (e6c04b9): 데드락 근본 수정 — `kis_auth_llm.send_request()` `fut.result()` → `fut.result(timeout=5)` (`_kws_lock` 내 asyncio 무한대기 → 4/9 silent hang 9시간 원인)
+- 2026-04-10 — 이슈 5 (d564b23): 자동 재시작 래퍼 `ws_realtime_trading_runner.sh` 추가 — SIGSEGV/데드락 등 비정상 사망 시 Telegram 알림 + 자동 복구 (20:10 이후/20회 초과 시 중단). crontab을 runner.sh 경유로 변경 필요

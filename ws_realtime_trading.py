@@ -904,57 +904,68 @@ def _query_and_print_balance(label: str, *, trade_only: bool = True,
     """
     global _code_account_map
     try:
-        accounts = _iter_enabled_accounts(trade_only=trade_only)
-        if not accounts:
-            cfg = _read_cfg() or load_config(str(CONFIG_PATH))
-            cano = str(cfg.get("cano", "")).strip()
-            acnt = str(cfg.get("acnt_prdt_cd", "01")).strip() or "01"
-            if not cano:
-                logger.warning(f"{ts_prefix()} [{label}] config에 cano 없음")
-                return {}
-            accounts = [{"account_id": "main", "alias": "a1", "cano": cano, "acnt_prdt_cd": acnt}]
+        # ── 잔고조회: kis_inquire_balance_simple.fetch_balance_simple() 재사용 ──
+        # 기존 _iter_enabled_accounts + _init_account_client + _get_balance_page 경로는
+        # 어떤 이유(토큰 캐시 / 클라이언트 초기화 / ConfigProxy 필드 매핑 등)로 out2 가
+        # all-zero 로 수신되는 사례가 있어, 검증된 심플 경로로 치환.
+        from kis_inquire_balance_simple import fetch_balance_simple
 
+        # 거래 대상 계좌 식별 (기본: default_user + main). 계좌별 alias 표기용.
+        enabled_accts = _iter_enabled_accounts(trade_only=trade_only)
+        if enabled_accts:
+            primary = enabled_accts[0]
+            alias = primary.get("alias", primary.get("account_id", "a1"))
+            primary_cano = str(primary.get("cano", "")).strip()
+            account_id = primary.get("account_id")
+        else:
+            alias = "a1"
+            primary_cano = ""
+            account_id = None
+
+        try:
+            res = fetch_balance_simple(config_path=str(CONFIG_PATH), account_id=account_id)
+        except Exception as e:
+            logger.warning(f"{ts_prefix()} [{label}] fetch_balance_simple 실패: {e}")
+            return {}
+
+        cano = res.get("cano") or primary_cano or "?"
+        if not res.get("ok"):
+            logger.warning(f"{ts_prefix()} [{label}] KIS 응답 오류: {res.get('raw', {}).get('msg1')}")
+        logger.info(f"[{label}] {alias}({cano}) 조회 완료")
+
+        # 보유종목 리스트 (심플 포맷) → 기존 테이블 출력 포맷에 맞춤
+        simple_holdings = res.get("holdings", [])
         hold_rows: list[dict] = []
         seen_codes: set[str] = set()
-        summary: dict = {}
-        for acct in accounts:
-            cano = acct["cano"]
-            acnt = acct.get("acnt_prdt_cd", "01") or "01"
-            alias = acct.get("alias", acct.get("account_id", "?"))
-            try:
-                client = _init_account_client(acct) if "appkey" in acct else (_top_client or _init_top_client())
-            except Exception as e:
-                logger.warning(f"{ts_prefix()} [{label}] {alias}({cano}) 클라이언트 초기화 실패: {e}")
+        for h in simple_holdings:
+            c = str(h.get("pdno", "")).strip().zfill(6)
+            if not c or c == "000000" or c in seen_codes:
                 continue
-            ctx_fk, ctx_nk = "", ""
-            for _ in range(10):
-                out1, out2, ctx_fk, ctx_nk = _get_balance_page(client, cano, acnt, "TTTC8434R", ctx_fk, ctx_nk)
-                rows = out1 if isinstance(out1, list) else ([out1] if isinstance(out1, dict) else [])
-                if not rows:
-                    break
-                for row in rows:
-                    c = str(row.get("pdno", "")).strip().zfill(6)
-                    if c and c != "000000" and c not in seen_codes:
-                        seen_codes.add(c)
-                        row["_acct_alias"] = f"{alias}({cano})"
-                        hold_rows.append(row)
-                        _code_account_map[c] = acct
-                if not summary:
-                    summary = out2 if isinstance(out2, dict) else (out2[0] if isinstance(out2, list) and out2 else {})
-                if not ctx_fk.strip() and not ctx_nk.strip():
-                    break
-            logger.info(f"[{label}] {alias}({cano}) 조회 완료")
+            seen_codes.add(c)
+            row = {
+                "pdno": c,
+                "hts_kor_isnm": h.get("hts_kor_isnm", ""),
+                "hldg_qty": h.get("hldg_qty", 0),
+                "ord_psbl_qty": h.get("ord_psbl_qty", 0),
+                "pchs_avg_pric": h.get("pchs_avg_pric", 0.0),
+                "prpr": h.get("prpr", 0.0),
+                "evlu_amt": h.get("evlu_amt", 0.0),
+                "evlu_pfls_amt": h.get("evlu_pfls_amt", 0.0),
+                "evlu_pfls_rt": h.get("evlu_pfls_rt", 0.0),
+                "_acct_alias": f"{alias}({cano})",
+            }
+            hold_rows.append(row)
+            if enabled_accts:
+                _code_account_map[c] = enabled_accts[0]
 
         # ── 계좌 요약 ────────────────────────────────────────────────────────
-        def _f(key: str) -> float:
-            return float(str(summary.get(key, 0) or 0).replace(",", "") or 0)
-
-        dnca      = _f("dnca_tot_amt")
-        ord_cash  = _f("prvs_rcdl_excc_amt")
-        tot_eval  = _f("tot_evlu_amt")
-        buy_amt   = _f("thdt_buy_amt")
-        sll_amt   = _f("thdt_sll_amt")
-        eval_pfls = _f("evlu_pfls_smtm_amt")
+        summary = res.get("summary", {}) or {}
+        dnca      = float(summary.get("dnca_tot_amt", 0) or 0)
+        ord_cash  = float(summary.get("prvs_rcdl_excc_amt", 0) or 0)
+        tot_eval  = float(summary.get("tot_evlu_amt", 0) or 0)
+        buy_amt   = float(summary.get("thdt_buy_amt", 0) or 0)
+        sll_amt   = float(summary.get("thdt_sll_amt", 0) or 0)
+        eval_pfls = float(summary.get("evlu_pfls_smtm_amt", 0) or 0)
 
         SEP = "─" * 66
         now_str = datetime.now(KST).strftime("%H:%M:%S")
@@ -3444,7 +3455,10 @@ def _load_nxt_target_codes_pre() -> set[str]:
                     row = df[df["_code6"] == c].iloc[0] if c in df["_code6"].values else None
                     if row is not None:
                         try:
-                            pdy_ctrt = float(row.get("pdy_ctrt", 0)) * 100 if row.get("pdy_ctrt") else 0
+                            # 표시용 퍼센트: CSV 생성기(str3)가 "해당 date에 tdy_ctrt≥0.28인 종목"을
+                            # 다음 거래일 대상으로 저장하므로, 전일(=해당 date)의 상한가 판정에 쓰이는 값은
+                            # tdy_ctrt 다. (pdy_ctrt는 그 전날 ratio라 오해를 유발함)
+                            pdy_ctrt = float(row.get("tdy_ctrt", 0)) * 100 if row.get("tdy_ctrt") else 0
                             close = float(row.get("close", 0)) if row.get("close") else 0
                         except (ValueError, TypeError):
                             pdy_ctrt, close = 0, 0

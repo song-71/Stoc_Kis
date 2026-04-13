@@ -3414,20 +3414,41 @@ def _load_nxt_target_codes_pre() -> set[str]:
                 raw_codes = df["symbol"].str.strip().str.zfill(6).unique().tolist()
                 logger.info(f"{ts_prefix()} [nxt] ① CSV({last_date}) 전일 상한가: {len(raw_codes)}종목")
 
-                # ── ST 필터 (KRX_code.csv group=ST) ──
+                # ── ST + NXT 필터 (KRX_code.csv group=ST, nxt=Y) ──
                 krx_path = Path("/home/ubuntu/Stoc_Kis/data/admin/symbol_master/KRX_code.csv")
                 st_set = set()
+                nxt_set = set()
                 if krx_path.exists():
-                    krx_df = pd.read_csv(krx_path, dtype=str, usecols=["code", "group"])
+                    krx_cols = ["code", "group"]
+                    # nxt 컬럼이 있으면 함께 로드
+                    try:
+                        _test_df = pd.read_csv(krx_path, dtype=str, nrows=0)
+                        if "nxt" in _test_df.columns:
+                            krx_cols.append("nxt")
+                    except Exception:
+                        pass
+                    krx_df = pd.read_csv(krx_path, dtype=str, usecols=krx_cols)
                     krx_df["code"] = krx_df["code"].str.strip().str.zfill(6)
                     krx_df["group"] = krx_df["group"].str.strip().str.upper()
                     st_set = set(krx_df.loc[krx_df["group"] == "ST", "code"])
+                    if "nxt" in krx_df.columns:
+                        krx_df["nxt"] = krx_df["nxt"].str.strip().str.upper()
+                        nxt_set = set(krx_df.loc[krx_df["nxt"] == "Y", "code"])
                 if st_set:
                     st_codes = [c for c in raw_codes if c in st_set]
                 else:
                     logger.warning("[nxt] KRX_code에 group 컬럼 없음 → 전체 통과")
                     st_codes = list(raw_codes)
                 logger.info(f"{ts_prefix()} [nxt] ② ST 필터: {len(raw_codes)} → {len(st_codes)}종목")
+
+                # NXT 적격 필터
+                if nxt_set:
+                    before_nxt = len(st_codes)
+                    st_codes = [c for c in st_codes if c in nxt_set]
+                    if before_nxt != len(st_codes):
+                        logger.info(f"{ts_prefix()} [nxt] ②-1 NXT 적격 필터: {before_nxt} → {len(st_codes)}종목")
+                else:
+                    logger.warning("[nxt] KRX_code에 nxt 컬럼 없음 → NXT 필터 스킵")
 
                 # ── 단가 500원 이상 필터 (CSV close 컬럼) ──
                 # close 컬럼에서 종목별 종가 매핑
@@ -3499,18 +3520,37 @@ def _refresh_nxt_target_codes_after() -> set[str]:
             # → 프리마켓 대상(전일 상한가 CSV)으로 대체
             logger.info(f"{ts_prefix()} [nxt] 당일 상한가 정보 없음 → 전일 상한가 CSV로 폴백")
             return _load_nxt_target_codes_pre()
-        # ST 필터 (KRX_code.csv group=ST)
+        # ST + NXT 필터 (KRX_code.csv group=ST, nxt=Y)
         krx_path = Path("/home/ubuntu/Stoc_Kis/data/admin/symbol_master/KRX_code.csv")
         st_set = set()
+        nxt_set = set()
         if krx_path.exists():
-            krx_df = pd.read_csv(krx_path, dtype=str, usecols=["code", "group"])
+            krx_cols = ["code", "group"]
+            try:
+                _test_df = pd.read_csv(krx_path, dtype=str, nrows=0)
+                if "nxt" in _test_df.columns:
+                    krx_cols.append("nxt")
+            except Exception:
+                pass
+            krx_df = pd.read_csv(krx_path, dtype=str, usecols=krx_cols)
             krx_df["code"] = krx_df["code"].str.strip().str.zfill(6)
             krx_df["group"] = krx_df["group"].str.strip().str.upper()
             st_set = set(krx_df.loc[krx_df["group"] == "ST", "code"])
+            if "nxt" in krx_df.columns:
+                krx_df["nxt"] = krx_df["nxt"].str.strip().str.upper()
+                nxt_set = set(krx_df.loc[krx_df["nxt"] == "Y", "code"])
         if st_set:
             upper_codes = candidates & st_set
         else:
             upper_codes = candidates
+        # NXT 적격 필터
+        if nxt_set:
+            before_nxt = len(upper_codes)
+            upper_codes = upper_codes & nxt_set
+            if before_nxt != len(upper_codes):
+                logger.info(f"{ts_prefix()} [nxt] 애프터 NXT 적격 필터: {before_nxt} → {len(upper_codes)}종목")
+        else:
+            logger.warning("[nxt] KRX_code에 nxt 컬럼 없음 → NXT 필터 스킵")
         # 500원 이상 필터 (_last_stck_prpr 사용)
         before_price = len(upper_codes)
         upper_codes = {c for c in upper_codes if _last_stck_prpr.get(c, 0) >= 500}
@@ -4496,9 +4536,11 @@ def scheduler_loop():
                     _vi_delayed_codes.clear()
                     _vi_delay_until = None
 
-                if dtime(16, 9, 59) <= now.time() < dtime(17, 50):
+                if (dtime(16, 9, 59) <= now.time() < dtime(17, 50)
+                        and new_mode not in (RunMode.NXT_AFTER, RunMode.NXT_PRE)):
                     # 마지막 의미 있는 슬롯: 17:49:59 (17:50 체결가 수신)
                     # 17:50 이후에는 새 슬롯 전환 없이 예상체결가 유지 → 18:00 EXIT
+                    # NXT 모드에서는 OVERTIME 슬롯 전환 하지 않음
                     total_min = now.hour * 60 + now.minute
                     slot_min = ((total_min - 9) // 10) * 10 + 9
                     slot = now.replace(hour=slot_min // 60, minute=slot_min % 60, second=59, microsecond=0)
@@ -4564,6 +4606,8 @@ def scheduler_loop():
                                 )
                                 # WS를 닫지 않음 — 체결가 구독은 _apply_subscriptions(desired={})에서 해제됨
                                 # H0STCNI0 구독만 살아 있어 15:40 시간외종가 체결통보 수신 가능
+                                # watchdog 오판 방지: 장 마감 후 데이터 미수신은 정상
+                                globals()['_last_ingest_tick_ts'] = time.time()
                         # 15:31 타임아웃 → 미수신 종목 있어도 구독 해제 (WS는 유지)
                         elif (new_mode == RunMode.CLOSE_REAL
                                 and not desired
@@ -4576,6 +4620,8 @@ def scheduler_loop():
                                     f"체결가 구독 해제, WS 연결은 유지 (체결통보 수신 지속)",
                                     tele=True,
                                 )
+                                # watchdog 오판 방지: 장 마감 후 데이터 미수신은 정상
+                                globals()['_last_ingest_tick_ts'] = time.time()
 
                 now_ts = time.time()
                 nt = now.time()
@@ -8607,6 +8653,12 @@ def _watchdog_loop():
             tick = globals().get('_last_ingest_tick_ts', 0.0) or 0.0
             if tick <= 0.0:
                 # 최초 tick 세팅 전 (프로그램 기동 직후) — 감시 skip
+                continue
+            # 15:31~16:00: 정규장 종료 후 WS 데이터 미수신은 정상 → watchdog 감시 중단
+            now_t = datetime.now(KST).time()
+            if dtime(15, 31) <= now_t < dtime(16, 0):
+                warned = False
+                fataled = False
                 continue
             idle = time.time() - tick
 

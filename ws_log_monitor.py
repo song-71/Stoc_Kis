@@ -69,6 +69,19 @@ MODERATE_PATTERNS = [
     (re.compile(r"구독.*실패"), "구독실패"),
     (re.compile(r"no data for.*resubscribe"), "데이터미수신"),
     (re.compile(r"\| WARNING \|"), "WARNING"),
+    # NXT 모니터링 대상 종목 수 비정상 (nxt 필터 누락 등)
+    (re.compile(r"NXT.*(?:프리마켓|애프터마켓)\s*시작.*모니터링 시작"), "NXT대상점검"),
+    # 모니터링/배너 반복 출력 (동일 메시지 10분 내 재출력)
+    (re.compile(r"NXT.*모니터링 시작"), "NXT반복출력"),
+]
+
+CRITICAL_PATTERNS_EXTRA = [
+    # 시스템 재시작 (watchdog 강제 종료)
+    (re.compile(r"\[watchdog\]\[FATAL\].*강제 종료"), "watchdog강제종료"),
+    # os._exit 또는 프로세스 재시작
+    (re.compile(r"os\._exit|프로세스 강제 종료"), "시스템강제종료"),
+    # runner에 의한 재시작 감지
+    (re.compile(r"launch\s*\(#\d+\)"), "시스템재시작"),
 ]
 
 # 비정상종료 판정: 15:30 이전에만 CRITICAL
@@ -103,6 +116,10 @@ class LogMonitor:
                     log_time = self._extract_time(line)
                     if log_time >= MARKET_CLOSE:
                         return ("INFO", "정상종료")
+                return ("CRITICAL", cat)
+        # 추가 CRITICAL 패턴 (watchdog 강제 종료, 시스템 재시작)
+        for pat, cat in CRITICAL_PATTERNS_EXTRA:
+            if pat.search(line):
                 return ("CRITICAL", cat)
         for pat, cat in MODERATE_PATTERNS:
             if pat.search(line):
@@ -322,7 +339,11 @@ class LogMonitor:
             f"- 시간대별 이상 구간 식별\n"
             f"- 로그가 부족하여 추적이 어려운 부분 (LOG_WEAK)\n"
             f"- 로그 순서 역전 감지: 주문send 로그가 체결통보보다 늦게 찍히는 등 "
-            f"논리적 선후관계가 뒤바뀐 로그 쌍을 식별하고 원인/개선방안 제시\n\n"
+            f"논리적 선후관계가 뒤바뀐 로그 쌍을 식별하고 원인/개선방안 제시\n"
+            f"- NXT 모니터링 대상 종목 검증: NXT 프리마켓/애프터마켓 대상이 실제 nxt=Y인지 점검\n"
+            f"- 동일 배너/메시지 반복 출력 감지: 같은 '시작' 메시지가 반복되면 루프 버그 의심\n"
+            f"- 시스템 재시작 감지: watchdog FATAL, os._exit, runner 재시작 등은 반드시 분석 대상\n"
+            f"- 15:30 전후 WS 연결 끊김/구독 해제 실패가 연쇄적으로 시스템 다운을 유발하는지 점검\n\n"
             f"규칙: 행번호는 반드시 현재 파일에서 직접 확인. 추측으로 원인 단정 금지.\n"
             f"프로젝트 경로: {SCRIPT_DIR}"
         )

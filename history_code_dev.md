@@ -2,6 +2,26 @@
 
 ---
 
+## [2026-04-13] 19f94cc
+- **Category**: fix
+- **Title**: NXT 필터 누락·OVERTIME 중복·watchdog 오판 4개 버그 수정 (Issue 6~9)
+- **Files**: `ws_realtime_trading.py`, `ws_log_monitor.py`
+- **Changes**:
+  - **[Issue 6,7]** `_load_nxt_target_codes_pre`, `_refresh_nxt_target_codes_after`에서
+    KRX_code.csv `nxt=Y` 필터 추가. 기존에는 ST 필터만 적용되어 비NXT 종목이 포함될 수 있었음.
+    `nxt` 컬럼 없으면 경고 로그 후 스킵(하위 호환 유지).
+  - **[Issue 8]** OVERTIME 슬롯 전환 조건에 `NXT_AFTER`, `NXT_PRE` 모드 가드 추가.
+    NXT 모드에서 불필요한 슬롯 전환이 발생해 동일 배너가 23회 반복 출력되던 버그 차단.
+  - **[Issue 9]** watchdog가 15:31~16:00 구간에 WS 데이터 미수신을 freeze로 오판하여
+    `os._exit(2)` 호출하는 버그 수정. 해당 구간 감시 스킵 추가.
+    종가 체결 구독 해제 시 `_last_ingest_tick_ts` heartbeat 갱신하여 오판 방지.
+  - **ws_log_monitor.py**: watchdog 강제종료·시스템재시작 CRITICAL 패턴 추가,
+    NXT 대상 점검·반복 출력 MODERATE 패턴 추가, 일일 리뷰 프롬프트에 분석 관점 4가지 보강.
+- **Impact**:
+  - NXT 프리마켓/애프터마켓 거래 대상이 실제 NXT 적격 종목으로 정확하게 필터링됨
+  - NXT 모드 중 OVERTIME 배너 폭주 차단 → 로그 노이즈 제거
+  - 15:31~16:00 구간 watchdog 오판에 의한 시스템 강제 종료 방지
+
 ## [2026-04-10] d564b23
 - **Category**: feat
 - **Title**: ws_realtime_trading 자동 재시작 래퍼 스크립트 추가

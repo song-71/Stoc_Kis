@@ -692,12 +692,13 @@ class KISWebSocket:
     amx_retries: int = 0
 
     # init
-    def __init__(self, api_url: str, max_retries: int = 1):
+    def __init__(self, api_url: str, max_retries: int = 1, approval_key: str | None = None):
         self.api_url = api_url
         self.max_retries = max_retries  # 기본 1: 내부 재시도 없이 즉시 반환 → 외부 run_ws_forever가 최신 구독으로 재연결
         self._ws = None
         self._loop = None
         self._close_requested = False
+        self._approval_key = approval_key  # None이면 글로벌 _base_headers_ws 사용
 
     # private
     async def __subscriber(self, ws: websockets.ClientConnection):
@@ -864,13 +865,22 @@ class KISWebSocket:
             data: list | str,
             kwargs: dict = None,
     ):
-        if type(data) is str:
-            await self.send(ws, request, tr_type, data, kwargs)
-        elif type(data) is list:
-            for d in data:
-                await self.send(ws, request, tr_type, d, kwargs)
-        else:
-            raise ValueError("data must be str or list")
+        # 인스턴스별 approval_key가 있으면 글로벌을 임시 교체
+        saved_key = None
+        if self._approval_key:
+            saved_key = _base_headers_ws.get("approval_key")
+            _base_headers_ws["approval_key"] = self._approval_key
+        try:
+            if type(data) is str:
+                await self.send(ws, request, tr_type, data, kwargs)
+            elif type(data) is list:
+                for d in data:
+                    await self.send(ws, request, tr_type, d, kwargs)
+            else:
+                raise ValueError("data must be str or list")
+        finally:
+            if saved_key is not None:
+                _base_headers_ws["approval_key"] = saved_key
 
     @classmethod
     def subscribe(

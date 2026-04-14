@@ -420,6 +420,32 @@ htsid = getattr(trenv, "my_htsid", "") if trenv is not None else ""
 if not htsid:
     htsid = ka.getEnv().get("my_htsid", "")
 
+# ── a2 계좌 WSS 인증 (VI 예상체결가 전용) ──
+_a1_approval_key = ka._base_headers_ws["approval_key"]
+_a2_approval_key: str | None = None
+_a2_cfg_acct = _cfg_json_auth.get("accounts", {}).get("syw_2", {})
+if _a2_cfg_acct.get("appkey") and _a2_cfg_acct.get("appsecret"):
+    _saved_app, _saved_sec = ka._cfg["my_app"], ka._cfg["my_sec"]
+    _saved_token = ka.token_tmp
+    ka._cfg["my_app"] = _a2_cfg_acct["appkey"]
+    ka._cfg["my_sec"] = _a2_cfg_acct["appsecret"]
+    _a2_token_path = Path(ka.config_root) / f"KIS_syw2_{datetime.today().strftime('%Y%m%d')}"
+    ka.token_tmp = str(_a2_token_path)
+    if not _a2_token_path.exists():
+        _a2_token_path.touch()
+    try:
+        ka.auth_ws(svr="prod")
+        _a2_approval_key = ka._base_headers_ws["approval_key"]
+        logger.info(f"[auth] a2(syw_2) WSS approval_key 발급 완료")
+    except Exception as e:
+        logger.warning(f"[auth] a2(syw_2) WSS 인증 실패: {e}")
+    # a1 상태 복원
+    ka._cfg["my_app"], ka._cfg["my_sec"] = _saved_app, _saved_sec
+    ka._base_headers_ws["approval_key"] = _a1_approval_key
+    ka.token_tmp = _saved_token
+else:
+    logger.info("[auth] a2(syw_2) 계좌 미설정 → VI 예상체결가는 a1 WSS 사용")
+
 # =============================================================================
 # 사용자 설정
 # =============================================================================
@@ -5259,6 +5285,61 @@ _REST_OPEN_INTERVAL = 1.0             # 개장 직후: 종목당 1초 간격
 _REST_VI_UNTIL      = dtime(9, 2)     # VI 발동 종목 REST 보충 제외 시한
 _REST_GRACE_SEC     = 30              # 시작/재시작 후 WSS warmup 대기 시간(초)
 
+# ── a2 WSS (VI 예상체결가 전용) ─────────────────────────────────────────────
+_kws_a2 = None                         # a2 KISWebSocket 인스턴스
+_kws_a2_ready = threading.Event()      # a2 WSS 연결 완료 신호
+_a2_subscribed_codes: set[str] = set() # a2에서 구독 중인 예상체결가 종목
+
+def _init_a2_wss() -> None:
+    """a2 계좌 전용 WSS 연결 (VI 예상체결가 H0STANC0 구독용).
+    프로그램 시작 시 daemon 스레드로 실행. a2 인증이 안 된 경우 스킵.
+    """
+    global _kws_a2
+    if not _a2_approval_key:
+        logger.info(f"{ts_prefix()} [a2-wss] approval_key 없음 → a2 WSS 미사용")
+        return
+
+    # open_map을 비워서 초기 구독 없이 연결 (동적 구독만 사용)
+    saved_map = dict(ka.open_map)
+    ka.open_map.clear()
+    _kws_a2 = ka.KISWebSocket(api_url="", max_retries=9999, approval_key=_a2_approval_key)
+    ka.open_map.update(saved_map)  # a1 open_map 즉시 복원
+
+    def _a2_on_result(ws, tr_id, df, data_info):
+        """a2 WSS 수신 콜백: H0STANC0 데이터를 기존 ingest_queue로 합류."""
+        recv_ts = datetime.now(KST).strftime("%H%M%S%f")[:9]
+        _ingest_queue.put((df, tr_id, "regular_exp", "N", recv_ts))
+
+    def _a2_on_system(rsp):
+        if rsp.isOk and rsp.tr_msg and "SUCCESS" in rsp.tr_msg:
+            if not _kws_a2_ready.is_set():
+                _kws_a2_ready.set()
+                logger.info(f"{ts_prefix()} [a2-wss] 연결 완료")
+            return
+        if rsp.tr_msg:
+            logger.debug(f"{ts_prefix()} [a2-wss] system: {rsp.tr_msg}")
+
+    _kws_a2.on_system = _a2_on_system
+    logger.info(f"{ts_prefix()} [a2-wss] 연결 시작 (VI 예상체결가 전용)")
+    _kws_a2.start(_a2_on_result)  # blocking — daemon thread에서 호출
+
+def _a2_wss_subscribe(code: str, tr_type: str) -> bool:
+    """a2 WSS로 예상체결가 구독/해제. 성공 시 True."""
+    if _kws_a2 is None:
+        return False
+    try:
+        _kws_a2.send_request(request=exp_ccnl_krx, tr_type=tr_type, data=code)  # noqa: F405
+        if tr_type == "1":
+            _a2_subscribed_codes.add(code)
+        else:
+            _a2_subscribed_codes.discard(code)
+        return True
+    except Exception as e:
+        name = code_name_map.get(code, code)
+        action = "구독" if tr_type == "1" else "해제"
+        logger.warning(f"{ts_prefix()} [a2-wss] exp_ccnl {action} 실패: {name}({code}) {e}")
+        return False
+
 def _vi_exp_sub_add(code: str) -> None:
     """VI 발동 종목에 예상체결가 구독 추가.
     on_result 콜백(asyncio 이벤트 루프 내)에서 호출되므로,
@@ -5278,19 +5359,23 @@ def _vi_exp_sub_unsub(code: str) -> None:
     threading.Thread(target=_vi_exp_sub_worker, args=(code, "2"), daemon=True).start()
 
 def _vi_exp_sub_worker(code: str, tr_type: str) -> None:
-    """별도 스레드에서 VI 예상체결가 구독/해제 (asyncio 데드락 방지).
-    해제(tr_type="2") 시 즉시 실시간체결가(ccnl_krx)로 전환.
+    """별도 스레드에서 VI 예상체결가 구독/해제.
+    a2 WSS 우선 사용 (a1 슬롯 소비 없음, lock 경합 없음).
+    a2 미사용 시 a1 fallback.
     """
     action = "구독 추가" if tr_type == "1" else "구독 해제"
     name = code_name_map.get(code, code)
-    # 로그 헤더를 [VI감지] 계열로 통일 — 기존 별도 [VI감지] 로그와의 중복 제거
+
+    # ── a2 WSS 경로 (우선) ──
+    if _a2_wss_subscribe(code, tr_type):
+        logger.info(f"{ts_prefix()} [VI감지] a2 예상체결가 {action}: {name}({code})")
+        return  # a2에서 처리 완료 — a1 실시간체결가는 건드리지 않음 (항상 유지)
+
+    # ── a1 fallback (a2 미사용 시) ──
     label = (
         "예상체결가 구독 추가 성공" if tr_type == "1"
         else "예상체결가 구독 해제 성공"
     )
-    # ★ _get_mode()를 _kws_lock 바깥에서 호출 (lock ordering deadlock 방지)
-    #   scheduler_loop: _mode_lock → _kws_lock 순서
-    #   여기서 _kws_lock → _get_mode() → _mode_lock 순서면 교차 데드락
     mode = _get_mode()
     with _kws_lock:
         if _active_kws is not None:
@@ -5299,14 +5384,11 @@ def _vi_exp_sub_worker(code: str, tr_type: str) -> None:
                     _active_kws, exp_ccnl_krx, [code], tr_type,  # noqa: F405
                     label=label,
                 )
-                # _subscribed state 갱신 — force 재구독 루틴이 같은 종목을
-                # 다시 해제/추가하지 않도록. (Chunk 3에서 a2 경로로 전환 예정)
-                # 주의: _subscribed 전용 락은 없음. 현재는 _kws_lock 하에서 수정.
                 if tr_type == "1":
                     _subscribed.setdefault("exp_ccnl_krx", set()).add(code)
                 else:
                     _subscribed.get("exp_ccnl_krx", set()).discard(code)
-                # VI 해제 → 즉시 실시간체결가(H0STCNT0)로 전환
+                # VI 해제 → 즉시 실시간체결가(H0STCNT0)로 전환 (a1 fallback에서만 필요)
                 if tr_type == "2" and code in set(codes):
                     if mode == RunMode.REGULAR_REAL:
                         _send_subscribe(_active_kws, ccnl_krx, [code], "1")  # noqa: F405
@@ -8734,6 +8816,12 @@ def _shutdown(reason: str):
         if _active_kws is not None:
             _request_ws_close(_active_kws)
             _active_kws = None  # 다른 스레드의 추가 send 방지
+    # a2 WSS 종료
+    if _kws_a2 is not None:
+        try:
+            _kws_a2.shutdown()
+        except Exception:
+            pass
     time.sleep(0.3)
 
 def _handle_signal(signum, frame):
@@ -8929,6 +9017,11 @@ def _desired_subscription_map(now: datetime) -> dict:
         # ── VI / 57·59(30분 단일가) / 일반 종목 분리 ──
         vi_codes = (_vi_delayed_codes | _vi_active_codes) & all_codes
         single_codes = (_single_price_codes.keys() | _single_price_pending.keys()) & all_codes
+
+        # a2 WSS 활성 → VI 종목은 a2에서 예상체결가 처리, a1은 실시간체결 유지
+        if _kws_a2 is not None:
+            vi_codes = set()  # a1에서 VI 예상체결 구독 불필요
+
         rest_codes = all_codes - vi_codes - single_codes
 
         # 57/59: XX:29:29~XX:00:05 / XX:59:29~XX:30:05 = 실시간 체결가, 그 외 예상체결가
@@ -9204,6 +9297,11 @@ if __name__ == "__main__":
     # REST 요청 워커
     t_rest = threading.Thread(target=_rest_worker, daemon=True)
     t_rest.start()
+
+    # a2 WSS (VI 예상체결가 전용) — a2 인증 완료 시만 시작
+    if _a2_approval_key:
+        t_a2_wss = threading.Thread(target=_init_a2_wss, name="a2_vi_exp_wss", daemon=True)
+        t_a2_wss.start()
 
     # REST 현재가 보강 워치독/요청 루프
     t_price_watch = threading.Thread(target=_price_watchdog_loop, daemon=True)

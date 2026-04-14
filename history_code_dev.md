@@ -2,6 +2,18 @@
 
 ---
 
+## [2026-04-14] dea17d1
+- **Category**: refactor
+- **Title**: H0STMKO0 상시구독 제거 → a2 WSS 온디맨드 방식으로 전환
+- **Files**: `ws_realtime_trading.py`
+- **Changes**:
+  1. **a1 상시구독 완전 제거**: `run_ws_forever()` 초기 구독 블록, `_load_str1_sell_state_on_startup()` `_mkstatus_sub_add()` 2곳, `_str1_sell_worker()` 매도 완료 시 `_mkstatus_sub_remove()` 2곳 삭제
+  2. **a2 온디맨드 함수 신설**: `_a2_mkstatus_subscribe()` — 미수신 종목 일시 구독, `_a2_mkstatus_unsubscribe()` — 수신 재개 또는 VI 해제 시 자동 해제
+  3. **_a2_on_result에 H0STMKO0 분기 추가**: `_on_market_status_krx(df)` 직접 호출
+  4. **트리거 포인트 3곳**: `_price_watchdog_loop` stale_check 시 구독 개시, `ingest_loop` WSS 수신 재개 시 자동 해제, `_on_market_status_krx` VI 해제 시 자동 해제
+  5. **`_a2_mkstatus_codes` 상태 셋 추가**: a2 H0STMKO0 구독 중인 종목 추적
+- **Impact**: a1 WSS 슬롯 보유종목 5~10개 절약 → a1을 순수 실시간체결가(H0STCNT0) 전용으로 확보. VI/거래정지/사이드카 감지는 stale 시에만 일시적으로 a2에서 확인하는 방식으로 효율화
+
 ## [2026-04-14] 41564da
 - **Category**: feat
 - **Title**: a2 WSS 역할 확장 — VI 전용 → 예상체결가 전체 + 체결통보 겸용

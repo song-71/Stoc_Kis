@@ -2,6 +2,20 @@
 
 ---
 
+## [2026-04-14] 9d56507
+- **Category**: feat
+- **Title**: a2 계좌 별도 WSS로 VI 예상체결가 구독 분리 (lock 경합 제거 + a1 슬롯 보존)
+- **Files**: `kis_auth_llm.py`, `ws_realtime_trading.py`
+- **Changes**:
+  - `KISWebSocket.__init__`에 `approval_key` 파라미터 추가. `send_multiple`에서 인스턴스별 key를 글로벌과 임시 스왑 후 복원 (finally 보장)
+  - 프로그램 시작 시 a2(syw_2) WSS 인증 + `_a2_approval_key` 발급 (a1 상태 복원 후 진행)
+  - `_init_a2_wss()`: a2 전용 KISWebSocket 생성/시작, H0STANC0 수신 시 `_ingest_queue`에 `regular_exp` 타입으로 합류
+  - `_a2_wss_subscribe()`: a2 WSS로 예상체결가 동적 구독/해제, `_a2_subscribed_codes` 관리
+  - `_vi_exp_sub_worker`: a2 우선 처리 → 성공 시 즉시 반환 (a1 건드리지 않음), a2 미사용 시 a1 fallback
+  - `_desired_subscription_map`: a2 활성 시 `vi_codes = set()` → a1에서 VI 종목 예상체결가 구독 불필요
+  - `_shutdown`: a2 WSS 종료 추가
+- **Impact**: a1 WSS는 실시간체결가(H0STCNT0)를 항상 유지. VI 발동 시 a2가 예상체결가만 구독/해제하므로 `_kws_lock` 경합 원천 제거 + a1 슬롯 보존
+
 ## [2026-04-14] 35a4524
 - **Category**: fix
 - **Title**: lock ordering deadlock 해소 + watchdog 스킵 구간 heartbeat 리셋 (04-14 연속 crash 4회 원인)

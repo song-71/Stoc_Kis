@@ -1448,8 +1448,7 @@ def _load_str1_sell_state_on_startup(balance_map: dict[str, dict] | None = None)
             msg = "\n".join(lines)
             _notify(msg, tele=True)
             logger.info(msg)
-            # H0STMKO0 장운영정보 구독 (보유종목 VI 감지)
-            _mkstatus_sub_add(set(added_for_sell))
+            # H0STMKO0: a2 온디맨드로 이전 (상시구독 불필요)
             # WSS 구독 재구성: 잔고 종목이 open_map 구성 이후에 추가된 경우 대비
             _trigger_ws_rebuild()
         return
@@ -1555,8 +1554,7 @@ def _load_str1_sell_state_on_startup(balance_map: dict[str, dict] | None = None)
         msg = "\n".join(lines)
         _notify(msg, tele=True)
         logger.info(msg)
-        # H0STMKO0 장운영정보 구독 (보유종목 VI 감지)
-        _mkstatus_sub_add(set(added_for_sell))
+        # H0STMKO0: a2 온디맨드로 이전 (상시구독 불필요)
         # WSS 구독 재구성: 잔고 종목이 open_map 구성 이후에 추가된 경우 대비
         _trigger_ws_rebuild()
 
@@ -1802,12 +1800,7 @@ def _str1_sell_worker() -> None:
             # VI 포지션 정리
             if code in _vi_positions:
                 _vi_positions[code]["sold"] = True
-            # 매도 완료 시 H0STMKO0 장운영정보 구독 해제
-            if not is_opening_call_auction:
-                try:
-                    _mkstatus_sub_remove({code})
-                except Exception as e_mk:
-                    logger.warning(f"[str1_sell] H0STMKO0 해제 실패 {code}: {e_mk}")
+            # H0STMKO0: a2 온디맨드 → 매도완료 시 별도 해제 불필요
             # 거래장부 기록
             with _str1_sell_state_lock:
                 bp = _str1_sell_state.get(code, {}).get("buy_price", 0.0)
@@ -1903,11 +1896,7 @@ def _str1_sell_worker() -> None:
                 )
                 _notify(msg, tele=True)
                 logger.info(msg)
-                if not is_opening_call_auction:
-                    try:
-                        _mkstatus_sub_remove({code})
-                    except Exception:
-                        pass
+                # H0STMKO0: a2 온디맨드 → 매도완료 시 별도 해제 불필요
                 with _str1_sell_state_lock:
                     bp = _str1_sell_state.get(code, {}).get("buy_price", 0.0)
                 _is_market2 = ord_dvsn == "01"
@@ -5307,11 +5296,12 @@ _REST_OPEN_INTERVAL = 1.0             # 개장 직후: 종목당 1초 간격
 _REST_VI_UNTIL      = dtime(9, 2)     # VI 발동 종목 REST 보충 제외 시한
 _REST_GRACE_SEC     = 30              # 시작/재시작 후 WSS warmup 대기 시간(초)
 
-# ── a2 WSS (예상체결가 전체 + 체결통보 전용) ──────────────────────────────────
+# ── a2 WSS (예상체결가 + 체결통보 + 장운영정보 온디맨드) ────────────────────────
 _kws_a2 = None                         # a2 KISWebSocket 인스턴스
 _kws_a2_ready = threading.Event()      # a2 WSS 연결 완료 신호
 _a2_subscribed_codes: set[str] = set() # a2에서 구독 중인 예상체결가 종목
 _a2_ccnl_notice_done = False           # a2 체결통보 구독 완료 여부
+_a2_mkstatus_codes: set[str] = set()   # a2에서 H0STMKO0 일시 구독 중인 종목
 
 def _init_a2_wss() -> None:
     """a2 계좌 전용 WSS 연결 (예상체결가 전체 + 체결통보 H0STCNI0).
@@ -5343,6 +5333,9 @@ def _init_a2_wss() -> None:
         elif trid == "H0STCNI0":
             # 체결통보: a1의 on_result 처리 경로 직접 호출 (ingest_queue 미경유)
             on_result(ws, tr_id, df, data_info)
+        elif trid == "H0STMKO0":
+            # 장운영정보: 기존 처리 함수 직접 호출
+            _on_market_status_krx(df)
 
     def _a2_on_system(rsp):
         if rsp.isOk and rsp.tr_msg and "SUCCESS" in rsp.tr_msg:
@@ -5419,6 +5412,30 @@ def _a2_wss_subscribe_batch(request_func, code_list: list, tr_type: str = "1") -
     except Exception as e:
         logger.warning(f"{ts_prefix()} [a2-wss] batch {request_func.__name__} 실패: {e}")
         return False
+
+def _a2_mkstatus_subscribe(code: str) -> None:
+    """a2 WSS에서 H0STMKO0 일시 구독 (미수신 원인 확인용)."""
+    if _kws_a2 is None or code in _a2_mkstatus_codes:
+        return
+    try:
+        _kws_a2.send_request(request=market_status_krx, tr_type="1", data=code)  # noqa: F405
+        _a2_mkstatus_codes.add(code)
+        name = code_name_map.get(code, code)
+        logger.info(f"{ts_prefix()} [a2-wss] H0STMKO0 일시 구독: {name}({code})")
+    except Exception as e:
+        logger.warning(f"{ts_prefix()} [a2-wss] H0STMKO0 구독 실패: {code} {e}")
+
+def _a2_mkstatus_unsubscribe(code: str) -> None:
+    """상태 확인 완료 후 H0STMKO0 해제."""
+    if _kws_a2 is None or code not in _a2_mkstatus_codes:
+        return
+    try:
+        _kws_a2.send_request(request=market_status_krx, tr_type="2", data=code)  # noqa: F405
+        _a2_mkstatus_codes.discard(code)
+        name = code_name_map.get(code, code)
+        logger.info(f"{ts_prefix()} [a2-wss] H0STMKO0 해제: {name}({code})")
+    except Exception as e:
+        logger.warning(f"{ts_prefix()} [a2-wss] H0STMKO0 해제 실패: {code} {e}")
 
 def _a2_apply_subscriptions(now: datetime) -> None:
     """a2 WSS 시간대별 예상체결가 구독 전환. scheduler_loop에서 주기 호출."""
@@ -5986,6 +6003,8 @@ def _on_market_status_krx(result) -> None:
                     _vi_exp_sub_unsub(code)
                     # VI 해제 시각 기록
                     _vi_end_ts[code] = datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S")
+                    # H0STMKO0 일시구독 자동 해제 (a2)
+                    _a2_mkstatus_unsubscribe(code)
                     msg = (f"{ts_prefix()} [VI해제] {name}({code}) "
                            f"vi_cls={vi_cls}")
                     logger.info(msg)
@@ -6243,6 +6262,8 @@ def _price_watchdog_loop() -> None:
                         _price_queue.put_nowait(("stale_check", c))
                     except Exception:
                         pass
+                    # 미수신 종목 → a2에서 H0STMKO0 일시 구독 (VI/사이드카/거래정지 확인)
+                    _a2_mkstatus_subscribe(c)
 
             # VI 예상체결가 구독 자동 해제 (150초 경과 — H0STMKO0 해제 통보 미수신 시 fallback)
             # VI 발동~해제 통상 2:03~2:20초 → 150초(2분30초) 안전 마진
@@ -8647,6 +8668,9 @@ def ingest_loop():
                     # WSS 전용 수신 시각 (REST 제외)
                     if trid != "FHKST01010100":
                         _last_wss_recv_ts[code] = now
+                        # 실시간 수신 재개 → H0STMKO0 일시구독 해제 (미수신 해소)
+                        if code in _a2_mkstatus_codes:
+                            _a2_mkstatus_unsubscribe(code)
                     if kind == "regular_real" and _get_mode() == RunMode.CLOSE_REAL:
                         _regular_real_seen.add(code)
                     if kind == "overtime_real":
@@ -9257,16 +9281,8 @@ def run_ws_forever():
             for req, code_set in desired_map.items():
                 ka.KISWebSocket.subscribe(req, list(code_set))
                 _subscribed[req.__name__] = set(code_set)
-            # H0STMKO0 장운영정보: 보유종목 VI 감지 (정규장 시간대)
-            if dtime(8, 50) <= now_t < dtime(15, 30):
-                held_codes = set()
-                with _str1_sell_state_lock:
-                    held_codes = {c for c, st in _str1_sell_state.items() if not st.get("sold")}
-                if held_codes:
-                    ka.KISWebSocket.subscribe(market_status_krx, list(held_codes))  # noqa: F405
-                    _mkstatus_sub_codes.update(held_codes)
-                    _subscribed["market_status_krx"] = set(held_codes)
-                    total_sub += len(held_codes)
+            # H0STMKO0 장운영정보: a2 온디맨드로 이전 (a1 상시구독 제거)
+            # VI 감지는 REST 폴링(_vi_poll_check) + a2 일시구독으로 처리
             # H0STCNI0 종목별 체결통보: open_map 등록 제거 (연결 불안정 원인)
             # 체결통보는 주문 성공 시 _ccnl_notice_sub_add()로 동적 구독
             sub_desc = ", ".join(f"{r.__name__}={len(c)}종목" for r, c in desired_map.items())

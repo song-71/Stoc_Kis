@@ -124,6 +124,34 @@ def _merge_date_group(
         if _is_valid_parquet(p):
             tables.append(pq.read_table(p))
 
+    # 테이블 간 동일 컬럼의 타입 충돌 해소 (예: bb_mid가 string vs double)
+    if len(tables) > 1:
+        col_types: dict[str, set] = {}
+        for t in tables:
+            for field in t.schema:
+                col_types.setdefault(field.name, set()).add(field.type)
+        conflict_cols = {name for name, types in col_types.items() if len(types) > 1}
+        if conflict_cols:
+            logger.info(f"{base_msg} 타입 충돌 컬럼 통일: {conflict_cols}")
+            unified = []
+            for t in tables:
+                for col_name in conflict_cols:
+                    if col_name in t.column_names:
+                        idx = t.schema.get_field_index(col_name)
+                        ftype = t.schema.field(idx).type
+                        has_numeric = any(
+                            pa.types.is_floating(tp) or pa.types.is_integer(tp)
+                            for tp in col_types[col_name]
+                        )
+                        if has_numeric and (pa.types.is_string(ftype) or pa.types.is_large_string(ftype)):
+                            col = pa.compute.cast(t.column(idx), pa.float64(), safe=False)
+                            t = t.set_column(idx, col_name, col)
+                        elif has_numeric and pa.types.is_null(ftype):
+                            col = pa.nulls(len(t), type=pa.float64())
+                            t = t.set_column(idx, col_name, col)
+                unified.append(t)
+            tables = unified
+
     combined = pa.concat_tables(tables, promote_options="permissive")
 
     # recv_ts 정렬 (있으면)

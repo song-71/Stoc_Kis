@@ -2,6 +2,28 @@
 
 ---
 
+## [2026-04-14] 41564da
+- **Category**: feat
+- **Title**: a2 WSS 역할 확장 — VI 전용 → 예상체결가 전체 + 체결통보 겸용
+- **Files**: `ws_realtime_trading.py`, `ws_merge_wss_parts.py`, `test_ccnl_notice.py`
+- **Changes**:
+  1. `_init_a2_wss` 콜백 분기: H0STANC0/H0STOAC0 → ingest_queue, H0STCNI0 → on_result 직접 호출
+  2. `_a2_on_system`: 연결 완료 즉시 체결통보(`_a2_subscribe_ccnl_notice`) + 현재 시간대 예상체결가(`_a2_apply_subscriptions`) 자동 구독
+  3. `_a2_subscribe_ccnl_notice()` 신규: a2 WSS에서 H0STCNI0 1회 구독 (`_a2_ccnl_notice_done` 플래그로 중복 방지)
+  4. `_a2_wss_subscribe_batch()` 신규: 배치 구독/해제 헬퍼
+  5. `_a2_apply_subscriptions()` 신규: 시간대별 예상체결가 구독 전환 로직
+     - 08:50~09:00: 전 종목 장전 예상체결가
+     - 09:00~15:20: VI + 57/59 예상체결가 (30분 단일가 실시간 윈도우 제외)
+     - 15:20~15:30: 전 종목 장마감 예상체결가
+  6. `_desired_subscription_map`: a2 활성 시 위 3개 시간대에서 a1 예상체결가 구독 제거 → a1 슬롯 절약
+  7. `_ccnl_notice_sub_add`: a2 우선 구독, a1 fallback
+  8. `scheduler_loop` 08:29:59 체결통보 조기 구독: a2 우선
+  9. `run_ws_forever` 체결통보 구독: a2 활성 시 a2에서 구독
+  10. `_switch_to_closing_codes`: 15:20 전환 시 a2 구독 갱신 호출
+  11. `_trigger_ws_rebuild`: a2 구독도 함께 갱신
+  12. `ws_merge_wss_parts.py`: parquet 병합 시 컬럼 타입 충돌(string vs double) 자동 해소 로직 추가
+- **Impact**: a1은 실시간체결(H0STCNT0) + 장운영정보(H0STMKO0) 전용으로 슬롯 여유 확보. a2는 예상체결가(H0STANC0/H0STOAC0) + 체결통보(H0STCNI0) 독립 40슬롯 운영 → 구독 슬롯 경합 해소
+
 ## [2026-04-14] 9d56507
 - **Category**: feat
 - **Title**: a2 계좌 별도 WSS로 VI 예상체결가 구독 분리 (lock 경합 제거 + a1 슬롯 보존)

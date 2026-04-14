@@ -2,6 +2,31 @@
 
 ---
 
+## [2026-04-14] 35a4524
+- **Category**: fix
+- **Title**: lock ordering deadlock 해소 + watchdog 스킵 구간 heartbeat 리셋 (04-14 연속 crash 4회 원인)
+- **Files**: `ws_realtime_trading.py`
+- **Changes**:
+  - **[Fix 1] `_vi_exp_sub_worker` lock ordering deadlock 해소**
+    - `scheduler_loop`는 `_mode_lock → _kws_lock` 순서로 획득
+    - 기존 코드는 `_kws_lock` 내부에서 `_get_mode()` → `_mode_lock` 획득 → 교차 데드락 발생
+    - `_get_mode()` 호출을 `with _kws_lock` 바깥으로 이동하여 lock 획득 순서 통일
+    - ae92c53(04-02) 커밋에서 도입된 버그, 04-14 watchdog 4회 강제종료의 근본 원인
+  - **[Fix 2] watchdog 스킵 구간(15:31~16:00) 종료 후 heartbeat 리셋**
+    - 스킵 구간(continue) 동안 `_last_ingest_tick_ts`가 갱신되지 않음
+    - 16:00 감시 재개 시 idle 시간이 1740초로 누적 → 즉시 FATAL 판정 → `os._exit(2)`
+    - 스킵 구간 내 `globals()['_last_ingest_tick_ts'] = time.time()` 추가로 해소
+    - 04-14 16:00 4번째 crash 원인
+  - **[Fix 3] `_switch_to_closing_codes`: `_active_kws` 선행 None 처리**
+    - `_active_kws = None` 먼저 세팅 후 `_request_ws_close(kws_ref)` 호출
+    - 다른 스레드의 send 시도를 close 이전에 차단하여 경쟁 조건 방지
+  - **[Fix 4] `_run_open_buy_order_cancel_on_startup`: 15:30~16:00 취소 스킵 추가**
+    - 정규장 종료(15:30) 후 주문이 자동 실효되는 구간에서 불필요한 취소 API 호출 방지
+- **Impact**:
+  - 04-14 장중 4회 발생한 watchdog 강제종료(`os._exit(2)`) 재발 방지
+  - VI 예상체결가 구독/해제 시 lock 교차 데드락 완전 해소
+  - 종가 전환 후 다른 스레드의 WebSocket send 충돌 방지
+
 ## [2026-04-13] 19f94cc
 - **Category**: fix
 - **Title**: NXT 필터 누락·OVERTIME 중복·watchdog 오판 4개 버그 수정 (Issue 6~9)

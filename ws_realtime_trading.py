@@ -816,8 +816,12 @@ def _run_open_buy_order_cancel_on_startup() -> None:
     단, 16:00~18:00 시간외 단일가 시간대에는 기존 주문이 10분 주기로 자동 유지되므로 취소 스킵."""
     if not OPEN_BUY_ORDER_CANCEL:
         return
-    # 16:00~18:00 시간외 단일가: 기존 주문이 다음 10분 주기 체결에 자동 유지되므로 취소하지 않음
+    # 15:30~16:00: 정규장 종료 후 주문 자동 실효 → 취소 불필요
+    # 16:00~18:00: 시간외 단일가 기존 주문 자동 유지 → 취소 스킵
     nt = datetime.now(KST).time()
+    if dtime(15, 30) <= nt < dtime(16, 0):
+        _notify(f"{ts_prefix()} [미체결취소] 정규장 종료(15:30~16:00) → 주문 자동 실효, 취소 스킵")
+        return
     if dtime(16, 0) <= nt < dtime(18, 0):
         _notify(f"{ts_prefix()} [미체결취소] 시간외 단일가 시간대(16:00~18:00) → 기존 주문 유지, 취소 스킵")
         return
@@ -5284,6 +5288,10 @@ def _vi_exp_sub_worker(code: str, tr_type: str) -> None:
         "예상체결가 구독 추가 성공" if tr_type == "1"
         else "예상체결가 구독 해제 성공"
     )
+    # ★ _get_mode()를 _kws_lock 바깥에서 호출 (lock ordering deadlock 방지)
+    #   scheduler_loop: _mode_lock → _kws_lock 순서
+    #   여기서 _kws_lock → _get_mode() → _mode_lock 순서면 교차 데드락
+    mode = _get_mode()
     with _kws_lock:
         if _active_kws is not None:
             try:
@@ -5300,7 +5308,6 @@ def _vi_exp_sub_worker(code: str, tr_type: str) -> None:
                     _subscribed.get("exp_ccnl_krx", set()).discard(code)
                 # VI 해제 → 즉시 실시간체결가(H0STCNT0)로 전환
                 if tr_type == "2" and code in set(codes):
-                    mode = _get_mode()
                     if mode == RunMode.REGULAR_REAL:
                         _send_subscribe(_active_kws, ccnl_krx, [code], "1")  # noqa: F405
                         logger.info(f"{ts_prefix()} [VI감지] 실시간체결가 즉시 전환: {name}({code})")
@@ -6688,7 +6695,9 @@ def _switch_to_closing_codes() -> None:
     # ── 2) WSS 재연결으로 구독 초기화 (41개 해제 대신 9개만 신규 구독) ──
     with _kws_lock:
         if _active_kws is not None:
-            _request_ws_close(_active_kws)
+            kws_ref = _active_kws
+            _active_kws = None  # 다른 스레드의 send 시도를 사전 차단
+            _request_ws_close(kws_ref)
 
     # ── 3) 메시지 출력: 예상체결가 전환 → 종가매매 전환 완료 순서 ──
     sys.stdout.write("\n")  # 제자리 출력 줄바꿈
@@ -8659,6 +8668,8 @@ def _watchdog_loop():
             if dtime(15, 31) <= now_t < dtime(16, 0):
                 warned = False
                 fataled = False
+                # ★ 스킵 구간 종료 후 idle 폭발 방지: heartbeat를 현재 시각으로 리셋
+                globals()['_last_ingest_tick_ts'] = time.time()
                 continue
             idle = time.time() - tick
 

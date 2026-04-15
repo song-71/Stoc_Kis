@@ -76,6 +76,10 @@ VI_TRADE_MODE = "off"
 # 상한가 스톱 연속 이탈 확인 틱 수 (서버 스톱지정가 대신 클라이언트에서 N틱 연속 확인 후 매도)
 STOP_LIMIT_CONFIRM_TICKS = 30
 
+# 29%+ 긴급매도: on_result fast-path (stck_prpr 기반, ingest_loop 우회)
+EMERGENCY_29PCT_SELL_ENABLED = True
+EMERGENCY_SELL_HOGA_OFFSET = 5        # 현재가 대비 N호가 아래 지정가
+
 # 직전 영업일 종가매수 선정 종목을 당일 base codes로 자동 사용
 AUTO_CODE_FROM_PREV_CLOSING = True
 
@@ -1570,10 +1574,9 @@ def _add_no_sell_code(code: str, source: str = "") -> None:
 
 def _str1_sell_worker() -> None:
     """
-    별도 스레드: _str1_sell_queue에서 매도/취소 요청을 꺼내 KIS API로 처리.
-    - action=="sell": 매도 주문
+    별도 스레드: _str1_sell_queue에서 취소 요청을 꺼내 KIS API로 처리.
     - action=="cancel": 장전 매도 주문 취소 (09:00 전까지)
-    ingest_loop(hot path)과 분리하여 API 지연이 틱 처리를 막지 않도록 함.
+    매도 주문은 _do_sell_order()가 즉시 스레드에서 실행 (큐 경유 안 함).
     """
     logger.info("[str1_sell] worker started")
     while not _stop_event.is_set() or not _str1_sell_queue.empty():
@@ -1649,238 +1652,14 @@ def _str1_sell_worker() -> None:
                             _notify(f"{ts_prefix()} [str1_sell] 동시호가매도 취소실패 ({retry_cnt}/5) {name}({code}) err={e}", tele=True)
             continue
 
-        # ── 매도 주문 ──
-        qty       = int(req.get("qty", 0))
-        reason    = req.get("reason", "")
-        ref_price = req.get("ref_price", 0.0)
-        ord_dvsn  = req.get("ord_dvsn", "01")
-        sell_price = req.get("price", 0.0)
-        cndt_pric  = req.get("cndt_pric", 0.0)
-        ord_dvsn_name = {"00": "지정가", "01": "시장가", "02": "시간외종가", "05": "장전시간외", "06": "장후시간외", "07": "시간외단일가", "22": "스톱지정가"}.get(ord_dvsn, ord_dvsn)
-        retry_after_cancel = False   # 미체결 취소 후 재주문 플래그
-        try:
-            # 종목별 보유 계좌로 매도 (syw_2 등 서브계좌 지원)
-            acct = _code_account_map.get(code)
-            if acct:
-                cano = acct["cano"]
-                acnt = acct.get("acnt_prdt_cd", "01") or "01"
-                client = _init_account_client(acct)
-                alias = acct.get("alias", acct.get("account_id", "?"))
-                logger.info(f"[str1_sell] {name}({code}) → {alias}({cano}) 계좌로 매도")
-            else:
-                cfg = _read_cfg() or load_config(str(CONFIG_PATH))
-                cano = str(cfg.get("cano", "")).strip()
-                acnt = str(cfg.get("acnt_prdt_cd", "01")).strip() or "01"
-                client = _top_client or _init_top_client()
-            if not cano:
-                logger.warning(f"[str1_sell] config cano 없음 → {code} 매도 스킵")
-                continue
-
-            is_stop_limit = (ord_dvsn == "22")
-            is_opening_call_auction = reason.startswith("str1_시초가하락_예상")
-            sell_label = "스톱지정가매도" if is_stop_limit else ("동시호가매도" if is_opening_call_auction else "매도")
-            if is_stop_limit:
-                price_info = f"  조건가={cndt_pric:,.0f}  지정가={sell_price:,.0f}"
-            elif ord_dvsn not in ORD_DVSN_NO_PRICE:
-                price_info = f"  주문가={ref_price:,.0f}"
-            else:
-                price_info = ""
-            api_call_msg = (
-                f"{ts_prefix()} [str1_sell] ■ {sell_label}주문 API호출 {name}({code})"
-                f"  tr_id=TTTC0801U  수량={qty}  주문방식={ord_dvsn_name}({ord_dvsn}){price_info}"
-                f"  사유={reason}"
+        # 매도 요청이 큐에 들어온 경우 (레거시 호환) → 즉시 스레드 실행
+        if action == "sell":
+            qty = int(req.get("qty", 0))
+            _do_sell_order(
+                code, name, qty, req.get("reason", ""),
+                req.get("ref_price", 0.0), req.get("ord_dvsn", "01"),
+                req.get("price", 0.0), req.get("cndt_pric", 0.0),
             )
-            _notify(api_call_msg, tele=True)
-            logger.info(api_call_msg)
-            j = _sell_order_cash(
-                client, cano, acnt, code, qty,
-                price=sell_price, ord_dvsn=ord_dvsn, cndt_pric=cndt_pric,
-            )
-            out = j.get("output") or {}
-            ordno = str(out.get("ODNO") or out.get("odno") or "").strip()
-
-            with _str1_sell_state_lock:
-                st = _str1_sell_state.get(code, {})
-                buy_price = st.get("buy_price") or ref_price
-            pnl_info = calc_sell_pnl(buy_price, ref_price, qty) if buy_price > 0 else {}
-            with _str1_sell_state_lock:
-                st = _str1_sell_state.get(code, {})
-                sell_ts = datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S")
-                new_st = {
-                    **st,
-                    "sell_reason": reason,
-                    "sell_price": ref_price,
-                    "ordno": ordno,
-                }
-                if is_stop_limit:
-                    # 스톱지정가: 조건 미충족 시 미체결 → sold=False 유지, 일반 매도 계속 가능
-                    new_st["stop_limit_ordered"] = True
-                    new_st["sold"] = False
-                elif is_opening_call_auction:
-                    # 동시호가 매도: 09:00 시초가에 체결 예정 → sold=False, opening_call_auction_ordered=True
-                    # 이후 예상가 복귀 시 취소 가능
-                    new_st["opening_call_auction_ordered"] = True
-                    new_st["sold"] = False
-                else:
-                    new_st["sold"] = True
-                    new_st["sell_time"] = sell_ts
-                    new_st["pnl"] = pnl_info.get("pnl", 0.0)
-                    new_st["ret_pct"] = pnl_info.get("ret_pct", 0.0)
-                _str1_sell_state[code] = new_st
-            _save_str1_sell_state()
-
-            pnl_txt = f"  PNL≈{pnl_info.get('pnl', 0):+,.0f}원  ret≈{pnl_info.get('ret_pct', 0):+.2f}%" if pnl_info else ""
-            opening_call_auction_suffix = " → 09:00 시초가 체결대기(복귀 시 취소가능)" if is_opening_call_auction else ""
-            msg = (
-                f"{ts_prefix()} [str1_sell] ✔ {sell_label}주문 접수완료 {name}({code})"
-                f"  tr_id=TTTC0801U  주문번호={ordno}  수량={qty}"
-                f"  주문방식={ord_dvsn_name}({ord_dvsn}){price_info}"
-                f"  사유={reason}{pnl_txt}{opening_call_auction_suffix}"
-            )
-            _notify(msg, tele=True)
-            logger.info(msg)
-            # 매도 성공 시 EMA 데드크로스 상태 해제
-            _ema_sell_cond.pop(code, None)
-            _up_trend_state.pop(code, None)
-            # VI 포지션 정리
-            if code in _vi_positions:
-                _vi_positions[code]["sold"] = True
-            # 매도 완료 시 H0STMKO0 장운영정보 구독 해제
-            if not is_opening_call_auction:
-                try:
-                    _mkstatus_sub_remove({code})
-                except Exception as e_mk:
-                    logger.warning(f"[str1_sell] H0STMKO0 해제 실패 {code}: {e_mk}")
-            # 거래장부 기록
-            with _str1_sell_state_lock:
-                bp = _str1_sell_state.get(code, {}).get("buy_price", 0.0)
-            _is_market = ord_dvsn == "01"
-            _append_ledger(
-                order_type="sell_order",
-                code=code, name=name,
-                buy_price=float(bp or 0),
-                sell_price=0.0 if _is_market else float(ref_price or 0),
-                order_qty=qty,
-                reason=f"{reason}_주문",
-                ord_no=ordno,
-                ord_dvsn=f"{ord_dvsn}({ord_dvsn_name})",
-                prdy_ctrt=float(_last_prdy_ctrt.get(code, 0.0)),
-                stck_prpr=float(ref_price or 0),
-            )
-
-        except Exception as e:
-            err_str = str(e)
-            logger.error(
-                f"[str1_sell] 매도주문 실패 {name}({code})"
-                f"  수량={qty}  기준가={ref_price:,.0f}  주문방식={ord_dvsn_name}({ord_dvsn})"
-                f"  사유={reason}  에러={e}"
-            )
-
-            # ── 수량 초과(APBK0400) → 미체결 매도주문 취소 후 재주문 ──
-            if "APBK0400" in err_str or "수량을 초과" in err_str:
-                try:
-                    logger.info(f"[str1_sell] 수량초과 → {name}({code}) 미체결 매도주문 조회/취소 시도")
-                    n_cancelled = _cancel_open_sell_orders_for_code(client, cano, acnt, code)
-                    if n_cancelled > 0:
-                        logger.info(f"[str1_sell] {name}({code}) 미체결 매도 {n_cancelled}건 취소 완료 → 재주문 예정")
-                        retry_after_cancel = True
-                    else:
-                        logger.warning(f"[str1_sell] {name}({code}) 취소할 미체결 매도주문 없음")
-                except Exception as ce:
-                    logger.error(f"[str1_sell] {name}({code}) 미체결 매도 취소 중 에러: {ce}")
-
-            if not retry_after_cancel:
-                _notify(
-                    f"{ts_prefix()} [str1_sell] 매도실패 {name}({code})"
-                    f"  수량={qty}  기준가={ref_price:,.0f}  주문방식={ord_dvsn_name}({ord_dvsn})"
-                    f"  사유={reason} err={e}",
-                    tele=True,
-                )
-                # 주문 실패 시 sell_ordered/sold 복구 → 재시도 가능
-                with _str1_sell_state_lock:
-                    if code in _str1_sell_state:
-                        _str1_sell_state[code]["sell_ordered"] = False
-                        _str1_sell_state[code]["sold"] = False
-
-        # ── 미체결 취소 후 재주문 ──
-        if retry_after_cancel:
-            time.sleep(0.5)  # 취소 반영 대기
-            try:
-                logger.info(
-                    f"[str1_sell] 재주문 시도 {name}({code})"
-                    f"  수량={qty}  기준가={ref_price:,.0f}  주문방식={ord_dvsn_name}({ord_dvsn})"
-                )
-                j2 = _sell_order_cash(client, cano, acnt, code, qty, ord_dvsn=ord_dvsn)
-                out2 = j2.get("output") or {}
-                ordno2 = str(out2.get("ODNO") or out2.get("odno") or "").strip()
-                is_opening_call_auction = reason.startswith("str1_시초가하락_예상")
-                with _str1_sell_state_lock:
-                    st = _str1_sell_state.get(code, {})
-                    buy_price = st.get("buy_price") or ref_price
-                pnl_info = calc_sell_pnl(buy_price, ref_price, qty) if buy_price > 0 else {}
-                with _str1_sell_state_lock:
-                    st = _str1_sell_state.get(code, {})
-                    sell_ts = datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S")
-                    new_st = {
-                        **st,
-                        "sell_reason": reason,
-                        "sell_price": ref_price,
-                        "ordno": ordno2,
-                    }
-                    if is_opening_call_auction:
-                        new_st["opening_call_auction_ordered"] = True
-                        new_st["sold"] = False
-                    else:
-                        new_st["sold"] = True
-                        new_st["sell_time"] = sell_ts
-                        new_st["pnl"] = pnl_info.get("pnl", 0.0)
-                        new_st["ret_pct"] = pnl_info.get("ret_pct", 0.0)
-                    _str1_sell_state[code] = new_st
-                _save_str1_sell_state()
-
-                pnl_txt = f"  PNL≈{pnl_info.get('pnl', 0):+,.0f}원  ret≈{pnl_info.get('ret_pct', 0):+.2f}%" if pnl_info else ""
-                msg = (
-                    f"{ts_prefix()} [str1_sell] 재주문 성공 {name}({code})"
-                    f"  주문번호={ordno2}  수량={qty}  기준가={ref_price:,.0f}"
-                    f"  주문방식={ord_dvsn_name}({ord_dvsn})  사유={reason}{pnl_txt}"
-                )
-                _notify(msg, tele=True)
-                logger.info(msg)
-                if not is_opening_call_auction:
-                    try:
-                        _mkstatus_sub_remove({code})
-                    except Exception:
-                        pass
-                with _str1_sell_state_lock:
-                    bp = _str1_sell_state.get(code, {}).get("buy_price", 0.0)
-                _is_market2 = ord_dvsn == "01"
-                _append_ledger(
-                    order_type="sell_order",
-                    code=code, name=name,
-                    buy_price=float(bp or 0),
-                    sell_price=0.0 if _is_market2 else float(ref_price or 0),
-                    order_qty=qty,
-                    reason=f"{reason}_주문(미체결취소후재주문)",
-                    ord_no=ordno2,
-                    ord_dvsn=f"{ord_dvsn}({ord_dvsn_name})",
-                    prdy_ctrt=float(_last_prdy_ctrt.get(code, 0.0)),
-                    stck_prpr=float(ref_price or 0),
-                )
-            except Exception as e2:
-                logger.error(
-                    f"[str1_sell] 재주문도 실패 {name}({code})"
-                    f"  수량={qty}  기준가={ref_price:,.0f}  에러={e2}"
-                )
-                _notify(
-                    f"{ts_prefix()} [str1_sell] 재주문실패 {name}({code})"
-                    f"  수량={qty}  기준가={ref_price:,.0f}  주문방식={ord_dvsn_name}({ord_dvsn})"
-                    f"  사유={reason} err={e2}",
-                    tele=True,
-                )
-                with _str1_sell_state_lock:
-                    if code in _str1_sell_state:
-                        _str1_sell_state[code]["sell_ordered"] = False
-                        _str1_sell_state[code]["sold"] = False
 
     logger.info("[str1_sell] worker stopped")
 
@@ -1975,6 +1754,238 @@ def _run_sell_1518() -> None:
     _sell_1518_done = True
 
 
+def _do_sell_order(
+    code: str, name: str, qty: int, reason: str, ref_price: float,
+    ord_dvsn: str = "01", sell_price: float = 0.0, cndt_pric: float = 0.0,
+) -> None:
+    """별도 스레드에서 실행: KIS REST API 매도 주문 + 상태 갱신 + 거래장부 기록.
+
+    _enqueue_str1_sell에서 daemon 스레드로 즉시 호출됨 (sell_worker 큐 경�� 제거).
+    """
+    ord_dvsn_name = {
+        "00": "지정가", "01": "시장가", "02": "시간외종가",
+        "05": "장전시간외", "06": "장후시간외", "07": "시간외단일가", "22": "스톱지정가",
+    }.get(ord_dvsn, ord_dvsn)
+    retry_after_cancel = False
+
+    try:
+        # 종목별 보유 계좌로 매도 (syw_2 등 서브계좌 지원)
+        acct = _code_account_map.get(code)
+        if acct:
+            cano = acct["cano"]
+            acnt = acct.get("acnt_prdt_cd", "01") or "01"
+            client = _init_account_client(acct)
+            alias = acct.get("alias", acct.get("account_id", "?"))
+            logger.info(f"[str1_sell] {name}({code}) → {alias}({cano}) 계좌로 매도")
+        else:
+            cfg = _read_cfg() or load_config(str(CONFIG_PATH))
+            cano = str(cfg.get("cano", "")).strip()
+            acnt = str(cfg.get("acnt_prdt_cd", "01")).strip() or "01"
+            client = _top_client or _init_top_client()
+        if not cano:
+            logger.warning(f"[str1_sell] config cano 없음 → {code} 매도 스킵")
+            return
+
+        is_stop_limit = (ord_dvsn == "22")
+        is_opening_call_auction = reason.startswith("str1_시초가하락_예상")
+        sell_label = "스톱지정가매도" if is_stop_limit else ("동시호가매도" if is_opening_call_auction else "매도")
+        if is_stop_limit:
+            price_info = f"  조건가={cndt_pric:,.0f}  지정가={sell_price:,.0f}"
+        elif ord_dvsn not in ORD_DVSN_NO_PRICE:
+            price_info = f"  주문가={ref_price:,.0f}"
+        else:
+            price_info = ""
+        api_call_msg = (
+            f"{ts_prefix()} [str1_sell] ■ {sell_label}주문 API호출 {name}({code})"
+            f"  tr_id=TTTC0801U  수량={qty}  주문방식={ord_dvsn_name}({ord_dvsn}){price_info}"
+            f"  사유={reason}"
+        )
+        _notify(api_call_msg, tele=True)
+        logger.info(api_call_msg)
+        j = _sell_order_cash(
+            client, cano, acnt, code, qty,
+            price=sell_price, ord_dvsn=ord_dvsn, cndt_pric=cndt_pric,
+        )
+        out = j.get("output") or {}
+        ordno = str(out.get("ODNO") or out.get("odno") or "").strip()
+
+        with _str1_sell_state_lock:
+            st = _str1_sell_state.get(code, {})
+            buy_price = st.get("buy_price") or ref_price
+        pnl_info = calc_sell_pnl(buy_price, ref_price, qty) if buy_price > 0 else {}
+        with _str1_sell_state_lock:
+            st = _str1_sell_state.get(code, {})
+            sell_ts = datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S")
+            new_st = {
+                **st,
+                "sell_reason": reason,
+                "sell_price": ref_price,
+                "ordno": ordno,
+            }
+            if is_stop_limit:
+                new_st["stop_limit_ordered"] = True
+                new_st["sold"] = False
+            elif is_opening_call_auction:
+                new_st["opening_call_auction_ordered"] = True
+                new_st["sold"] = False
+            else:
+                new_st["sold"] = True
+                new_st["sell_time"] = sell_ts
+                new_st["pnl"] = pnl_info.get("pnl", 0.0)
+                new_st["ret_pct"] = pnl_info.get("ret_pct", 0.0)
+            _str1_sell_state[code] = new_st
+        _save_str1_sell_state()
+
+        pnl_txt = f"  PNL≈{pnl_info.get('pnl', 0):+,.0f}원  ret≈{pnl_info.get('ret_pct', 0):+.2f}%" if pnl_info else ""
+        opening_call_auction_suffix = " → 09:00 시초가 체결대기(복귀 시 취소가능)" if is_opening_call_auction else ""
+        msg = (
+            f"{ts_prefix()} [str1_sell] ✔ {sell_label}주문 접수완료 {name}({code})"
+            f"  tr_id=TTTC0801U  주문번호={ordno}  수량={qty}"
+            f"  주문방식={ord_dvsn_name}({ord_dvsn}){price_info}"
+            f"  사유={reason}{pnl_txt}{opening_call_auction_suffix}"
+        )
+        _notify(msg, tele=True)
+        logger.info(msg)
+        _ema_sell_cond.pop(code, None)
+        _up_trend_state.pop(code, None)
+        if code in _vi_positions:
+            _vi_positions[code]["sold"] = True
+        if not is_opening_call_auction:
+            try:
+                _mkstatus_sub_remove({code})
+            except Exception as e_mk:
+                logger.warning(f"[str1_sell] H0STMKO0 해제 실패 {code}: {e_mk}")
+        # 거래장부 기록
+        with _str1_sell_state_lock:
+            bp = _str1_sell_state.get(code, {}).get("buy_price", 0.0)
+        _is_market = ord_dvsn == "01"
+        _append_ledger(
+            order_type="sell_order",
+            code=code, name=name,
+            buy_price=float(bp or 0),
+            sell_price=0.0 if _is_market else float(ref_price or 0),
+            order_qty=qty,
+            reason=f"{reason}_주문",
+            ord_no=ordno,
+            ord_dvsn=f"{ord_dvsn}({ord_dvsn_name})",
+            prdy_ctrt=float(_last_prdy_ctrt.get(code, 0.0)),
+            stck_prpr=float(ref_price or 0),
+        )
+
+    except Exception as e:
+        err_str = str(e)
+        logger.error(
+            f"[str1_sell] 매도주문 실패 {name}({code})"
+            f"  수량={qty}  기준가={ref_price:,.0f}  주문방식={ord_dvsn_name}({ord_dvsn})"
+            f"  사유={reason}  에러={e}"
+        )
+
+        # ── 수량 초과(APBK0400) → 미체결 매도주문 취소 후 재주문 ──
+        if "APBK0400" in err_str or "수량을 초과" in err_str:
+            try:
+                logger.info(f"[str1_sell] 수량초과 → {name}({code}) 미체결 매도주문 조회/취소 시도")
+                n_cancelled = _cancel_open_sell_orders_for_code(client, cano, acnt, code)
+                if n_cancelled > 0:
+                    logger.info(f"[str1_sell] {name}({code}) 미체결 매도 {n_cancelled}건 취소 완료 �� 재주문 예정")
+                    retry_after_cancel = True
+                else:
+                    logger.warning(f"[str1_sell] {name}({code}) 취소할 미체결 매도주문 없음")
+            except Exception as ce:
+                logger.error(f"[str1_sell] {name}({code}) 미체결 매도 취소 중 에러: {ce}")
+
+        if not retry_after_cancel:
+            _notify(
+                f"{ts_prefix()} [str1_sell] 매도실패 {name}({code})"
+                f"  수량={qty}  기준가={ref_price:,.0f}  주문방식={ord_dvsn_name}({ord_dvsn})"
+                f"  사유={reason} err={e}",
+                tele=True,
+            )
+            with _str1_sell_state_lock:
+                if code in _str1_sell_state:
+                    _str1_sell_state[code]["sell_ordered"] = False
+                    _str1_sell_state[code]["sold"] = False
+
+    # ── 미체결 취소 후 재주문 ──
+    if retry_after_cancel:
+        time.sleep(0.5)
+        try:
+            logger.info(
+                f"[str1_sell] 재주문 시도 {name}({code})"
+                f"  수량={qty}  기준가={ref_price:,.0f}  주문방식={ord_dvsn_name}({ord_dvsn})"
+            )
+            j2 = _sell_order_cash(client, cano, acnt, code, qty, ord_dvsn=ord_dvsn)
+            out2 = j2.get("output") or {}
+            ordno2 = str(out2.get("ODNO") or out2.get("odno") or "").strip()
+            is_opening_call_auction = reason.startswith("str1_시초가하락_예상")
+            with _str1_sell_state_lock:
+                st = _str1_sell_state.get(code, {})
+                buy_price = st.get("buy_price") or ref_price
+            pnl_info = calc_sell_pnl(buy_price, ref_price, qty) if buy_price > 0 else {}
+            with _str1_sell_state_lock:
+                st = _str1_sell_state.get(code, {})
+                sell_ts = datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S")
+                new_st = {
+                    **st,
+                    "sell_reason": reason,
+                    "sell_price": ref_price,
+                    "ordno": ordno2,
+                }
+                if is_opening_call_auction:
+                    new_st["opening_call_auction_ordered"] = True
+                    new_st["sold"] = False
+                else:
+                    new_st["sold"] = True
+                    new_st["sell_time"] = sell_ts
+                    new_st["pnl"] = pnl_info.get("pnl", 0.0)
+                    new_st["ret_pct"] = pnl_info.get("ret_pct", 0.0)
+                _str1_sell_state[code] = new_st
+            _save_str1_sell_state()
+
+            pnl_txt = f"  PNL≈{pnl_info.get('pnl', 0):+,.0f}원  ret≈{pnl_info.get('ret_pct', 0):+.2f}%" if pnl_info else ""
+            msg = (
+                f"{ts_prefix()} [str1_sell] 재주문 성공 {name}({code})"
+                f"  주문번호={ordno2}  수량={qty}  기준가={ref_price:,.0f}"
+                f"  주문방식={ord_dvsn_name}({ord_dvsn})  사유={reason}{pnl_txt}"
+            )
+            _notify(msg, tele=True)
+            logger.info(msg)
+            if not is_opening_call_auction:
+                try:
+                    _mkstatus_sub_remove({code})
+                except Exception:
+                    pass
+            with _str1_sell_state_lock:
+                bp = _str1_sell_state.get(code, {}).get("buy_price", 0.0)
+            _is_market2 = ord_dvsn == "01"
+            _append_ledger(
+                order_type="sell_order",
+                code=code, name=name,
+                buy_price=float(bp or 0),
+                sell_price=0.0 if _is_market2 else float(ref_price or 0),
+                order_qty=qty,
+                reason=f"{reason}_주문(미체결취소후재주문)",
+                ord_no=ordno2,
+                ord_dvsn=f"{ord_dvsn}({ord_dvsn_name})",
+                prdy_ctrt=float(_last_prdy_ctrt.get(code, 0.0)),
+                stck_prpr=float(ref_price or 0),
+            )
+        except Exception as e2:
+            logger.error(
+                f"[str1_sell] 재주문도 실패 {name}({code})"
+                f"  수량={qty}  기준가={ref_price:,.0f}  에러={e2}"
+            )
+            _notify(
+                f"{ts_prefix()} [str1_sell] 재주문실패 {name}({code})"
+                f"  수량={qty}  기준가={ref_price:,.0f}  주문방식={ord_dvsn_name}({ord_dvsn})"
+                f"  사유={reason} err={e2}",
+                tele=True,
+            )
+            with _str1_sell_state_lock:
+                if code in _str1_sell_state:
+                    _str1_sell_state[code]["sell_ordered"] = False
+                    _str1_sell_state[code]["sold"] = False
+
+
 def _enqueue_str1_sell(
     code: str, reason: str, ref_price: float,
     ord_dvsn: str = "01", price: float = 0.0, cndt_pric: float = 0.0,
@@ -2011,15 +2022,164 @@ def _enqueue_str1_sell(
             _str1_sell_state[code]["sold"] = True  # 낙관적 선점
     sell_type = "스톱지정가매도" if is_stop_limit else ("동시호가매도" if is_opening_call_auction else "매도")
     logger.info(
-        f"{ts_prefix()} [str1_sell] ▶ {sell_type} 큐등록 {name}({code})"
+        f"{ts_prefix()} [str1_sell] ▶ {sell_type} 즉시주문 {name}({code})"
         f"  수량={qty}  기준가={ref_price:,.0f}  사유={reason}"
     )
-    _str1_sell_queue.put({
-        "action": "sell",
-        "code": code, "qty": qty, "reason": reason,
-        "ref_price": ref_price, "name": name,
-        "ord_dvsn": ord_dvsn, "price": price, "cndt_pric": cndt_pric,
-    })
+    # 즉시 daemon 스레드에서 REST 매도 호출 (sell_worker 큐 경유 제거 → 지연 최소화)
+    threading.Thread(
+        target=_do_sell_order,
+        args=(code, name, qty, reason, ref_price, ord_dvsn, price, cndt_pric),
+        name=f"sell_{code}_{int(time.time()*1000)%100000}",
+        daemon=True,
+    ).start()
+
+
+# =============================================================================
+# 29%+ 긴급매도 fast-path (on_result → 별도 스레드 즉시 REST)
+# =============================================================================
+def _fire_emergency_sell(code: str, trigger_price: float, cndt_price: int) -> None:
+    """29%+ 긴급매도: state 선점 후 별도 스레드에서 즉시 REST 호출.
+
+    on_result (WSS 콜백 스레드)에서 호출됨 — 최소 지연으로 주문 발동.
+    실패 시 state 롤백하여 기존 sell_worker 경로에서 재시도 가능.
+    """
+    with _str1_sell_state_lock:
+        st = _str1_sell_state.get(code)
+        if not st or st.get("sold") or st.get("sell_ordered"):
+            return  # 이미 매도 진행 중 → 중복 방지
+        if code in _no_sell_codes:
+            return
+        qty = int(st.get("qty", 0))
+        name = st.get("name", code)
+        if qty <= 0:
+            return
+        # 선점: 다른 경로(ingest_loop 등)에서 중복 주문 방지
+        _str1_sell_state[code]["sell_ordered"] = True
+        _str1_sell_state[code]["sold"] = True
+        _str1_sell_state[code]["stop_limit_ordered"] = True
+
+    reason = f"str1_상한가_긴급매도(stck_prpr={trigger_price:,.0f}<조건={cndt_price:,})"
+    logger.info(
+        f"{ts_prefix()} [긴급매도] ▶▶ FAST-PATH 발동 {name}({code})"
+        f"  stck_prpr={trigger_price:,.0f}  조건가={cndt_price:,}  수량={qty}"
+    )
+
+    def _do_sell():
+        try:
+            # 계좌 결정
+            acct = _code_account_map.get(code)
+            if acct:
+                client = _init_account_client(acct)
+                cano = acct["cano"]
+                acnt = acct.get("acnt_prdt_cd", "01") or "01"
+                alias = acct.get("alias", acct.get("account_id", "?"))
+            else:
+                cfg = _read_cfg() or load_config(str(CONFIG_PATH))
+                cano = str(cfg.get("cano", "")).strip()
+                acnt = str(cfg.get("acnt_prdt_cd", "01")).strip() or "01"
+                client = _top_client or _init_top_client()
+                alias = "main"
+            if not cano:
+                raise RuntimeError("config cano 없음")
+
+            # 지정가 계산: 현재가 - N호가
+            import kis_utils as _ku
+            tick = _ku._kr_tick_size(trigger_price)
+            limit_price = int(trigger_price) - (EMERGENCY_SELL_HOGA_OFFSET * tick)
+            limit_price = max(limit_price, tick)  # 하한 보호
+
+            api_msg = (
+                f"{ts_prefix()} [긴급매도] ■ 지정가매도 API호출 {name}({code})"
+                f"  계좌={alias}({cano})  수량={qty}  지정가={limit_price:,}"
+                f"  (stck_prpr={trigger_price:,.0f}−{EMERGENCY_SELL_HOGA_OFFSET}호가)"
+                f"  사유={reason}"
+            )
+            _notify(api_msg, tele=True)
+            logger.info(api_msg)
+
+            j = _sell_order_cash(
+                client, cano, acnt, code, qty,
+                price=limit_price, ord_dvsn="00",
+            )
+            out = j.get("output") or {}
+            ordno = str(out.get("ODNO") or out.get("odno") or "").strip()
+
+            with _str1_sell_state_lock:
+                if code in _str1_sell_state:
+                    _str1_sell_state[code]["ordno"] = ordno
+                    _str1_sell_state[code]["sell_reason"] = reason
+                    _str1_sell_state[code]["sell_price"] = limit_price
+            _save_str1_sell_state()
+
+            ok_msg = (
+                f"{ts_prefix()} [긴급매도] ✔ 주문접수 {name}({code})"
+                f"  ordno={ordno}  지정가={limit_price:,}"
+            )
+            _notify(ok_msg, tele=True)
+            logger.info(ok_msg)
+            # 거래장부 기록
+            with _str1_sell_state_lock:
+                bp = float(_str1_sell_state.get(code, {}).get("buy_price", 0))
+            _append_ledger(
+                order_type="sell_order",
+                code=code, name=name,
+                buy_price=bp,
+                sell_price=float(limit_price),
+                order_qty=qty,
+                reason=f"{reason}_주문",
+                ord_no=ordno,
+                ord_dvsn="00(지정가)",
+                prdy_ctrt=float(_last_prdy_ctrt.get(code, 0.0)),
+                stck_prpr=trigger_price,
+            )
+        except Exception as e:
+            logger.error(f"[긴급매도] {name}({code}) REST 실패: {e}")
+            # 롤백 → 기존 경로(ingest_loop → sell_worker)에서 재시도 가능
+            with _str1_sell_state_lock:
+                if code in _str1_sell_state:
+                    _str1_sell_state[code]["sell_ordered"] = False
+                    _str1_sell_state[code]["sold"] = False
+                    _str1_sell_state[code]["stop_limit_ordered"] = False
+            _notify(
+                f"{ts_prefix()} [긴급매도] ✘ {name}({code}) 실패: {e} → 일반매도 경로 재시도",
+                tele=True,
+            )
+
+    threading.Thread(target=_do_sell, name=f"emergency_sell_{code}", daemon=True).start()
+
+
+def _fast_29pct_sell_check(result_pl: "pl.DataFrame", kind: str) -> None:
+    """on_result에서 호출: sl_monitoring 중 종목의 stck_prpr이 조건가 미만이면 긴급매도."""
+    if kind != "regular_real":
+        return
+    if not _str1_sell_state:
+        return
+
+    code_col = "mksc_shrn_iscd" if "mksc_shrn_iscd" in result_pl.columns else (
+        "stck_shrn_iscd" if "stck_shrn_iscd" in result_pl.columns else None
+    )
+    if not code_col or "stck_prpr" not in result_pl.columns:
+        return
+
+    for df_code in result_pl.partition_by(code_col, maintain_order=True):
+        code = str(df_code[code_col][0]).strip().zfill(6)
+        with _str1_sell_state_lock:
+            st = _str1_sell_state.get(code, {})
+            if not st.get("sl_monitoring"):
+                continue
+            if st.get("sold") or st.get("sell_ordered"):
+                continue
+            sl_cndt = st.get("sl_cndt_price", 0)
+        if sl_cndt <= 0:
+            continue
+
+        try:
+            stck_prpr = float(str(df_code["stck_prpr"][-1]).replace(",", "") or 0)
+        except (ValueError, TypeError, IndexError):
+            continue
+
+        if stck_prpr > 0 and stck_prpr < sl_cndt:
+            _fire_emergency_sell(code, stck_prpr, sl_cndt)
 
 
 _periodic_sell_check_ts: float = 0.0   # 마지막 주기적 매도 체크 시각
@@ -7748,6 +7908,12 @@ def on_result(ws, tr_id, result, data_info):
     recv_ts = datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S.%f")
     # WSS 파서 단계에서 Polars로 변환 → ingest_loop는 Polars 네이티브로 처리
     result_pl = pl.from_pandas(result)
+    # ▶ 29%+ 긴급매도 fast-path: ingest_loop 우회, on_result에서 즉시 감지
+    if EMERGENCY_29PCT_SELL_ENABLED and _str1_sell_state:
+        try:
+            _fast_29pct_sell_check(result_pl, kind)
+        except Exception:
+            pass
     _ingest_queue.put((result_pl, trid, kind, is_real, recv_ts))
 
 

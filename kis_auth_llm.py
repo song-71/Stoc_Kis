@@ -8,6 +8,7 @@ import json
 import logging
 import csv
 import os
+import threading
 import time
 from base64 import b64decode
 from collections import namedtuple
@@ -690,6 +691,7 @@ class KISWebSocket:
 
     retry_count: int = 0
     amx_retries: int = 0
+    _approval_key_lock = threading.Lock()  # send_multiple의 approval_key 스왑 동시 접근 방지
 
     # init
     def __init__(self, api_url: str, max_retries: int = 1, approval_key: str | None = None):
@@ -699,8 +701,9 @@ class KISWebSocket:
         self._loop = None
         self._close_requested = False
         self._approval_key = approval_key  # None이면 글로벌 _base_headers_ws 사용
-        # 인스턴스 생성 시점의 open_map 스냅샷 (재연결 시 글로벌 open_map 오염 방지)
-        self._init_open_map = dict(open_map) if approval_key is None else {}
+        # a2 등 별도 인스턴스(approval_key 지정)는 빈 open_map 사용 (동적 구독만)
+        # a1(approval_key=None)은 글로벌 open_map 직접 참조 (run_ws_forever가 매 연결마다 갱신)
+        self._use_global_open_map = (approval_key is None)
 
     # private
     async def __subscriber(self, ws: websockets.ClientConnection):
@@ -805,8 +808,9 @@ class KISWebSocket:
                 continue
 
     async def __runner(self):
-        # 인스턴스별 open_map 사용 (a2 등 별도 인스턴스는 빈 맵)
-        init_map = self._init_open_map if hasattr(self, "_init_open_map") else open_map
+        # a1: 글로벌 open_map 직접 참조 (run_ws_forever가 매 연결마다 최신으로 갱신)
+        # a2: 빈 맵 (동적 구독만 사용, 글로벌 오염 방지)
+        init_map = open_map if self._use_global_open_map else {}
         if len(init_map.keys()) > 40:
             raise ValueError("Subscription's max is 40")
 
@@ -869,12 +873,22 @@ class KISWebSocket:
             data: list | str,
             kwargs: dict = None,
     ):
-        # 인스턴스별 approval_key가 있으면 글로벌을 임시 교체
-        saved_key = None
+        # 인스턴스별 approval_key가 있으면 글로벌을 임시 교체 (thread lock으로 보호)
         if self._approval_key:
-            saved_key = _base_headers_ws.get("approval_key")
-            _base_headers_ws["approval_key"] = self._approval_key
-        try:
+            with KISWebSocket._approval_key_lock:
+                saved_key = _base_headers_ws.get("approval_key")
+                _base_headers_ws["approval_key"] = self._approval_key
+                try:
+                    if type(data) is str:
+                        await self.send(ws, request, tr_type, data, kwargs)
+                    elif type(data) is list:
+                        for d in data:
+                            await self.send(ws, request, tr_type, d, kwargs)
+                    else:
+                        raise ValueError("data must be str or list")
+                finally:
+                    _base_headers_ws["approval_key"] = saved_key
+        else:
             if type(data) is str:
                 await self.send(ws, request, tr_type, data, kwargs)
             elif type(data) is list:
@@ -882,9 +896,6 @@ class KISWebSocket:
                     await self.send(ws, request, tr_type, d, kwargs)
             else:
                 raise ValueError("data must be str or list")
-        finally:
-            if saved_key is not None:
-                _base_headers_ws["approval_key"] = saved_key
 
     @classmethod
     def subscribe(

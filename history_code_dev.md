@@ -2,6 +2,17 @@
 
 ---
 
+## [2026-04-15] 6dcd871
+- **Category**: fix
+- **Title**: a2 WSS 미연결 시 send_request 블로킹으로 인한 watchdog 강제종료 방지
+- **Files**: `ws_realtime_trading.py`, `ws_merge_wss_parts_snapshot.py` (신규)
+- **Changes**:
+  1. **`_a2_is_connected()` 함수 추가**: `_kws_a2 is not None and _kws_a2._ws is not None` 조건으로 실제 WebSocket 연결 여부 확인. 기존 `_kws_a2 is not None` 패턴(12곳)을 전량 교체
+  2. **a2 send_request 호출부 전체 가드 교체**: `_a2_wss_subscribe`, `_a2_subscribe_ccnl_notice`, `_a2_wss_subscribe_batch`, `_a2_mkstatus_subscribe`, `_a2_mkstatus_unsubscribe`, `_a2_apply_subscriptions`, `_desired_subscription_map`(3곳), `run_ws_forever`, `scheduler_loop`, `_ccnl_notice_sub_add`, `_shutdown`
+  3. **`_desired_subscription_map` fallback 보장**: a2 미연결 시 a1에서 예상체결가(exp_ccnl_krx) 구독하도록 분기 처리
+  4. **`ws_merge_wss_parts_snapshot.py` 추가**: 중간 병합 스냅샷 스크립트 보관
+- **Impact**: KIS 서버 throttling으로 a2 WebSocket 연결이 수립되지 않은 상태(`_ws=None`)에서 send_request가 5초씩 반복 블로킹되어 ingest_loop heartbeat가 갱신되지 않고 watchdog이 127초 후 프로세스를 강제종료하던 문제 해소. a2 연결 시도 중에도 a1에서 예상체결가 fallback 구독이 정상 동작
+
 ## [2026-04-15] e22125e
 - **Category**: refactor
 - **Title**: _init_open_map 플래그화 + approval_key 스왑 threading.Lock 보호

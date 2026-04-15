@@ -2,6 +2,17 @@
 
 ---
 
+## [2026-04-15] e22125e
+- **Category**: refactor
+- **Title**: _init_open_map 플래그화 + approval_key 스왑 threading.Lock 보호
+- **Files**: `kis_auth_llm.py`
+- **Changes**:
+  1. **`_use_global_open_map` 플래그 도입**: `__init__`에서 스냅샷(`_init_open_map = dict(open_map)`) 방식을 폐기하고, approval_key 유무에 따라 플래그만 설정. a1(None)은 글로벌 `open_map` 직접 참조, a2(지정)는 빈 맵 사용
+  2. **`__runner` 로직 단순화**: `hasattr` 방어 코드 제거, `open_map if self._use_global_open_map else {}` 한 줄로 대체
+  3. **`send_multiple` approval_key 스왑 Lock 보호**: `threading.Lock`(`_approval_key_lock`, 클래스 변수)으로 임시 교체 블록을 감싸 a1/a2 동시 send 시 글로벌 `_base_headers_ws["approval_key"]` 경합 방지. approval_key 미사용 경로는 lock 밖에서 직접 send
+  4. **`threading` import 추가**
+- **Impact**: 스냅샷 방식에서 발생하던 인스턴스 생성 시점 고정 문제 해소. a1/a2 동시 send 시 approval_key가 서로 덮어쓰이던 잠재적 경합 조건 제거로 WSS 구독/해제 요청 안정화
+
 ## [2026-04-15] 41912ed
 - **Category**: fix
 - **Title**: a2 H0STMKO0 슬롯 오버플로우 + _shutdown UnboundLocalError 수정

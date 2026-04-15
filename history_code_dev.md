@@ -2,6 +2,15 @@
 
 ---
 
+## [2026-04-15] 335593f
+- **Category**: fix
+- **Title**: a2 WSS 재연결 시 글로벌 open_map 오염 + on_system 데드락 2건 수정
+- **Files**: `kis_auth_llm.py`, `ws_realtime_trading.py`
+- **Changes**:
+  1. **[kis_auth_llm.py] Bug 1 — open_map 글로벌 참조 오염**: `KISWebSocket.__init__`에서 `_init_open_map` 스냅샷 저장 (approval_key 지정 시 빈 맵으로 초기화). `__runner`에서 글로벌 `open_map` 대신 인스턴스별 `_init_open_map`을 사용하여 a2 재연결 시 a1 구독 목록을 a2 approval_key로 전송하던 문제 제거
+  2. **[ws_realtime_trading.py] Bug 2 — on_system 콜백 데드락**: `_a2_on_system`(asyncio 루프 내 콜백)에서 `send_request`(`run_coroutine_threadsafe`) 직접 호출 시 같은 루프에 코루틴이 추가되지만 현재 콜백이 반환되기 전까지 실행되지 않아 5초 timeout 발생. 구독 요청 로직을 별도 daemon thread로 분리(1초 대기 후 실행)하여 해결
+- **Impact**: a2 WSS 재연결 시 서버가 잘못된 구독 요청을 받아 연결을 끊는 반복 현상 해소. on_system 콜백에서의 timeout으로 인한 연결 불안정 제거 → a2 WSS 안정적 운영 가능
+
 ## [2026-04-15] 2ccc3ac
 - **Category**: fix
 - **Title**: a2 WSS 수신 DataFrame Polars 미변환으로 인한 ingest_loop AttributeError 수정

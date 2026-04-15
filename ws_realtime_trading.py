@@ -5302,6 +5302,9 @@ _kws_a2_ready = threading.Event()      # a2 WSS 연결 완료 신호
 _a2_subscribed_codes: set[str] = set() # a2에서 구독 중인 예상체결가 종목
 _a2_ccnl_notice_done = False           # a2 체결통보 구독 완료 여부
 _a2_mkstatus_codes: set[str] = set()   # a2에서 H0STMKO0 일시 구독 중인 종목
+_a2_mkstatus_ts: dict[str, float] = {} # H0STMKO0 구독 시각 (타임아웃 자동 해제용)
+_A2_MKSTATUS_TIMEOUT = 30.0           # H0STMKO0 일시 구독 자동 해제 (30초)
+_A2_MKSTATUS_MAX = 5                  # H0STMKO0 동시 구독 상한
 
 def _init_a2_wss() -> None:
     """a2 계좌 전용 WSS 연결 (예상체결가 전체 + 체결통보 H0STCNI0).
@@ -5423,14 +5426,19 @@ def _a2_wss_subscribe_batch(request_func, code_list: list, tr_type: str = "1") -
         return False
 
 def _a2_mkstatus_subscribe(code: str) -> None:
-    """a2 WSS에서 H0STMKO0 일시 구독 (미수신 원인 확인용)."""
+    """a2 WSS에서 H0STMKO0 일시 구독 (미수신 원인 확인용). 상한 초과 시 스킵."""
     if _kws_a2 is None or code in _a2_mkstatus_codes:
         return
+    # 타임아웃 만료분 먼저 정리
+    _a2_mkstatus_expire()
+    if len(_a2_mkstatus_codes) >= _A2_MKSTATUS_MAX:
+        return  # 동시 구독 상한 도달
     try:
         _kws_a2.send_request(request=market_status_krx, tr_type="1", data=code)  # noqa: F405
         _a2_mkstatus_codes.add(code)
+        _a2_mkstatus_ts[code] = time.time()
         name = code_name_map.get(code, code)
-        logger.info(f"{ts_prefix()} [a2-wss] H0STMKO0 일시 구독: {name}({code})")
+        logger.info(f"{ts_prefix()} [a2-wss] H0STMKO0 일시 구독: {name}({code}) (현재 {len(_a2_mkstatus_codes)}개)")
     except Exception as e:
         logger.warning(f"{ts_prefix()} [a2-wss] H0STMKO0 구독 실패: {code} {e}")
 
@@ -5440,11 +5448,21 @@ def _a2_mkstatus_unsubscribe(code: str) -> None:
         return
     try:
         _kws_a2.send_request(request=market_status_krx, tr_type="2", data=code)  # noqa: F405
-        _a2_mkstatus_codes.discard(code)
-        name = code_name_map.get(code, code)
-        logger.info(f"{ts_prefix()} [a2-wss] H0STMKO0 해제: {name}({code})")
     except Exception as e:
         logger.warning(f"{ts_prefix()} [a2-wss] H0STMKO0 해제 실패: {code} {e}")
+    _a2_mkstatus_codes.discard(code)
+    _a2_mkstatus_ts.pop(code, None)
+    name = code_name_map.get(code, code)
+    logger.debug(f"{ts_prefix()} [a2-wss] H0STMKO0 해제: {name}({code})")
+
+def _a2_mkstatus_expire() -> None:
+    """타임아웃 경과한 H0STMKO0 일시 구독 자동 해제."""
+    if not _a2_mkstatus_ts:
+        return
+    now = time.time()
+    expired = [c for c, ts in _a2_mkstatus_ts.items() if (now - ts) >= _A2_MKSTATUS_TIMEOUT]
+    for c in expired:
+        _a2_mkstatus_unsubscribe(c)
 
 def _a2_apply_subscriptions(now: datetime) -> None:
     """a2 WSS 시간대별 예상체결가 구독 전환. scheduler_loop에서 주기 호출."""
@@ -6273,6 +6291,9 @@ def _price_watchdog_loop() -> None:
                         pass
                     # 미수신 종목 → a2에서 H0STMKO0 일시 구독 (VI/사이드카/거래정지 확인)
                     _a2_mkstatus_subscribe(c)
+
+            # H0STMKO0 일시 구독 타임아웃 자동 해제
+            _a2_mkstatus_expire()
 
             # VI 예상체결가 구독 자동 해제 (150초 경과 — H0STMKO0 해제 통보 미수신 시 fallback)
             # VI 발동~해제 통상 2:03~2:20초 → 150초(2분30초) 안전 마진
@@ -8959,6 +8980,7 @@ def _watchdog_loop():
 # 종료 처리
 # =============================================================================
 def _shutdown(reason: str):
+    global _active_kws
     if _stop_event.is_set():
         return
     logger.warning(f"\n{'=' * 66}\n[shutdown] {reason}\n{'=' * 66}")
@@ -9267,9 +9289,8 @@ def run_ws_forever():
             # H0STCNI0 체결통보: a2 활성 시 a2에서 구독, 아니면 a1에서 구독
             now_t = datetime.now(KST).time()
             if _kws_a2 is not None:
-                # a2에서 체결통보 구독 (a1 슬롯 절약)
+                # a2에서 체결통보 구독 (a1 슬롯 절약, 이미 구독 시 스킵)
                 _a2_subscribe_ccnl_notice()
-                logger.info(f"{ts_prefix()} [체결통보] a2 WSS에서 H0STCNI0 구독")
             else:
                 acc_key = _get_ccnl_notice_tr_key()
                 if acc_key:

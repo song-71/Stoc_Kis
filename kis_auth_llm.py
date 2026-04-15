@@ -6,7 +6,6 @@ import asyncio
 import copy
 import json
 import logging
-import csv
 import os
 import threading
 import time
@@ -691,7 +690,8 @@ class KISWebSocket:
 
     retry_count: int = 0
     amx_retries: int = 0
-    _approval_key_lock = threading.Lock()  # send_multiple의 approval_key 스왑 동시 접근 방지
+
+    _approval_key_lock = threading.Lock()
 
     # init
     def __init__(self, api_url: str, max_retries: int = 1, approval_key: str | None = None):
@@ -700,9 +700,7 @@ class KISWebSocket:
         self._ws = None
         self._loop = None
         self._close_requested = False
-        self._approval_key = approval_key  # None이면 글로벌 _base_headers_ws 사용
-        # a2 등 별도 인스턴스(approval_key 지정)는 빈 open_map 사용 (동적 구독만)
-        # a1(approval_key=None)은 글로벌 open_map 직접 참조 (run_ws_forever가 매 연결마다 갱신)
+        self._approval_key = approval_key
         self._use_global_open_map = (approval_key is None)
 
     # private
@@ -740,20 +738,8 @@ class KISWebSocket:
 
                     dm = data_map[tr_id]
                     d = d1[3]
-                    # H0STCNI0 디버깅: encrypt/key/iv 상태 로깅
-                    if tr_id == "H0STCNI0":
-                        logging.info(f"[H0STCNI0] data_map encrypt={dm.get('encrypt')}, key={'SET' if dm.get('key') else 'NONE'}, iv={'SET' if dm.get('iv') else 'NONE'}, data_len={len(d)}")
-                    is_encrypted = dm.get("encrypt") == "Y" or d1[0] == "1"
-                    if is_encrypted:
-                        if dm.get("key") and dm.get("iv"):
-                            d = aes_cbc_base64_dec(dm["key"], dm["iv"], d)
-                            if tr_id == "H0STCNI0":
-                                logging.info(f"[H0STCNI0] 복호화 성공, fields={len(d.split('^'))}")
-                        else:
-                            logging.warning(f"[{tr_id}] 암호화 데이터(d1[0]={d1[0]}, encrypt={dm.get('encrypt')})이나 key/iv 없음 → 복호화 불가")
-                            continue
-                    elif tr_id == "H0STCNI0":
-                        logging.warning(f"[H0STCNI0] encrypt={dm.get('encrypt')}, d1[0]={d1[0]} → 복호화 스킵! 데이터가 암호화 상태일 수 있음")
+                    if dm.get("encrypt", None) == "Y":
+                        d = aes_cbc_base64_dec(dm["key"], dm["iv"], d)
 
                     # ── 여러 건 데이터 처리: KIS는 N건을 ^로 연결해서 보냄 ──
                     # 컬럼 수로 나눠 각 건을 개별 행으로 분리 (duplicate cols 방지)
@@ -770,8 +756,7 @@ class KISWebSocket:
                         d = "\n".join(rows)
 
                     df = pd.read_csv(
-                        StringIO(d), header=None, sep="^", names=columns, dtype=object,
-                        quoting=csv.QUOTE_NONE,
+                        StringIO(d), header=None, sep="^", names=columns, dtype=object
                     )
 
                     show_result = True
@@ -780,8 +765,6 @@ class KISWebSocket:
                     rsp = system_resp(raw)
 
                     tr_id = rsp.tr_id
-                    if tr_id == "H0STCNI0":
-                        logging.info(f"[H0STCNI0] system_resp: encrypt={rsp.encrypt}, key={'SET' if rsp.ekey else 'NONE'}, iv={'SET' if rsp.iv else 'NONE'}")
                     add_data_map(
                         tr_id=rsp.tr_id, encrypt=rsp.encrypt, key=rsp.ekey, iv=rsp.iv
                     )
@@ -808,10 +791,7 @@ class KISWebSocket:
                 continue
 
     async def __runner(self):
-        # a1: 글로벌 open_map 직접 참조 (run_ws_forever가 매 연결마다 최신으로 갱신)
-        # a2: 빈 맵 (동적 구독만 사용, 글로벌 오염 방지)
-        init_map = open_map if self._use_global_open_map else {}
-        if len(init_map.keys()) > 40:
+        if len(open_map.keys()) > 40:
             raise ValueError("Subscription's max is 40")
 
         env = getTREnv()
@@ -824,11 +804,13 @@ class KISWebSocket:
         url = f"{env.my_url_ws}{self.api_url}"
         self._loop = asyncio.get_running_loop()
 
+        init_map = open_map if self._use_global_open_map else {}
+
         while self.retry_count < self.max_retries:
             try:
                 async with websockets.connect(url) as ws:
                     self._ws = ws
-                    # request subscribe (인스턴스별 open_map)
+                    # request subscribe
                     for name, obj in init_map.items():
                         await self.send_multiple(
                             ws, obj["func"], "1", obj["items"], obj["kwargs"]
@@ -873,7 +855,6 @@ class KISWebSocket:
             data: list | str,
             kwargs: dict = None,
     ):
-        # 인스턴스별 approval_key가 있으면 글로벌을 임시 교체 (thread lock으로 보호)
         if self._approval_key:
             with KISWebSocket._approval_key_lock:
                 saved_key = _base_headers_ws.get("approval_key")
@@ -934,10 +915,7 @@ class KISWebSocket:
             raise RuntimeError("WebSocket not connected")
         coro = self.send_multiple(self._ws, request, tr_type, data, kwargs)
         fut = asyncio.run_coroutine_threadsafe(coro, self._loop)
-        try:
-            return fut.result(timeout=5)
-        except TimeoutError:
-            raise RuntimeError("WebSocket send timeout (5s)")
+        return fut.result()
 
     def close(self):
         self._close_requested = True

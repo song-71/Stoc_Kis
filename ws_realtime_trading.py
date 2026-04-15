@@ -5327,9 +5327,13 @@ def _init_a2_wss() -> None:
             "H0STOAC0": ("overtime_exp", "N"),
         }
         if trid in _TR_KIND:
-            recv_ts = datetime.now(KST).strftime("%H%M%S%f")[:9]
+            recv_ts = datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S.%f")
             kind, is_real = _TR_KIND[trid]
-            _ingest_queue.put((df, trid, kind, is_real, recv_ts))
+            # 컬럼명 소문자 통일 (a1 on_result과 동일)
+            df.columns = [str(c).strip().lower() for c in df.columns]
+            # kis_auth_llm은 pandas DataFrame 반환 → Polars 변환 필수 (ingest_loop은 Polars 기대)
+            df_pl = pl.from_pandas(df)
+            _ingest_queue.put((df_pl, trid, kind, is_real, recv_ts))
         elif trid == "H0STCNI0":
             # 체결통보: a1의 on_result 처리 경로 직접 호출 (ingest_queue 미경유)
             on_result(ws, tr_id, df, data_info)

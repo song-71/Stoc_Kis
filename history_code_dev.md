@@ -2,6 +2,16 @@
 
 ---
 
+## [2026-04-15] 2ccc3ac
+- **Category**: fix
+- **Title**: a2 WSS 수신 DataFrame Polars 미변환으로 인한 ingest_loop AttributeError 수정
+- **Files**: `ws_realtime_trading.py`
+- **Changes**:
+  1. **`_a2_on_result` 버그 수정**: kis_auth_llm이 반환하는 pandas DataFrame을 `pl.from_pandas()`로 변환 후 `_ingest_queue`에 투입. 기존에는 pandas DataFrame을 그대로 큐에 넣어 ingest_loop에서 Polars API 호출 시 AttributeError 발생
+  2. **컬럼명 소문자 통일**: `df.columns = [str(c).strip().lower() for c in df.columns]` 처리를 변환 전 추가 (a1 on_result와 동일 방식)
+  3. **recv_ts 포맷 통일**: 기존 `"%H%M%S%f"[:9]` 형식에서 a1과 동일한 `"%Y-%m-%d %H:%M:%S.%f"` 형식으로 변경
+- **Impact**: 미수정 시 a2 WSS(예상체결가/시간외 등) 수신 데이터 전량 유실 → watchdog 강제종료로 이어지는 치명적 버그 해소. a2 연결 데이터가 정상적으로 ingest_loop에서 처리됨
+
 ## [2026-04-14] dea17d1
 - **Category**: refactor
 - **Title**: H0STMKO0 상시구독 제거 → a2 WSS 온디맨드 방식으로 전환

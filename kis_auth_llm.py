@@ -699,6 +699,8 @@ class KISWebSocket:
         self._loop = None
         self._close_requested = False
         self._approval_key = approval_key  # None이면 글로벌 _base_headers_ws 사용
+        # 인스턴스 생성 시점의 open_map 스냅샷 (재연결 시 글로벌 open_map 오염 방지)
+        self._init_open_map = dict(open_map) if approval_key is None else {}
 
     # private
     async def __subscriber(self, ws: websockets.ClientConnection):
@@ -803,7 +805,9 @@ class KISWebSocket:
                 continue
 
     async def __runner(self):
-        if len(open_map.keys()) > 40:
+        # 인스턴스별 open_map 사용 (a2 등 별도 인스턴스는 빈 맵)
+        init_map = self._init_open_map if hasattr(self, "_init_open_map") else open_map
+        if len(init_map.keys()) > 40:
             raise ValueError("Subscription's max is 40")
 
         env = getTREnv()
@@ -820,8 +824,8 @@ class KISWebSocket:
             try:
                 async with websockets.connect(url) as ws:
                     self._ws = ws
-                    # request subscribe
-                    for name, obj in open_map.items():
+                    # request subscribe (인스턴스별 open_map)
+                    for name, obj in init_map.items():
                         await self.send_multiple(
                             ws, obj["func"], "1", obj["items"], obj["kwargs"]
                         )

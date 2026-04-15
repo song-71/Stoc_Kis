@@ -5345,16 +5345,21 @@ def _init_a2_wss() -> None:
         if rsp.isOk and rsp.tr_msg and "SUCCESS" in rsp.tr_msg:
             if not _kws_a2_ready.is_set():
                 _kws_a2_ready.set()
-                logger.info(f"{ts_prefix()} [a2-wss] 연결 완료 → 체결통보 + 예상체결가 구독 시작")
-                # 연결 완료 즉시: 체결통보 구독 + 현재 시간대 예상체결가 구독
-                try:
-                    _a2_subscribe_ccnl_notice()
-                except Exception as e:
-                    logger.warning(f"{ts_prefix()} [a2-wss] 체결통보 초기 구독 실패: {e}")
-                try:
-                    _a2_apply_subscriptions(datetime.now(KST))
-                except Exception as e:
-                    logger.warning(f"{ts_prefix()} [a2-wss] 예상체결가 초기 구독 실패: {e}")
+                logger.info(f"{ts_prefix()} [a2-wss] 연결 완료")
+                # ★ on_system은 asyncio 루프 내에서 호출됨 → send_request(run_coroutine_threadsafe)가
+                #   같은 루프에 코루틴을 넣어도 현재 콜백이 반환될 때까지 실행 안 됨 → timeout
+                #   → 별도 스레드에서 구독 요청
+                def _a2_initial_subscribe():
+                    time.sleep(1)  # ws 안정화 대기
+                    try:
+                        _a2_subscribe_ccnl_notice()
+                    except Exception as e:
+                        logger.warning(f"{ts_prefix()} [a2-wss] 체결통보 초기 구독 실패: {e}")
+                    try:
+                        _a2_apply_subscriptions(datetime.now(KST))
+                    except Exception as e:
+                        logger.warning(f"{ts_prefix()} [a2-wss] 예상체결가 초기 구독 실패: {e}")
+                threading.Thread(target=_a2_initial_subscribe, daemon=True).start()
             return
         if rsp.tr_msg:
             msg = str(rsp.tr_msg)

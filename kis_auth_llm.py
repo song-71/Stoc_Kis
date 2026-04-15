@@ -835,7 +835,7 @@ class KISWebSocket:
                         self.__subscriber(ws),
                     )
             except Exception as e:
-                print("Connection exception >> ", e)
+                logging.debug(f"[ws] connection exception: {e}")
                 self.retry_count += 1
                 await asyncio.sleep(1)
             finally:

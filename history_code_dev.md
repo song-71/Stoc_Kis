@@ -2,6 +2,17 @@
 
 ---
 
+## [2026-04-15] 41912ed
+- **Category**: fix
+- **Title**: a2 H0STMKO0 슬롯 오버플로우 + _shutdown UnboundLocalError 수정
+- **Files**: `ws_realtime_trading.py`
+- **Changes**:
+  1. **`_a2_mkstatus_expire()` 신설**: 구독 시각(`_a2_mkstatus_ts`)을 기록해두고 30초(`_A2_MKSTATUS_TIMEOUT`) 경과 시 자동 해제. `_a2_mkstatus_subscribe`와 `_price_watchdog_loop`에서 주기적으로 호출하여 누적 방지
+  2. **`_A2_MKSTATUS_MAX=5` 동시 구독 상한**: 상한 초과 시 신규 구독을 스킵하여 슬롯 고갈 방어
+  3. **`_shutdown` UnboundLocalError 수정**: 함수 진입부에 `global _active_kws` 선언 추가. 일부 코드 경로에서 선언 없이 `_active_kws`를 재할당하여 UnboundLocalError 발생하던 문제 해소
+  4. **`run_ws_forever` 체결통보 중복 로그 제거**: `_a2_subscribe_ccnl_notice` 호출 후 중복된 `logger.info` 제거 (이미 구독 시 스킵 처리로 충분)
+- **Impact**: stale_check마다 H0STMKO0 구독이 쌓여 a2 40슬롯 초과 → MAX SUBSCRIBE OVER → 연결 반복 끊김 현상 해소. _shutdown 경로에서 발생하던 UnboundLocalError 제거로 종료 처리 안정화
+
 ## [2026-04-15] 335593f
 - **Category**: fix
 - **Title**: a2 WSS 재연결 시 글로벌 open_map 오염 + on_system 데드락 2건 수정

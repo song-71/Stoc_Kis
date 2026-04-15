@@ -2208,7 +2208,7 @@ def _ccnl_notice_sub_add(code: str) -> None:
         logger.warning(f"{ts_prefix()} [체결통보] htsid 미설정 → H0STCNI0 구독 불가: {code}")
         return
     # a2 WSS 우선
-    if _kws_a2 is not None:
+    if _a2_is_connected():
         _a2_subscribe_ccnl_notice()  # 이미 구독됐으면 스킵
         _ccnl_notice_sub_codes.add(code)
         _ccnl_notice_order_ts[code] = time.time()
@@ -4322,7 +4322,7 @@ def scheduler_loop():
                 global _ccnl_early_add_date
                 today = now.date()
                 if _ccnl_early_add_date != today:
-                    if _kws_a2 is not None:
+                    if _a2_is_connected():
                         # a2에서 체결통보 구독
                         _a2_subscribe_ccnl_notice()
                         _ccnl_early_add_date = today
@@ -5378,7 +5378,7 @@ def _init_a2_wss() -> None:
 def _a2_subscribe_ccnl_notice() -> None:
     """a2 WSS에서 H0STCNI0 체결통보 구독. 연결 완료 후 1회 호출."""
     global _a2_ccnl_notice_done
-    if _kws_a2 is None or _a2_ccnl_notice_done:
+    if not _a2_is_connected() or _a2_ccnl_notice_done:
         return
     acc_key = _get_ccnl_notice_tr_key()
     if not acc_key:
@@ -5391,9 +5391,13 @@ def _a2_subscribe_ccnl_notice() -> None:
     except Exception as e:
         logger.warning(f"{ts_prefix()} [a2-wss] H0STCNI0 체결통보 구독 실패: {e}")
 
+def _a2_is_connected() -> bool:
+    """a2 WSS가 연결되어 있는지 확인."""
+    return _kws_a2 is not None and getattr(_kws_a2, '_ws', None) is not None
+
 def _a2_wss_subscribe(code: str, tr_type: str) -> bool:
     """a2 WSS로 예상체결가 구독/해제. 성공 시 True."""
-    if _kws_a2 is None:
+    if not _a2_is_connected():
         return False
     try:
         _kws_a2.send_request(request=exp_ccnl_krx, tr_type=tr_type, data=code)  # noqa: F405
@@ -5410,7 +5414,7 @@ def _a2_wss_subscribe(code: str, tr_type: str) -> bool:
 
 def _a2_wss_subscribe_batch(request_func, code_list: list, tr_type: str = "1") -> bool:
     """a2 WSS로 배치 구독/해제."""
-    if _kws_a2 is None or not code_list:
+    if not _a2_is_connected() or not code_list:
         return False
     try:
         _kws_a2.send_request(request=request_func, tr_type=tr_type, data=code_list)
@@ -5427,7 +5431,7 @@ def _a2_wss_subscribe_batch(request_func, code_list: list, tr_type: str = "1") -
 
 def _a2_mkstatus_subscribe(code: str) -> None:
     """a2 WSS에서 H0STMKO0 일시 구독 (미수신 원인 확인용). 상한 초과 시 스킵."""
-    if _kws_a2 is None or code in _a2_mkstatus_codes:
+    if not _a2_is_connected() or code in _a2_mkstatus_codes:
         return
     # 타임아웃 만료분 먼저 정리
     _a2_mkstatus_expire()
@@ -5444,7 +5448,7 @@ def _a2_mkstatus_subscribe(code: str) -> None:
 
 def _a2_mkstatus_unsubscribe(code: str) -> None:
     """상태 확인 완료 후 H0STMKO0 해제."""
-    if _kws_a2 is None or code not in _a2_mkstatus_codes:
+    if not _a2_is_connected() or code not in _a2_mkstatus_codes:
         return
     try:
         _kws_a2.send_request(request=market_status_krx, tr_type="2", data=code)  # noqa: F405
@@ -5466,7 +5470,7 @@ def _a2_mkstatus_expire() -> None:
 
 def _a2_apply_subscriptions(now: datetime) -> None:
     """a2 WSS 시간대별 예상체결가 구독 전환. scheduler_loop에서 주기 호출."""
-    if _kws_a2 is None:
+    if not _a2_is_connected():
         return
     t = now.time()
     all_codes = set(codes)
@@ -8992,7 +8996,7 @@ def _shutdown(reason: str):
             _request_ws_close(_active_kws)
             _active_kws = None  # 다른 스레드의 추가 send 방지
     # a2 WSS 종료
-    if _kws_a2 is not None:
+    if _a2_is_connected():
         try:
             _kws_a2.shutdown()
         except Exception:
@@ -9180,7 +9184,7 @@ def _desired_subscription_map(now: datetime) -> dict:
         return {}
     if dtime(8, 50) <= t < dtime(9, 0):
         # a2 활성 → 예상체결가는 a2에서 처리, a1은 08:59:29부터 57/59 실시간체결만
-        if _kws_a2 is not None:
+        if _a2_is_connected():
             single_codes = (_single_price_codes.keys() | _single_price_pending.keys()) & all_codes
             if single_codes and t >= dtime(8, 59, 29):
                 return {ccnl_krx: single_codes}  # noqa: F405
@@ -9200,7 +9204,7 @@ def _desired_subscription_map(now: datetime) -> dict:
         single_codes = (_single_price_codes.keys() | _single_price_pending.keys()) & all_codes
 
         # a2 WSS 활성 → 예상체결가 전체를 a2에서 처리, a1은 실시간체결만
-        if _kws_a2 is not None:
+        if _a2_is_connected():
             vi_codes = set()  # a1에서 VI 예상체결 구독 불필요
             # 57/59 예상체결도 a2에서 처리 → a1은 실시간 체결가 구간만
             minute, second = t.minute, t.second
@@ -9234,7 +9238,7 @@ def _desired_subscription_map(now: datetime) -> dict:
 
     if dtime(15, 20) <= t < dtime(15, 30):
         # a2 활성 → 예상체결가는 a2에서 처리
-        if _kws_a2 is not None:
+        if _a2_is_connected():
             return {}
         return {exp_ccnl_krx: all_codes}  # noqa: F405
 
@@ -9288,7 +9292,7 @@ def run_ws_forever():
             _subscribed.clear()
             # H0STCNI0 체결통보: a2 활성 시 a2에서 구독, 아니면 a1에서 구독
             now_t = datetime.now(KST).time()
-            if _kws_a2 is not None:
+            if _a2_is_connected():
                 # a2에서 체결통보 구독 (a1 슬롯 절약, 이미 구독 시 스킵)
                 _a2_subscribe_ccnl_notice()
             else:

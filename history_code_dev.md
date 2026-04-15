@@ -2,6 +2,34 @@
 
 ---
 
+## [2026-04-15] 34e8225
+- **Category**: refactor
+- **Title**: 4.1 안정 버전 복원 + a2 WSS 최소 추가 (0415 불안정 롤백)
+- **Files**: `ws_realtime_trading.py`, `kis_auth_llm.py`
+- **Changes**:
+  1. **배경**: 0415 버전이 KIS 서버 throttling + a2 send_request 블로킹 + watchdog 반복종료 문제로 불안정. 안정적이었던 4.1 코드를 기반으로 a2 분리를 최소 범위로 재구현
+  2. **[kis_auth_llm.py] 4.1 복원 + 4가지 수정**:
+     - approval_key 파라미터 전달 및 threading.Lock 보호 유지
+     - 인스턴스별 open_map(`_use_global_open_map` 플래그) 유지
+     - H0STCNI0 디버그 로그 제거 → logging.debug 단순화
+     - csv QUOTE_NONE 제거, 복잡한 암호화 분기 제거 → `dm.get("encrypt") == "Y"` 단순화
+     - `fut.result(timeout=5)` → `fut.result()` (5초 타임아웃 제거로 블로킹 방지)
+  3. **[ws_realtime_trading.py] 4.1 복원 + a2 추가 (~120줄)**:
+     - `faulthandler`/`os` import 제거, `_watchdog_loop` 스레드 제거 (watchdog 반복종료 원인 원천 제거)
+     - NXT 관련 코드 전량 제거 (RunMode.NXT_PRE/NXT_AFTER, ccnl_nxt, `_run_balance_0758` 등)
+     - `_antc_prce_timeline`, `_print_antc_prce_timeline`, `_FUNC_NAME_TO_TRID` 역매핑 제거
+     - `_query_and_print_balance`: `fetch_balance_simple` 경유 → 기존 `_get_balance_page` 직접 호출 방식 복원
+     - `_get_balance_holdings`: `effective_qty = psbl if psbl > 0 else qty` (T+2 결제 전 hldg_qty 활용 복원)
+     - VI 예상체결가: a2 우선 → a1 fallback (`_desired_subscription_map` 4.1 구조 복원, a2 전담 분기 제거)
+     - 체결통보(H0STCNI0): a2 활성 시 a2 우선, 미연결 시 a1 fallback
+     - 장운영정보(H0STMKO0): a2 온디맨드 유지(상한5개, 30초 타임아웃) + 매도 상태 로드 시 `_mkstatus_sub_add` 복원
+     - `_shutdown`: a2 종료를 a1 앞으로 순서 조정, `global _active_kws` 선언 복원
+     - `run_ws_forever`: 보유종목 없을 시 WSS 구독 생략 + 18:00까지 대기 로직 추가
+     - `_switch_to_closing_codes`: `_a2_apply_subscriptions` 호출 제거 (4.1 구조 복원)
+     - `_desired_subscription_map`: 15:30~16:00 구독 종료 구간 복원, NXT 시간대 제거
+     - 건드리지 않은 것: `_desired_subscription_map` 핵심 분기, `_apply_subscriptions`, `scheduler_loop`, `_switch_to_closing_codes` 구조 — 4.1 그대로
+- **Impact**: 0415 버전의 세 가지 불안정 요인(KIS throttling → a2 연결 지연 → send_request 블로킹 → ingest heartbeat 정체 → watchdog 강제종료) 원천 해소. watchdog 스레드 제거로 오판 종료 없음. 4.1 기반으로 a2 체결통보/H0STMKO0 온디맨드가 최소 범위로 동작하여 a1 슬롯 절약 및 안정성 유지
+
 ## [2026-04-15] 6dcd871
 - **Category**: fix
 - **Title**: a2 WSS 미연결 시 send_request 블로킹으로 인한 watchdog 강제종료 방지

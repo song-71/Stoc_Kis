@@ -785,13 +785,14 @@ def _cancel_open_sell_orders_for_code(client, cano: str, acnt: str, code: str) -
 
 def _run_open_buy_order_cancel_on_startup() -> None:
     """재시작 시 미체결 매수주문 전부 취소. 조회 → 현황 출력 → 취소 → 결과 출력.
-    단, 16:00~18:00 시간외 단일가 시간대에는 기존 주문이 10분 주기로 자동 유지되므로 취소 스킵."""
+    단, 15:20~18:00 종가/시간외 시간대에는 기존 주문을 유지해야 하므로 취소 스킵
+    (재시작 후 _restore_orders_from_server_on_startup()에서 codes/체결통보 복원)."""
     if not OPEN_BUY_ORDER_CANCEL:
         return
-    # 16:00~18:00 시간외 단일가: 기존 주문이 다음 10분 주기 체결에 자동 유지되므로 취소하지 않음
+    # 15:20~18:00: 종가매수/장후시간외/시간외단일가 시간대 → 기존 주문 유지
     nt = datetime.now(KST).time()
-    if dtime(16, 0) <= nt < dtime(18, 0):
-        _notify(f"{ts_prefix()} [미체결취소] 시간외 단일가 시간대(16:00~18:00) → 기존 주문 유지, 취소 스킵")
+    if dtime(15, 20) <= nt < dtime(18, 0):
+        _notify(f"{ts_prefix()} [미체결취소] {nt.strftime('%H:%M')} 종가/시간외 시간대 → 기존 주문 유지, 취소 스킵")
         return
     sys.stdout.write("\n")
     _notify(f"{ts_prefix()} [미체결취소] 매수주문 확인 중...")
@@ -2403,6 +2404,145 @@ def _run_closing_buy_retry_on_startup() -> None:
     _save_closing_buy_state(state["codes"], state.get("code_info") or {}, list(merged.values()))
 
 
+def _restore_orders_from_server_on_startup() -> None:
+    """15:20~18:00 재시작 시 KIS 서버에서 미체결 매수주문 조회 → codes/체결통보/tracking 복원.
+
+    기존 _closing_buy_retry (15:20~15:30 재주문)와 보완적:
+    - 이 함수는 재주문을 하지 않음. 이미 서버에 접수된 주문을 그대로 두고
+      로컬 트래킹(codes 구독, H0STCNI0 체결통보 구독, _today_closing_target_codes)만 복원.
+    """
+    global _today_closing_target_codes, _today_closing_target_done, _overtime_order_done
+
+    if not CLOSE_BUY:
+        return
+    now_t = datetime.now(KST).time()
+    if not (dtime(15, 20) <= now_t < dtime(18, 0)):
+        return
+
+    try:
+        accounts = _iter_enabled_accounts(trade_only=True)
+    except Exception as e:
+        logger.warning(f"{ts_prefix()} [restart] 계좌 조회 실패: {e}")
+        return
+
+    all_orders: list[dict] = []   # {code, name, ordno, ord_qty, psbl_qty, filled, ord_dvsn, sll_buy, acct_alias}
+    for acct in accounts:
+        cano = str(acct.get("cano", "")).strip()
+        acnt = str(acct.get("acnt_prdt_cd", "01")).strip() or "01"
+        alias = acct.get("alias", acct.get("account_id", ""))
+        if not cano:
+            continue
+        try:
+            client = _init_account_client(acct)
+            raw_orders = _inquire_psbl_rvsecncl(client, cano, acnt, sll_buy_dvsn_cd="02")  # 전체
+        except Exception as e:
+            logger.warning(f"{ts_prefix()} [restart] {alias} 주문조회 실패: {e}")
+            continue
+
+        for o in raw_orders:
+            code = str(o.get("pdno") or o.get("PDNO") or "").strip().zfill(6)
+            if not code or code == "000000":
+                continue
+            ordno = str(o.get("odno") or o.get("ODNO") or "").strip()
+            ord_qty = int(float(str(o.get("ord_qty") or o.get("ORD_QTY") or 0).replace(",", "") or 0))
+            psbl_qty = int(float(str(o.get("psbl_qty") or o.get("PSBL_QTY") or 0).replace(",", "") or 0))
+            ord_dvsn = str(o.get("ord_dvsn_cd") or o.get("ORD_DVSN_CD") or "").strip()
+            sll_buy = str(o.get("sll_buy_dvsn_cd") or o.get("SLL_BUY_DVSN_CD") or "").strip()
+            # 매수만 복원 (매도 미체결은 _load_str1_sell_state_on_startup이 담당)
+            if sll_buy != "02":
+                continue
+            if psbl_qty <= 0:
+                continue
+            all_orders.append({
+                "code": code,
+                "name": code_name_map.get(code, code),
+                "ordno": ordno,
+                "ord_qty": ord_qty,
+                "psbl_qty": psbl_qty,
+                "filled": max(0, ord_qty - psbl_qty),
+                "ord_dvsn": ord_dvsn,
+                "acct_alias": alias,
+                "cano": cano,
+            })
+
+    if not all_orders:
+        logger.info(f"{ts_prefix()} [restart] 미체결 매수주문 없음 → 복원 스킵")
+        return
+
+    # 종목별 요약
+    restore_codes: set[str] = set()
+    for o in all_orders:
+        restore_codes.add(o["code"])
+
+    # 1) codes 추가 (WSS 구독 대상)
+    try:
+        added = _ensure_code_structs(list(restore_codes))
+        if added:
+            logger.info(f"{ts_prefix()} [restart] codes 복원: {len(added)}종목")
+    except Exception as e:
+        logger.warning(f"{ts_prefix()} [restart] codes 복원 실패: {e}")
+
+    # 2) H0STCNI0 체결통보 대상 등록 (WSS 연결 전이므로 set에만 등록, 실제 구독은 run_ws_forever)
+    now_ts = time.time()
+    for code in restore_codes:
+        _ccnl_notice_sub_codes.add(code)
+        _ccnl_notice_order_ts[code] = now_ts
+
+    # 3) 시간대별 복원: 16:00~18:00이면 _today_closing_target_codes로, 그 전이면 _closing_codes로
+    if dtime(16, 0) <= now_t < dtime(18, 0):
+        _today_closing_target_codes = list(restore_codes)
+        _today_closing_target_done = True   # 재선정 스크립트 재실행 방지
+        _overtime_order_done = True         # 16:00 주문 중복 방지
+        logger.info(
+            f"{ts_prefix()} [restart] 16:00~18:00 시간외단일가 미체결 복원: "
+            f"{len(restore_codes)}종목 → _today_closing_target_codes"
+        )
+    else:
+        global _closing_codes, _closing_code_info
+        for code in restore_codes:
+            if code not in _closing_codes:
+                _closing_codes.append(code)
+            if code not in _closing_code_info:
+                _closing_code_info[code] = {"name": code_name_map.get(code, code)}
+        logger.info(
+            f"{ts_prefix()} [restart] 15:20~16:00 종가/장후시간외 미체결 복원: "
+            f"{len(restore_codes)}종목 → _closing_codes"
+        )
+
+    # 4) _closing_buy_state 재구성 (체결 추적 로직과 호환)
+    try:
+        orders_json = []
+        for o in all_orders:
+            orders_json.append({
+                "code": o["code"], "name": o["name"],
+                "order_qty": o["ord_qty"],
+                "limit_up": 0,
+                "ordno": o["ordno"],
+                "status": "ordered",
+                "filled_qty": o["filled"],
+                "remain_qty": o["psbl_qty"],
+                "acct_alias": o["acct_alias"],
+            })
+        code_info = {o["code"]: {"name": o["name"]} for o in all_orders}
+        _save_closing_buy_state(list(restore_codes), code_info, orders_json)
+    except Exception as e:
+        logger.warning(f"{ts_prefix()} [restart] state 저장 실패: {e}")
+
+    # 5) 요약 로그 + 텔레그램
+    by_acct: dict[str, list[str]] = {}
+    for o in all_orders:
+        alias = o["acct_alias"] or "main"
+        by_acct.setdefault(alias, []).append(
+            f"{o['name']}({o['code']}) 미체결={o['psbl_qty']}/{o['ord_qty']} ordno={o['ordno']}"
+        )
+    lines = [f"{ts_prefix()} [restart] 서버 미체결 매수주문 복원: 총 {len(all_orders)}건 ({len(restore_codes)}종목)"]
+    for alias, items in by_acct.items():
+        lines.append(f"  [{alias}] {len(items)}건")
+        for item in items:
+            lines.append(f"    {item}")
+    _notify("\n".join(lines), tele=True)
+
+
 def _get_close_from_kis_api(client, code: str, use_today: bool) -> float:
     """KIS API로 당일종가(use_today=True) 또는 전일종가(use_today=False) 조회."""
     try:
@@ -2608,8 +2748,8 @@ def _run_closing_buy_orders() -> None:
                 pass
             return prep, j, elapsed
 
-        # 10건씩 배치 (KIS API 초당 10건 제한)
-        batches = [_closing_buy_prepared[i:i+10] for i in range(0, len(_closing_buy_prepared), 10)]
+        # 20건씩 배치 (KIS REST 20건/초 한도)
+        batches = [_closing_buy_prepared[i:i+20] for i in range(0, len(_closing_buy_prepared), 20)]
         ledger_records = []  # ledger 후처리용
 
         for batch_idx, batch in enumerate(batches):
@@ -2964,29 +3104,80 @@ def _run_afternoon_extra_closing_buy() -> None:
             _afternoon_extra_closing_done = True
             return
         _afternoon_extra_closing_done = True
+        from concurrent.futures import ThreadPoolExecutor, as_completed
         client = _top_client or _init_top_client()
         tr_id = "TTTC0802U"
         code_info = state.get("code_info") or {}
+
+        # 1) 당일종가 병렬 조회 (REST, 20건/초 한도)
+        def _fetch_close(code):
+            try:
+                return code, _get_close_from_kis_api(client, code, use_today=True)
+            except Exception as e:
+                logger.warning(f"{ts_prefix()} [15:40당일종가조회실패] {code}: {e}")
+                return code, 0
+
+        codes_to_fetch = [o["code"] for o in to_order]
+        close_map: dict[str, float] = {}
+        with ThreadPoolExecutor(max_workers=min(20, len(codes_to_fetch) or 1)) as executor:
+            for fut in as_completed([executor.submit(_fetch_close, c) for c in codes_to_fetch]):
+                code, close_price = fut.result()
+                close_map[code] = close_price
+
+        # 2) 계좌별 주문 병렬 발송 (20건 배치, KIS REST 20건/초 한도)
         for acct in _iter_enabled_accounts(trade_only=True):
             cano = str(acct.get("cano", "")).strip()
             acnt = str(acct.get("acnt_prdt_cd", "01")).strip() or "01"
             if not cano:
                 continue
+            alias = acct.get("alias", acct.get("account_id", ""))
+
+            order_items = []
             for o in to_order:
                 code = o["code"]
                 remain = int(o.get("remain_qty", 0))
                 if remain <= 0:
                     continue
-                info = code_info.get(code, {})
-                today_close = _get_close_from_kis_api(client, code, use_today=True)
+                today_close = close_map.get(code, 0)
                 if today_close <= 0:
                     continue
+                info = code_info.get(code, {})
                 name = o.get("name", info.get("name", code))
+                order_items.append({
+                    "code": code, "name": name, "remain": remain, "today_close": today_close,
+                })
+
+            def _send_one(item):
+                t0 = time.time()
                 try:
-                    _buy_order_cash(client, cano, acnt, tr_id, code, remain, today_close, ord_dvsn="06")
-                    _notify(f"{ts_prefix()} [15:40시간외종가_매수 주문] {name}({code}) 수량={remain} 당일종가={today_close:,.0f} (ORD_DVSN=06 장후시간외종가) 계좌={cano[-4:]}")
+                    _buy_order_cash(client, cano, acnt, tr_id,
+                                    item["code"], item["remain"], item["today_close"], ord_dvsn="06")
+                    return item, None, time.time() - t0
                 except Exception as e:
-                    logger.warning(f"{ts_prefix()} [15:40시간외종가실패] {code}: {e}")
+                    return item, e, time.time() - t0
+
+            batches = [order_items[i:i+20] for i in range(0, len(order_items), 20)]
+            ok_list, fail_list = [], []
+            for batch_idx, batch in enumerate(batches):
+                if batch_idx > 0:
+                    time.sleep(1.0)  # KIS REST 20건/초 한도 준수
+                with ThreadPoolExecutor(max_workers=len(batch)) as executor:
+                    for fut in as_completed([executor.submit(_send_one, it) for it in batch]):
+                        item, err, elapsed = fut.result()
+                        if err is None:
+                            ok_list.append((item, elapsed))
+                            _notify(
+                                f"{ts_prefix()} [15:40시간외종가_매수 주문] {item['name']}({item['code']}) "
+                                f"수량={item['remain']} 당일종가={item['today_close']:,.0f} "
+                                f"(ORD_DVSN=06 장후시간외종가) 계좌={cano[-4:]} {elapsed:.3f}s"
+                            )
+                        else:
+                            fail_list.append((item, err))
+                            logger.warning(f"{ts_prefix()} [15:40시간외종가실패] {item['code']}: {err}")
+            _notify(
+                f"{ts_prefix()} [15:40시간외종가주문완료] {alias} {len(ok_list)}건 성공 / {len(fail_list)}건 실패",
+                tele=True,
+            )
     except Exception as e:
         logger.warning(f"{ts_prefix()} [15:40시간외종가] 실패: {e}")
 
@@ -3062,15 +3253,13 @@ def _run_overtime_buy_orders() -> None:
                     f"{n}종목 → 종목당≈{int(cash_per):,}원 / 주문가능={len(order_items)}건"
                 )
 
-                # 2) 10건 단위 배치 발송
-                ok_list, fail_list = [], []
-                for idx, item in enumerate(order_items):
-                    if idx > 0 and idx % 10 == 0:
-                        time.sleep(1.0)  # KIS REST API 10건/초 제한 준수
+                # 2) 20건 배치 병렬 발송 (KIS REST 20건/초 한도)
+                from concurrent.futures import ThreadPoolExecutor, as_completed
+                def _send_one(item):
+                    t0 = time.time()
                     try:
                         _buy_order_cash(acct_client, cano, acnt, tr_id,
                                         item["code"], item["qty"], item["limit_up"], ord_dvsn="07")
-                        ok_list.append(item)
                         # 거래장부 기록
                         try:
                             _append_ledger(
@@ -3087,9 +3276,23 @@ def _run_overtime_buy_orders() -> None:
                             )
                         except Exception:
                             pass
+                        return item, None, time.time() - t0
                     except Exception as e:
-                        fail_list.append((item, str(e)))
-                        logger.warning(f"{ts_prefix()} [시간외단일가실패] {item['code']}: {e}")
+                        return item, e, time.time() - t0
+
+                batches = [order_items[i:i+20] for i in range(0, len(order_items), 20)]
+                ok_list, fail_list = [], []
+                for batch_idx, batch in enumerate(batches):
+                    if batch_idx > 0:
+                        time.sleep(1.0)
+                    with ThreadPoolExecutor(max_workers=len(batch)) as executor:
+                        for fut in as_completed([executor.submit(_send_one, it) for it in batch]):
+                            item, err, elapsed = fut.result()
+                            if err is None:
+                                ok_list.append(item)
+                            else:
+                                fail_list.append((item, str(err)))
+                                logger.warning(f"{ts_prefix()} [시간외단일가실패] {item['code']}: {err}")
 
                 # 3) 통합 결과 출력
                 lines = [f"{ts_prefix()} [시간외단일가주문] {alias} {len(ok_list)}건 발송완료 ({len(order_items)}건 중)"]
@@ -8576,6 +8779,9 @@ if __name__ == "__main__":
 
     # 15:20~15:30 재시작 시 미처리 종가매수 주문 재시도 (state 저장 기반)
     _run_closing_buy_retry_on_startup()
+
+    # 15:20~18:00 재시작 시 KIS 서버에서 미체결 매수주문 조회 → codes/체결통보/tracking 복원
+    _restore_orders_from_server_on_startup()
 
     # Str1 매도 상태 복원 — 시작잔고 결과 전달 (중복 API 호출 없이 재사용)
     _load_str1_sell_state_on_startup(_startup_balance_map)

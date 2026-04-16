@@ -4478,7 +4478,13 @@ def scheduler_loop():
                     ):
                         _overtime_real_last_progress_ts = time.time()
                         sys.stdout.write("\n")
-                        _notify(f"{ts_prefix()} [시간외] 체결가 수신 중 {seen_n}/{total_n}종목...")
+                        with _lock:
+                            per_sec_total = sum(_per_sec_counts.values())
+                            since_active = sum(1 for c in codes if _since_save_counts.get(c, 0) > 0)
+                        _notify(
+                            f"{ts_prefix()} 초당 수신건수 {per_sec_total:03d}건/초, "
+                            f"{_part_buffer_rows}건, 수신 {since_active}종목/대상 {total_n}종목"
+                        )
                         sys.stdout.flush()
                     if seen_n >= total_n:
                         # 전 종목 수신 완료 → 예상체결가 복귀 + 내 주문 체결 결과 출력

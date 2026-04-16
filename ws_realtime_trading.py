@@ -8445,19 +8445,28 @@ def run_ws_forever():
         if mode == RunMode.EXIT:
             break
 
-        # ── 보유종목 없으면 WSS 구독 불필요 → 18:00까지 대기 ──
+        # ── 보유종목 없고 base codes도 없으면 대기 ──
         with _str1_sell_state_lock:
             _has_held = any(not st.get("sold") for st in _str1_sell_state.values())
-        if not _has_held:
+        if not _has_held and not _base_codes:
             now_t = datetime.now(KST).time()
             if now_t < END_TIME:
-                logger.info(f"{ts_prefix()} [ws] 보유종목 없음 → WSS 구독 생략, {END_TIME.strftime('%H:%M')}까지 대기")
+                logger.info(f"{ts_prefix()} [ws] 보유종목·base codes 모두 없음 → {END_TIME.strftime('%H:%M')}까지 대기")
                 while not _stop_event.is_set():
                     if datetime.now(KST).time() >= END_TIME:
                         break
-                    time.sleep(1800.0)  # 30분
-                logger.info(f"{ts_prefix()} [ws] {END_TIME.strftime('%H:%M')} 도달 → 마무리 진행")
-            break
+                    if _base_codes:
+                        logger.info(f"{ts_prefix()} [ws] base codes 추가됨 → WSS 연결 진행")
+                        break
+                    time.sleep(30.0)
+                else:
+                    break
+                if datetime.now(KST).time() >= END_TIME:
+                    logger.info(f"{ts_prefix()} [ws] {END_TIME.strftime('%H:%M')} 도달 → 마무리 진행")
+                    break
+                # base codes 추가됨 → WSS 연결 루프 계속
+            else:
+                break
 
         attempt += 1
         kws = None

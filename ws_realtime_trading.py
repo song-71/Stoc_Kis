@@ -61,7 +61,7 @@ CODE_TEXT = """
 """
 
 # Top5 추가 구독 (False면 CODE_TEXT만 18:00까지 수신, Top50 다운/저장만 수행)
-TOP5_ADD = True   # False: Top50 다운·저장 O, Top5 추가/해제/종가매매전환/미수신구독해제 X
+TOP5_ADD = False   # False: Top50 다운·저장 O, Top5 추가/해제/종가매매전환/미수신구독해제 X
 
 # 한도 초과 시 폴백 계정 사용 여부 (True: 한도 초과 시 계정2(syw_2)로 재시도)
 USE_FALLBACK_ACCOUNT = False
@@ -1269,7 +1269,19 @@ def _get_balance_holdings() -> dict[str, dict]:
                     qty = int(float(str(row.get("hldg_qty", 0) or 0).replace(",", "") or 0))
                     psbl = int(float(str(row.get("ord_psbl_qty", 0) or 0).replace(",", "") or 0))
                     pchs = float(str(row.get("pchs_avg_pric", 0) or 0).replace(",", "") or 0)
-                    effective_qty = psbl if psbl > 0 else qty
+                    # ord_psbl_qty(매도가능수량) 우선 사용. hldg_qty 폴백 금지
+                    # (hldg_qty는 미결제 매수주문 포함 총량이라 수량초과 매도 유발)
+                    if psbl > 0:
+                        effective_qty = psbl
+                    elif qty > 0 and psbl == 0:
+                        # API 불안정 시 ord_psbl_qty=0 반환 가능 → hldg_qty 사용하되 경고
+                        effective_qty = qty
+                        logger.warning(
+                            f"{ts_prefix()} [잔고] {c} ord_psbl_qty=0, hldg_qty={qty}"
+                            f" → hldg_qty 사용 (매도 시 수량 재검증 필요)"
+                        )
+                    else:
+                        effective_qty = qty
                     if c not in hold_map:
                         hold_map[c] = {"qty": effective_qty, "buy_price": pchs}
                         _code_account_map[c] = acct  # 해당 종목을 보유한 계좌 기록
@@ -1652,6 +1664,23 @@ def _str1_sell_worker() -> None:
             if not cano:
                 logger.warning(f"[str1_sell] config cano 없음 → {code} 매도 스킵")
                 continue
+
+            # ── 매도 직전 수량 재검증 (hldg_qty vs ord_psbl_qty 불일치 방지) ──
+            try:
+                _bal = _get_balance_holdings()
+                _bal_info = _bal.get(code, {})
+                _sellable = _bal_info.get("qty", 0) if isinstance(_bal_info, dict) else _bal_info
+                if 0 < _sellable < qty:
+                    logger.warning(
+                        f"{ts_prefix()} [str1_sell] {name}({code}) 매도수량 보정: "
+                        f"state={qty} → 실매도가능={_sellable}"
+                    )
+                    qty = _sellable
+                    with _str1_sell_state_lock:
+                        if code in _str1_sell_state:
+                            _str1_sell_state[code]["qty"] = qty
+            except Exception as _be:
+                logger.warning(f"{ts_prefix()} [str1_sell] {code} 잔고재조회 실패(매도 계속): {_be}")
 
             is_stop_limit = (ord_dvsn == "22")
             is_opening_call_auction = reason.startswith("str1_시초가하락_예상")
@@ -2938,37 +2967,71 @@ def _run_morning_extra_closing_buy() -> None:
         code_info = state.get("code_info") or {}
 
         _notify(f"{ts_prefix()} [08:30시간외종가] 추가 매수 시작 {len(to_order)}건")
-        for o in to_order:
-            code    = str(o["code"]).zfill(6)
-            remain  = int(o.get("remain_qty", 0))
-            held    = int(o.get("actual_held", -1))
-            info    = code_info.get(code, {})
-            name    = o.get("name", info.get("name", code))
-            if remain <= 0:
-                continue
-            # KIS API에서 전일종가 실시간 조회 (저장값 대신 최신 값 사용)
-            prev_close = 0.0
+
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        # 전일종가 사전 조회 (병렬)
+        def _resolve_prev_close(code: str) -> float:
+            pc = 0.0
             for _attempt in range(3):
-                prev_close = _get_close_from_kis_api(client, code, use_today=False)
-                if prev_close > 0:
-                    break
-                time.sleep(1)
-            if prev_close <= 0:
-                prev_close = _get_prev_close_from_1d([code]).get(code, 0)
-            if prev_close <= 0:
-                logger.warning(f"{ts_prefix()} [08:30시간외종가] {code} 전일종가 조회 실패(API+1d폴백) → 스킵")
-                continue
-            held_txt = f" (잔고보유={held})" if held >= 0 else ""
+                pc = _get_close_from_kis_api(client, code, use_today=False)
+                if pc > 0:
+                    return pc
+                time.sleep(0.3)
+            return _get_prev_close_from_1d([code]).get(code, 0) or 0.0
+
+        pc_map: dict[str, float] = {}
+        with ThreadPoolExecutor(max_workers=min(20, max(1, len(to_order)))) as ex:
+            fmap = {ex.submit(_resolve_prev_close, str(o["code"]).zfill(6)): str(o["code"]).zfill(6) for o in to_order}
+            for fut in as_completed(fmap):
+                c = fmap[fut]
+                try:
+                    pc_map[c] = fut.result() or 0.0
+                except Exception:
+                    pc_map[c] = 0.0
+
+        def _send_one_830(o: dict):
+            code = str(o["code"]).zfill(6)
+            remain = int(o.get("remain_qty", 0))
+            held = int(o.get("actual_held", -1))
+            info = code_info.get(code, {})
+            name = o.get("name", info.get("name", code))
+            prev_close = pc_map.get(code, 0.0)
+            if remain <= 0 or prev_close <= 0:
+                return code, name, remain, held, prev_close, False, "전일종가없음" if prev_close <= 0 else "수량0"
             try:
                 _buy_order_cash(client, cano, acnt, "TTTC0802U", code, remain, prev_close, ord_dvsn="05")
-                _notify(
-                    f"{ts_prefix()} [08:30시간외종가_매수] {name}({code})"
-                    f"  수량={remain}{held_txt}  전일종가={prev_close:,.0f}  ORD_DVSN=05(장전시간외종가)",
-                    tele=True,
-                )
+                try:
+                    _ccnl_notice_sub_add(code)
+                except Exception:
+                    pass
+                return code, name, remain, held, prev_close, True, ""
             except Exception as e:
-                logger.warning(f"{ts_prefix()} [08:30시간외종가실패] {code}: {e}")
-                _notify(f"{ts_prefix()} [08:30시간외종가실패] {name}({code}) {e}", tele=True)
+                return code, name, remain, held, prev_close, False, str(e)
+
+        # 20건/초 배치 병렬 발송
+        batches = [to_order[i:i+20] for i in range(0, len(to_order), 20)]
+        for bi, batch in enumerate(batches):
+            if bi > 0:
+                time.sleep(1.0)
+            with ThreadPoolExecutor(max_workers=len(batch)) as ex:
+                futs = [ex.submit(_send_one_830, o) for o in batch]
+                for fut in as_completed(futs):
+                    try:
+                        code, name, remain, held, prev_close, ok, err = fut.result()
+                    except Exception as e:
+                        logger.warning(f"{ts_prefix()} [08:30시간외종가] future 실패: {e}")
+                        continue
+                    if ok:
+                        held_txt = f" (잔고보유={held})" if held >= 0 else ""
+                        _notify(
+                            f"{ts_prefix()} [08:30시간외종가_매수] {name}({code})"
+                            f"  수량={remain}{held_txt}  전일종가={prev_close:,.0f}  ORD_DVSN=05(장전시간외종가)",
+                            tele=True,
+                        )
+                    else:
+                        logger.warning(f"{ts_prefix()} [08:30시간외종가실패] {code}: {err}")
+                        _notify(f"{ts_prefix()} [08:30시간외종가실패] {name}({code}) {err}", tele=True)
     except Exception as e:
         logger.warning(f"{ts_prefix()} [08:30시간외종가] 실패: {e}")
 
@@ -3713,8 +3776,14 @@ def _trigger_ws_rebuild():
     t.start()
     t.join(timeout=5.0)
     if t.is_alive():
-        logger.warning(f"{ts_prefix()} [ws] _trigger_ws_rebuild timeout(5s) — 구독 갱신 지연, 다음 주기 재시도")
-        # 소켓은 닫지 않음 — 데이터 수신은 정상이므로 구독 갱신만 지연될 뿐
+        # timeout → _do 스레드가 _kws_lock 들고 dead socket에 send() 중 블로킹 가능
+        # dead socket 강제 종료 → send() 에러로 _kws_lock 해제 → scheduler_loop 교착 방지
+        logger.warning(f"{ts_prefix()} [ws] _trigger_ws_rebuild timeout(5s) — dead socket 의심, 강제 종료")
+        try:
+            if _active_kws is not None:
+                _request_ws_close(_active_kws)
+        except Exception:
+            pass
 
     # ── [주석] 재연결 방식 (동적 구독 문제 시 아래 주석 해제, 위 블록 주석 처리) ──
     # _ws_rebuild_event.set()
@@ -4482,8 +4551,8 @@ def scheduler_loop():
                             per_sec_total = sum(_per_sec_counts.values())
                             since_active = sum(1 for c in codes if _since_save_counts.get(c, 0) > 0)
                         _notify(
-                            f"{ts_prefix()} 초당 수신건수 {per_sec_total:03d}건/초, "
-                            f"{_part_buffer_rows}건, 수신 {since_active}종목/대상 {total_n}종목"
+                            f"{ts_prefix()} (초당 수신건수 {per_sec_total:03d}건/초), "
+                            f"(버퍼 {_part_buffer_rows}건/수신 종목 {since_active}개/구독 종목 {total_n}개)"
                         )
                         sys.stdout.flush()
                     if seen_n >= total_n:
@@ -8619,45 +8688,71 @@ def run_ws_forever():
                 logger.warning(warn_msg)
                 _notify(warn_msg, tele=True)
 
-            desired_map = _desired_subscription_map(datetime.now(KST))
-            total_sub = sum(len(v) for v in desired_map.values())
-            if total_sub > MAX_WSS_SUBSCRIBE:
-                logger.warning(
-                    f"{ts_prefix()} [ws] 구독 상한 초과 예상: {total_sub} > {MAX_WSS_SUBSCRIBE}"
-                )
-            for req, code_set in desired_map.items():
-                ka.KISWebSocket.subscribe(req, list(code_set))
-                _subscribed[req.__name__] = set(code_set)
             # H0STMKO0 장운영정보: 보유종목 VI 감지 + 장운영 keep-alive (정규장 시간대)
+            mko_codes: set[str] = set()
             if dtime(8, 50) <= now_t < dtime(15, 30):
                 held_codes = set()
                 with _str1_sell_state_lock:
                     held_codes = {c for c, st in _str1_sell_state.items() if not st.get("sold")}
-                # keep-alive 대표 종목 (CB/사이드카 감지용, 마켓당 1개)
                 keepalive_codes: set[str] = set()
                 for mkt, rep_code in _MKT_KEEPALIVE_INITIAL.items():
                     if not _mkt_keepalive_current.get(mkt):
                         _mkt_keepalive_current[mkt] = rep_code
                     keepalive_codes.add(_mkt_keepalive_current[mkt])
                 mko_codes = held_codes | keepalive_codes
-                if mko_codes:
-                    ka.KISWebSocket.subscribe(market_status_krx, list(mko_codes))  # noqa: F405
-                    _mkstatus_sub_codes.update(mko_codes)
-                    _subscribed["market_status_krx"] = set(mko_codes)
-                    total_sub += len(mko_codes)
-                    logger.info(
-                        f"{ts_prefix()} [장운영] H0STMKO0 구독: 보유 {len(held_codes)}개 + keep-alive {len(keepalive_codes)}개 "
-                        f"({','.join(f'{mkt}={code_name_map.get(c, c)}' for mkt, c in _mkt_keepalive_current.items())})"
-                    )
-            # H0STCNI0 종목별 체결통보: open_map 등록 제거 (연결 불안정 원인)
-            # 체결통보는 주문 성공 시 _ccnl_notice_sub_add()로 동적 구독
-            sub_desc = ", ".join(f"{r.__name__}={len(c)}종목" for r, c in desired_map.items())
-            if _mkstatus_sub_codes:
-                sub_desc += f", H0STMKO0={len(_mkstatus_sub_codes)}종목"
-            if _ccnl_notice_sub_codes:
-                sub_desc += f", H0STCNI0(종목별)={len(_ccnl_notice_sub_codes)}종목"
+
+            # ── 슬롯 상한 준수: H0STCNI0(1) + H0STMKO0(N) + 종목데이터(M) <= 40 ──
+            ccnl_notice_slots = 1  # H0STCNI0 이미 구독됨
+            mko_slots = len(mko_codes)
+            desired_map = _desired_subscription_map(datetime.now(KST))
+            data_slots = sum(len(v) for v in desired_map.values())
+            total_sub = ccnl_notice_slots + mko_slots + data_slots
+
+            if total_sub > MAX_WSS_SUBSCRIBE:
+                # 종목 데이터 슬롯을 줄여서 상한 준수
+                max_data = MAX_WSS_SUBSCRIBE - ccnl_notice_slots - mko_slots
+                logger.warning(
+                    f"{ts_prefix()} [ws] 구독 상한 초과: {total_sub} > {MAX_WSS_SUBSCRIBE}"
+                    f" → 종목데이터 {data_slots} → {max_data}로 축소"
+                )
+                # 종목 데이터 축소: 각 req 타입별 비례 축소
+                over = data_slots - max_data
+                for req in list(desired_map.keys()):
+                    if over <= 0:
+                        break
+                    cs = desired_map[req]
+                    if len(cs) > over:
+                        # 우선순위 낮은 종목 제거 (base_codes 우선 유지)
+                        removable = cs - _base_codes
+                        remove_n = min(len(removable), over)
+                        for c in list(removable)[:remove_n]:
+                            cs.discard(c)
+                            over -= 1
+                    elif len(cs) <= over:
+                        over -= len(cs)
+                        desired_map[req] = set()
+                data_slots = sum(len(v) for v in desired_map.values())
+                total_sub = ccnl_notice_slots + mko_slots + data_slots
+
+            for req, code_set in desired_map.items():
+                if code_set:
+                    ka.KISWebSocket.subscribe(req, list(code_set))
+                _subscribed[req.__name__] = set(code_set)
+
+            if mko_codes:
+                ka.KISWebSocket.subscribe(market_status_krx, list(mko_codes))  # noqa: F405
+                _mkstatus_sub_codes.update(mko_codes)
+                _subscribed["market_status_krx"] = set(mko_codes)
+                logger.info(
+                    f"{ts_prefix()} [장운영] H0STMKO0 구독: 보유 {len(held_codes)}개 + keep-alive {len(keepalive_codes)}개 "
+                    f"({','.join(f'{mkt}={code_name_map.get(c, c)}' for mkt, c in _mkt_keepalive_current.items())})"
+                )
+            sub_desc = ", ".join(f"{r.__name__}={len(c)}종목" for r, c in desired_map.items() if c)
+            if mko_codes:
+                sub_desc += f", H0STMKO0={len(mko_codes)}종목"
+            sub_desc += ", H0STCNI0=1"
             logger.info(
-                f"{ts_prefix()} [ws] open_map prepared: {sub_desc} total={total_sub}"
+                f"{ts_prefix()} [ws] open_map prepared: {sub_desc} total={total_sub}/{MAX_WSS_SUBSCRIBE}"
             )
 
             # 재연결 도중 쌓인 이벤트 클리어
@@ -8671,7 +8766,7 @@ def run_ws_forever():
 
             def _on_system(rsp):
                 if rsp.isOk and rsp.tr_msg and "SUCCESS" in rsp.tr_msg:
-                    if getattr(rsp, "tr_id", "") == "H0STCNI0" and attempt > 1:
+                    if getattr(rsp, "tr_id", "") == "H0STCNI0" and attempt == 2:
                         _notify(f"{ts_prefix()} [체결통보] 재접속 완료", tele=True)
                     return
                 if rsp.tr_msg:

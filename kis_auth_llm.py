@@ -771,7 +771,7 @@ class KISWebSocket:
 
                     if rsp.isPingPong:
                         logging.getLogger("wss_pingpong").debug(f"[PINGPONG] recv/send")
-                        await ws.pong(raw)
+                        await ws.send(raw)
 
                     if not rsp.isPingPong and self.on_system is not None:
                         try:
@@ -808,7 +808,7 @@ class KISWebSocket:
 
         while self.retry_count < self.max_retries:
             try:
-                async with websockets.connect(url) as ws:
+                async with websockets.connect(url, ping_interval=None) as ws:
                     self._ws = ws
                     # request subscribe
                     for name, obj in init_map.items():

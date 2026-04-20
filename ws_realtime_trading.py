@@ -61,7 +61,7 @@ CODE_TEXT = """
 """
 
 # Top5 추가 구독 (False면 CODE_TEXT만 18:00까지 수신, Top50 다운/저장만 수행)
-TOP5_ADD = False   # False: Top50 다운·저장 O, Top5 추가/해제/종가매매전환/미수신구독해제 X
+TOP5_ADD = True   # False: Top50 다운·저장 O, Top5 추가/해제/종가매매전환/미수신구독해제 X
 
 # 한도 초과 시 폴백 계정 사용 여부 (True: 한도 초과 시 계정2(syw_2)로 재시도)
 USE_FALLBACK_ACCOUNT = False
@@ -82,7 +82,9 @@ AUTO_CODE_FROM_PREV_CLOSING = True
 # 재시작 시 미체결 매수주문 전부 취소 (True: 정정취소가능주문조회 후 취소, 주문번호 기록 없어도 가능)
 OPEN_BUY_ORDER_CANCEL = True
 # 08:30~08:40 시간외 종가 추가 매수 (True: 전일 미매수 종목에 전일종가 지정가 ORD_DVSN=02 매수)
-MORNING_EXTRA_CLOSING_PR_BUY = True
+MORNING_EXTRA_CLOSING_PR_BUY = False
+# 16:00~18:00 시간외 단일가 매수 (False: 16:01에 조기 종료)
+OVERTIME_SINGLE_PRICE_BUY = False
 
 """
 실행/모니터링/종료 명령어
@@ -92,12 +94,12 @@ MORNING_EXTRA_CLOSING_PR_BUY = True
     => restart_wss_trading.sh을 재시작해줌.
 
 nohup 실행:
-  nohup /home/ubuntu/Stoc_Kis/venv/bin/python /home/ubuntu/Stoc_Kis/ws_realtime_trading.py > /home/ubuntu/Stoc_Kis/out/wss_realtime_trading.out 2>&1 &
+  nohup /home/ubuntu/Stoc_Kis/venv/bin/python /home/ubuntu/Stoc_Kis/ws_realtime_trading.py >> /home/ubuntu/Stoc_Kis/out/wss_realtime_trading.out 2>&1 &
 
 로그 모니터링:
   <노협 백그라운드 실행 모니터링>
   tail -f /home/ubuntu/Stoc_Kis/out/wss_realtime_trading.out
-  tail -n 200 -f /home/ubuntu/Stoc_Kis/out/wss_realtime_trading.out
+  tail -n 2000 -f /home/ubuntu/Stoc_Kis/out/wss_realtime_trading.out
 
   파일이 크면 VS Code에서 직접 여는 게 스크롤하기 편함.(단, 현재 시점 내용만 가져올 수 있음.)
   code /home/ubuntu/Stoc_Kis/out/wss_realtime_trading.out
@@ -218,11 +220,17 @@ def _notify(msg: str, tele: bool = False) -> None:
     logger.info(msg)
     sys.stdout.write("\r\033[2K" + msg + "\n")
     sys.stdout.flush()
-    if tele and tmsg is not None:
+    if tele:
         try:
-            tmsg(msg, "-t")
+            with open(TELE_LOG_PATH, "a", encoding="utf-8") as _tf:
+                _tf.write(f"{datetime.now(KST).strftime('%Y-%m-%d %H:%M:%S')} | {msg}\n")
         except Exception:
             pass
+        if tmsg is not None:
+            try:
+                tmsg(msg, "-t")
+            except Exception:
+                pass
 
 
 # =============================================================================
@@ -239,6 +247,7 @@ LOG_DIR = SCRIPT_DIR / "out" / "logs"
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 
 today_yymmdd = datetime.now(KST).strftime("%y%m%d")
+TELE_LOG_PATH = LOG_DIR / f"{today_yymmdd}_telegram.log"
 FINAL_PARQUET_PATH = OUT_DIR / f"{today_yymmdd}_wss_data.parquet"
 PART_DIR = OUT_DIR / "parts"
 PART_DIR.mkdir(parents=True, exist_ok=True)
@@ -2692,6 +2701,7 @@ def _prepare_closing_buy_orders() -> None:
                 limit_up = cp["limit_up"]
                 qty = int(cash_per // limit_up)
                 if qty <= 0:
+                    logger.info(f"{ts_prefix()} [종가매수준비] {cp['name']}({code}) 제외: 상한가({limit_up:,.0f}) > 배정액({cash_per:,.0f})")
                     continue
                 _closing_buy_prepared.append({
                     "code": code, "name": cp["name"], "qty": qty,
@@ -3798,8 +3808,23 @@ def _trigger_ws_rebuild():
     #         _request_ws_close(_active_kws)
 
 
-END_TIME = dtime(18, 0)
+END_TIME = dtime(18, 0) if OVERTIME_SINGLE_PRICE_BUY else dtime(16, 1)
 _end_time_reached = False   # 18:00 종료 시도 시 True (WS 지연 종료 시 병합 판단용)
+
+def _backup_log_file():
+    """종료 시 로그 파일을 날짜별 백업 (wss_realtime_trading_YYMMDD.out)"""
+    import shutil
+    _base = os.path.dirname(os.path.abspath(__file__))
+    src = os.path.join(_base, "out", "wss_realtime_trading.out")
+    if not os.path.exists(src):
+        return
+    today_str = datetime.now(KST).strftime("%y%m%d")
+    dst = os.path.join(_base, "out", f"wss_realtime_trading_{today_str}.out")
+    try:
+        shutil.copy2(src, dst)
+        logger.info(f"{ts_prefix()} [로그백업] {dst}")
+    except Exception as e:
+        logger.warning(f"{ts_prefix()} [로그백업 실패] {e}")
 _regular_real_seen: set[str] = set()
 _close_force_stopped = False          # 15:30 유예시간 후 강제 구독 중단 1회 로그용
 _last_overtime_buy_min: int = -1  # 마지막 실행 분(minute) - 10분당 1회
@@ -4340,26 +4365,36 @@ def scheduler_loop():
                     _prepare_closing_buy_orders()
                 except Exception as e:
                     logger.warning(f"{ts_prefix()} [종가매수준비] {e}")
-            # 15:19:55 사전 구독 해제: 종가매매 전환 전 기존 정규장 구독을 해제하여 슬롯 확보
-            if dtime(15, 19, 55) <= now.time() <= dtime(15, 19, 58):
+            # 15:19:10 사전 구독 해제: 기존 ccnl_krx 전종목 해제 (H0STCNI0/H0STMKO0 유지)
+            if dtime(15, 19, 10) <= now.time() <= dtime(15, 19, 15):
                 global _pre_unsub_closing_done
                 if not _pre_unsub_closing_done and _closing_codes:
                     _pre_unsub_closing_done = True
                     try:
-                        closing_set = set(_closing_codes)
                         with _kws_lock:
                             if _active_kws is not None:
-                                # 종가매매 대상 제외한 기존 종목 해제
                                 have_real = _subscribed.get("ccnl_krx", set())
-                                to_unsub = list(have_real - closing_set)
+                                to_unsub = list(have_real)
                                 if to_unsub:
                                     for i in range(0, len(to_unsub), 10):
                                         batch = to_unsub[i:i+10]
                                         _send_subscribe(_active_kws, ccnl_krx, batch, "2")  # noqa: F405
-                                    _subscribed["ccnl_krx"] = have_real & closing_set
-                                    _notify(f"{ts_prefix()} [사전구독해제] 15:19:55 정규장 {len(to_unsub)}종목 해제 완료 (종가대상 {len(closing_set)}종목 유지)")
+                                    _subscribed["ccnl_krx"] = set()
+                                    _notify(f"{ts_prefix()} [사전구독해제] 15:19:10 정규장 {len(to_unsub)}종목 전체 해제 완료")
                     except Exception as e:
                         logger.warning(f"{ts_prefix()} [사전구독해제] {e}")
+            # 15:21:00 예상체결가 구독 시작 (WSS 유지 상태에서 subscribe만)
+            if dtime(15, 21, 0) <= now.time() <= dtime(15, 21, 5):
+                if not getattr(_switch_to_closing_codes, '_exp_sub_done', False) and _closing_codes:
+                    try:
+                        with _kws_lock:
+                            if _active_kws is not None:
+                                _send_subscribe(_active_kws, exp_ccnl_krx, list(_closing_codes), "1")  # noqa: F405
+                                _subscribed["exp_ccnl_krx"] = set(_closing_codes)
+                                _switch_to_closing_codes._exp_sub_done = True
+                                _notify(f"{ts_prefix()} [예상체결가구독] 15:21 {len(_closing_codes)}종목 구독 완료", tele=True)
+                    except Exception as e:
+                        logger.warning(f"{ts_prefix()} [예상체결가구독] {e}")
             # 15:29:30 일시 확인: 예상체결가 첫 틱 대비 하락 시 종가매수 취소
             if dtime(15, 29, 28) <= now.time() <= dtime(15, 29, 35):
                 try:
@@ -4398,7 +4433,7 @@ def scheduler_loop():
                     except Exception as e:
                         logger.warning(f"{ts_prefix()} [잔고검증15:58] {e}")
             # 16:11, 16:21, ..., 18:01 — 시간외 단일가 10분 단위 체결 확인
-            if dtime(16, 11) <= now.time() < END_TIME:
+            if OVERTIME_SINGLE_PRICE_BUY and dtime(16, 11) <= now.time() < END_TIME:
                 global _overtime_balance_checked
                 minute = now.minute
                 if minute % 10 == 1 and now.second <= 5:
@@ -4411,7 +4446,7 @@ def scheduler_loop():
                             logger.warning(f"{ts_prefix()} [잔고검증{slot_key}] {e}")
             # 15:58 당일 상한가 재선정 (1m 데이터 기반 → 16:00~18:00 시간외 단일가 대상)
             # 15:20 top30 기반 선정보다 장 마감 후 데이터가 더 정확 → 시간외는 이걸 사용
-            if dtime(15, 58) <= now.time() < dtime(16, 0) and not _today_closing_target_done:
+            if OVERTIME_SINGLE_PRICE_BUY and dtime(15, 58) <= now.time() < dtime(16, 0) and not _today_closing_target_done:
                 try:
                     _run_today_target_reselect()
                 except Exception as e:
@@ -4432,7 +4467,7 @@ def scheduler_loop():
                     except Exception as e:
                         logger.warning(f"{ts_prefix()} [15:40시간외종가 로그] {e}")
             # 16:00~18:00 시간외 단일가 매수: 10분 단위(16:00, 16:10, ... 17:50) 체결통보 반영 후 주문→직전 결과 출력
-            if dtime(16, 0) <= now.time() < END_TIME:
+            if OVERTIME_SINGLE_PRICE_BUY and dtime(16, 0) <= now.time() < END_TIME:
                 global _last_overtime_buy_min
                 minute = now.minute
                 second = now.second
@@ -4468,13 +4503,14 @@ def scheduler_loop():
                     if new_mode == RunMode.OVERTIME_REAL:
                         _overtime_real_seen.clear()
                     if new_mode == RunMode.EXIT:
-                        # ① 마지막 17:50 단일가 결과 집계 출력
-                        _log_closing_order_aggregation("17:50단일가")
-                        # ② 시간외 단일가 마감 총 거래 내역 통보 (텔레그램)
-                        try:
-                            _notify_overtime_single_price_final()
-                        except Exception as e:
-                            logger.warning(f"{ts_prefix()} [시간외단일가 마감통보] {e}")
+                        if OVERTIME_SINGLE_PRICE_BUY:
+                            # ① 마지막 17:50 단일가 결과 집계 출력
+                            _log_closing_order_aggregation("17:50단일가")
+                            # ② 시간외 단일가 마감 총 거래 내역 통보 (텔레그램)
+                            try:
+                                _notify_overtime_single_price_final()
+                            except Exception as e:
+                                logger.warning(f"{ts_prefix()} [시간외단일가 마감통보] {e}")
                         # ③ 구독 종료 + WS 닫기
                         sys.stdout.write("\n")
                         _notify(f"{ts_prefix()} 시간외 체결가 구독 종료")
@@ -4483,7 +4519,7 @@ def scheduler_loop():
                                 _request_ws_close(_active_kws)
                         time.sleep(1.0)
                         # ② 버퍼 flush + parts 병합 (18:00 장 종료 시에만 병합)
-                        _flush_part_buffer("18:00_shutdown", force_full=True)
+                        _flush_part_buffer(f"{END_TIME.strftime('%H:%M')}_shutdown", force_full=True)
                         _merge_parts_to_final()
                         # ②-1 거래장부 연도별 parquet 갱신
                         _append_daily_ledger_to_yearly()
@@ -4492,7 +4528,12 @@ def scheduler_loop():
                         _notify(_final_summary())
                         time.sleep(1.0)
                         # ④ 프로그램 종료 안내 (텔레그램)
-                        _notify(f"{ts_prefix()} 18:00 이후 시간외 단일가 종료로 프로그램 종료", tele=True)
+                        if OVERTIME_SINGLE_PRICE_BUY:
+                            _notify(f"{ts_prefix()} 18:00 이후 시간외 단일가 종료로 프로그램 종료", tele=True)
+                        else:
+                            _notify(f"{ts_prefix()} 16:01 시간외 단일가 미사용으로 프로그램 종료", tele=True)
+                        # ⑤ 로그 파일 날짜별 백업
+                        _backup_log_file()
                         _end_time_reached = True
                         _stop_event.set()
                         break
@@ -6543,14 +6584,11 @@ def _switch_to_closing_codes() -> None:
         global _current_mode
         _current_mode = RunMode.CLOSE_EXP
 
-    # ── 2) WSS 재연결으로 구독 초기화 (41개 해제 대신 9개만 신규 구독) ──
-    with _kws_lock:
-        if _active_kws is not None:
-            _request_ws_close(_active_kws)
+    # ── 2) WSS 유지 (구독은 15:19:10 해제 완료, 15:21 예상체결가 구독 예정) ──
 
-    # ── 3) 메시지 출력: 예상체결가 전환 → 종가매매 전환 완료 순서 ──
+    # ── 3) 메시지 출력 ──
     sys.stdout.write("\n")  # 제자리 출력 줄바꿈
-    _notify(f"{ts_prefix()} 실시간 구독 중지 -> 예상체결가 구독 시작", tele=True)
+    _notify(f"{ts_prefix()} [종가매매전환] WSS 유지, 15:21 예상체결가 구독 예정", tele=True)
     _notify(
         f"{ts_prefix()} [top] ★★ 종가매매 전환 완료\n"
         f"  해제: {len(old_codes)}개 {old_names}\n"
@@ -8609,7 +8647,9 @@ def _desired_subscription_map(now: datetime) -> dict:
             result[ccnl_krx] = rest_codes | single_real
         return result
 
-    if dtime(15, 20) <= t < dtime(15, 30):
+    if dtime(15, 20) <= t < dtime(15, 21):
+        return {}  # 15:20~15:21: 주문 발송만, 예상체결가 구독은 15:21에 시작
+    if dtime(15, 21) <= t < dtime(15, 30):
         return {exp_ccnl_krx: all_codes}  # noqa: F405
 
     if dtime(15, 30) <= t < dtime(16, 0):

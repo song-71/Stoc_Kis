@@ -134,6 +134,7 @@ git commit -m "feat: ws_realtime_trading.py 전체 파일 커밋"
 git push
 """
 
+import os
 import sys
 import time
 import shutil

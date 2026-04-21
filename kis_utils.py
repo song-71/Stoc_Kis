@@ -29,6 +29,17 @@ def _is_open_day_via_api(target_dt: datetime) -> bool:
     cfg = load_config(_CONFIG_PATH)
     appkey = cfg.get("appkey")
     appsecret = cfg.get("appsecret")
+
+    # V2 멀티계좌 구조: 최상위에 appkey 없으면 default_user → main 계좌에서 가져옴
+    if not appkey or not appsecret:
+        try:
+            default_user = cfg["default_user"]
+            acct = cfg["users"][default_user]["accounts"]["main"]
+            appkey = acct["appkey"]
+            appsecret = acct["appsecret"]
+        except (KeyError, TypeError):
+            pass
+
     if not appkey or not appsecret:
         raise RuntimeError("config에 appkey/appsecret이 없습니다.")
 

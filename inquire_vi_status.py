@@ -25,6 +25,8 @@ import pandas as pd
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, BASE_DIR)
 
+from zoneinfo import ZoneInfo
+
 from kis_API_ohlcv_download_Utils import DEFAULT_BASE_URL, KisClient, KisConfig
 
 # ══════════════════════════════════════════════════════════════════
@@ -34,7 +36,7 @@ OPT_CODE      = ""          # 종목코드 (빈값=전체, 예: "005930")
 OPT_MARKET    = "0"         # 시장구분  0:전체 / K:코스피 / Q:코스닥
 OPT_DIRECTION = "1"         # 방향구분  0:전체 / 1:상승 / 2:하락
 OPT_VI_TYPE   = "0"         # VI종류   0:전체 / 1:정적 / 2:동적 / 3:정적&동적
-OPT_DATE      = "20260303"          # 영업일자  YYYYMMDD (빈값=당일, 예: "20260303")
+OPT_DATE      = "20260421"          # 영업일자  YYYYMMDD (빈값=당일, 예: "20260303")
 OPT_CSV_ONLY  = False       # True: 화면 출력 없이 CSV만 저장
 # ══════════════════════════════════════════════════════════════════
 
@@ -244,11 +246,56 @@ def display_vi_status(df: pd.DataFrame, date_str: str) -> None:
     print(f"  * = 현재 VI 발동 중")
     print(f"{'='*90}")
 
-    # 상세 데이터도 CSV로 저장
-    csv_name = f"vi_status_{date_str}.csv"
-    csv_path = os.path.join(BASE_DIR, csv_name)
-    df.to_csv(csv_path, index=False, encoding="utf-8-sig")
-    print(f"\n  CSV 저장: {csv_path}")
+    # Daily_inquire_vi_status.py와 동일 형식으로 CSV 저장
+    _save_daily_format(df, date_str)
+
+
+_VI_STATUS = {"N": "해제", "Y": "발동중", "0": "해제", "1": "정적VI", "2": "동적VI", "3": "정적&동적"}
+_VI_KIND   = {"1": "정적VI", "2": "동적VI", "3": "정적&동적"}
+
+# Daily_inquire_vi_status.py 저장 경로
+_OUT_DIR = os.path.join(BASE_DIR, "data", "vi_status", "1m_fetch")
+
+
+def _save_daily_format(df: pd.DataFrame, date_str: str) -> None:
+    """Daily_inquire_vi_status.py와 동일한 컬럼 형식으로 CSV 저장."""
+    if df.empty:
+        print("저장할 데이터 없음")
+        return
+
+    now = datetime.now(ZoneInfo("Asia/Seoul"))
+    records = []
+    for _, r in df.iterrows():
+        stnd = r.get("vi_stnd_prc", "")
+        dprt = r.get("vi_dprt", "")
+        if not str(stnd).strip() or str(stnd).strip() == "0":
+            stnd = r.get("vi_dmc_stnd_prc", "")
+            dprt = r.get("vi_dmc_dprt", "")
+
+        records.append({
+            "fetch_time": now.strftime("%H:%M"),
+            "종목코드": str(r.get("mksc_shrn_iscd", "")).strip().zfill(6),
+            "종목명": str(r.get("hts_kor_isnm", "")).strip(),
+            "상태": _VI_STATUS.get(str(r.get("vi_cls_code", "")).strip(), str(r.get("vi_cls_code", ""))),
+            "종류": _VI_KIND.get(str(r.get("vi_kind_code", "")).strip(), str(r.get("vi_kind_code", ""))),
+            "발동시간": str(r.get("cntg_vi_hour", "")).strip(),
+            "해제시간": str(r.get("vi_cncl_hour", "")).strip(),
+            "발동가": r.get("vi_prc", ""),
+            "기준가": stnd,
+            "괴리율": dprt,
+            "횟수": r.get("vi_count", ""),
+        })
+
+    out_df = pd.DataFrame(records)
+    os.makedirs(_OUT_DIR, exist_ok=True)
+
+    # YYMMDD 형식
+    ymd = date_str[2:] if len(date_str) == 8 else date_str
+    ts = now.strftime("%H%M")
+    filename = f"vi_status_{ymd}_{ts}.csv"
+    out_path = os.path.join(_OUT_DIR, filename)
+    out_df.to_csv(out_path, index=False, encoding="utf-8-sig")
+    print(f"\n  Daily형식 CSV 저장: {out_path} ({len(out_df)}건)")
 
 
 def main():
@@ -299,13 +346,7 @@ def main():
     if not csv_only:
         display_vi_status(df, date_str)
     else:
-        if df.empty:
-            print("조회된 데이터 없음")
-        else:
-            csv_name = f"vi_status_{date_str}.csv"
-            csv_path = os.path.join(BASE_DIR, csv_name)
-            df.to_csv(csv_path, index=False, encoding="utf-8-sig")
-            print(f"CSV 저장 완료: {csv_path} ({len(df)}건)")
+        _save_daily_format(df, date_str)
 
 
 if __name__ == "__main__":

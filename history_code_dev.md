@@ -2,6 +2,25 @@
 
 ---
 
+## [2026-04-22] e7d8e12
+- **Category**: feat
+- **Title**: 로그 파일 운영 모드 개선 — cron fresh vs 수동재시작 append 구분
+- **Files**: `ws_realtime_trading_runner.sh`, `restart_wss_trading.sh`
+- **Changes**:
+  1. **[ws_realtime_trading_runner.sh]** 첫 인자로 LOG_MODE 수신 (기본값 `fresh`)
+     - `fresh`: 기존 `.out` 파일이 있으면 `wss_realtime_trading_{yymmdd_HHMM}.out` 으로 rotate 후 새 파일 시작. 없으면 빈 파일 생성
+     - `append`: 기존 `.out` 에 이어서 기록 — 수동 재시작 시 당일 로그 연속성 유지
+     - 알 수 없는 모드 입력 시 `fresh` 로 폴백 + stderr 경고 출력
+     - runner_log 및 Telegram 알림 메시지에 `log_mode` 표시
+  2. **[restart_wss_trading.sh]** runner 호출 시 `append` 인자 명시 전달
+     - `nohup bash "$RUNNER_SCRIPT"` → `nohup bash "$RUNNER_SCRIPT" append`
+     - 에코 메시지에 log_mode 표시 추가
+- **Impact**:
+  - cron (인자 없음) → `fresh` 기본값 → 매일 자동 실행 시 전날 `.out` 자동 rotate, 날짜별 로그 분리로 분석 편의 개선
+  - `Restart.py` → `restart.sh` → `runner.sh append` → 수동 재시작 시 기존 `.out` 에 이어서 기록하여 당일 운영 맥락 유지
+  - crontab 수정 불필요 (기본값이 `fresh`)
+  - Python 로거 파일 (`out/logs/wss_TR_{yymmdd}.log` 등 날짜 기반 파일) 에는 영향 없음
+
 ## [2026-04-22] 87695d0
 - **Category**: chore
 - **Title**: _1 백업 파일을 정식 파일로 승격 및 _0422 날짜 백업 보존

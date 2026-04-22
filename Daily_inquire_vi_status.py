@@ -1,6 +1,7 @@
 """
 09:00 ~ 15:19 매 1분마다 상승 VI 현황을 조회하여 CSV part 파일로 저장
 15:20 도달 시 당일 CSV 전체를 하나로 병합(중복 제거) 후, 원본은 backup 폴더로 이동
+15:20 이후 실행 시 API/WSS 초기화 없이 파트파일 병합만 수행 후 즉시 종료
 
 nohup 실행:
 nohup /home/ubuntu/Stoc_Kis/venv/bin/python -u /home/ubuntu/Stoc_Kis/Daily_inquire_vi_status.py > /home/ubuntu/Stoc_Kis/out/Daily_inquire_vi_status.out 2>&1 &
@@ -405,6 +406,20 @@ if __name__ == "__main__":
         _tele(msg)
         raise SystemExit(0)
 
+    now = datetime.now(KST)
+    today = now.date()
+    today_str = now.strftime("%y%m%d")
+    merge_time = datetime(today.year, today.month, today.day, 15, 20, 0, tzinfo=KST)
+
+    # ── 15:20 이후 실행 시: 병합만 수행하고 즉시 종료 ──
+    if now >= merge_time:
+        print(f"[{now.strftime('%H:%M:%S')}] 15:20 이후 → 파트파일 병합만 실행")
+        _merge_and_backup(today_str)
+        end_msg = f"[{PROGRAM_NAME}] 파일 병합 완료. 프로그램 종료."
+        print(end_msg)
+        _tele(end_msg)
+        raise SystemExit(0)
+
     print("=" * 60)
     start_msg = f"[{PROGRAM_NAME}] 프로그램 시작 — 상승 VI 현황 1분단위 수집(09:00 ~ 15:19)"
     print(start_msg)
@@ -422,23 +437,9 @@ if __name__ == "__main__":
     # ── a2 계좌 H0STMKO0 WSS 백그라운드 시작 ──
     _init_ws_a2()
 
-    now = datetime.now(KST)
-    today = now.date()
-    today_str = now.strftime("%y%m%d")
     date_full = now.strftime("%Y%m%d")  # API 조회용 YYYYMMDD
-
     start_time = datetime(today.year, today.month, today.day, 9, 0, 0, tzinfo=KST)
     end_time   = datetime(today.year, today.month, today.day, 15, 19, 0, tzinfo=KST)
-    merge_time = datetime(today.year, today.month, today.day, 15, 20, 0, tzinfo=KST)
-
-    # 이미 15:20 이후면 병합만 실행
-    if now >= merge_time:
-        print(f"[{now.strftime('%H:%M:%S')}] 15:20 이후 → 다운로드 파일 병합 실행")
-        _merge_and_backup(today_str)
-        end_msg = f"[{PROGRAM_NAME}] 파일 병합 완료. 프로그램 종료."
-        print(end_msg)
-        _tele(end_msg)
-        raise SystemExit(0)
 
     # 09:00 이전이면 대기
     if now < start_time:

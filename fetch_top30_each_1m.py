@@ -1,5 +1,5 @@
 """
-08:50 ~ 15:09 매 1분마다 등락률 상위 Top30을 조회하여 CSV 저장
+09:00:10~09:03:00 10초 간격, 09:04~15:09 1분 간격으로 등락률 상위 Top30 조회하여 CSV 저장
 15:10 도달 시 당일 CSV 전체를 하나로 병합 후, 원본은 backup 폴더로 이동
 syw_2 계정 사용
 
@@ -110,7 +110,7 @@ def _fetch_fluctuation_top(client: KisClient, top_n: int = 50) -> list[dict]:
     return output[:top_n]
 
 
-def _fetch_and_save(client: KisClient, now: datetime) -> str | None:
+def _fetch_and_save(client: KisClient, now: datetime, include_seconds: bool = False) -> str | None:
     """Top30 조회 후 CSV 저장, 저장된 파일 경로 반환"""
     try:
         rows = _fetch_fluctuation_top(client, top_n=TOP_N)
@@ -124,9 +124,10 @@ def _fetch_and_save(client: KisClient, now: datetime) -> str | None:
 
     df = pd.DataFrame(rows)
     # fetch_time 컬럼 추가 (병합 시 시각 구분용)
-    df.insert(0, "fetch_time", now.strftime("%H:%M"))
+    df.insert(0, "fetch_time", now.strftime("%H:%M:%S"))
 
-    ts = now.strftime("%y%m%d_%H%M")
+    fmt = "%y%m%d_%H%M%S" if include_seconds else "%y%m%d_%H%M"
+    ts = now.strftime(fmt)
     filename = f"Top30_1m_{ts}.csv"
     out_path = os.path.join(OUT_DIR, filename)
     os.makedirs(OUT_DIR, exist_ok=True)
@@ -198,7 +199,7 @@ if __name__ == "__main__":
         raise SystemExit(0)
 
     print("=" * 60)
-    start_msg = f"[{PROGRAM_NAME}] 프로그램 시작 — 당일 등락율 상위 Top30 1분단위 수집(08:50 ~ 15:09)"
+    start_msg = f"[{PROGRAM_NAME}] 프로그램 시작 — 당일 등락율 상위 Top30 수집(09:00:10~09:03 10초간격, 09:04~ 1분간격)"
     print(start_msg)
     print(f"저장 경로: {OUT_DIR}")
     print("=" * 60)
@@ -210,9 +211,11 @@ if __name__ == "__main__":
     today = now.date()
     today_str = now.strftime("%y%m%d")
 
-    # 시작 시각: 08:50 (이미 지났으면 다음 정각+1분)
-    start_time = datetime(today.year, today.month, today.day, 8, 50, 0, tzinfo=KST)
-    end_time = datetime(today.year, today.month, today.day, 15, 9, 0, tzinfo=KST)
+    # 시간 설정
+    rapid_start = datetime(today.year, today.month, today.day, 9, 0, 10, tzinfo=KST)   # 09:00:10
+    rapid_end   = datetime(today.year, today.month, today.day, 9, 3, 0, tzinfo=KST)    # 09:03:00
+    normal_start = datetime(today.year, today.month, today.day, 9, 4, 0, tzinfo=KST)   # 09:04 (Phase 1 직후)
+    end_time   = datetime(today.year, today.month, today.day, 15, 9, 0, tzinfo=KST)
     merge_time = datetime(today.year, today.month, today.day, 15, 10, 0, tzinfo=KST)
 
     if now >= merge_time:
@@ -223,20 +226,33 @@ if __name__ == "__main__":
         _tele(end_msg)
         raise SystemExit(0)
 
-    # 08:50 이전이면 대기
-    if now < start_time:
-        print(f"[{now.strftime('%H:%M:%S')}] 08:50까지 대기 중...")
-        _wait_until(start_time)
-
-    # ── 매 1분 루프: 09:01 ~ 15:09 ──
-    current = datetime.now(KST)
-    # 다음 정분(초=0) 기준으로 스케줄 시작
-    next_run = current.replace(second=0, microsecond=0) + timedelta(minutes=1)
-    if next_run < start_time:
-        next_run = start_time
-
     saved_count = 0
-    print(f"[{current.strftime('%H:%M:%S')}] 다음 수집: {next_run.strftime('%H:%M')}")
+
+    # ── Phase 1: 09:00:10 ~ 09:03:00 (10초 간격) ──
+    if now < rapid_end:
+        if now < rapid_start:
+            print(f"[{now.strftime('%H:%M:%S')}] 09:00:10까지 대기 중...")
+            _wait_until(rapid_start)
+
+        next_run = max(rapid_start, datetime.now(KST))
+        print(f"[{datetime.now(KST).strftime('%H:%M:%S')}] 10초 간격 수집 시작 (09:00:10 ~ 09:03:00)")
+        while next_run <= rapid_end:
+            _wait_until(next_run)
+            now = datetime.now(KST)
+            result = _fetch_and_save(client, now, include_seconds=True)
+            if result:
+                saved_count += 1
+            next_run += timedelta(seconds=10)
+
+    # ── Phase 2: 09:02 ~ 15:09 (1분 간격) ──
+    current = datetime.now(KST)
+    if current < normal_start:
+        next_run = normal_start
+    else:
+        next_run = current.replace(second=0, microsecond=0) + timedelta(minutes=1)
+
+    if next_run <= end_time:
+        print(f"[{current.strftime('%H:%M:%S')}] 1분 간격 수집 시작, 다음: {next_run.strftime('%H:%M')}")
 
     while next_run <= end_time:
         _wait_until(next_run)

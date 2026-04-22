@@ -6,10 +6,10 @@
               volume, value, tdy_ctrt, tdy_h_ctrt, tdy_L_ctrt, pdy_ctrt,
               pdy_uc, pdy_h, pdy_L, R_avr, R_org
 """
-period_start = "2026-01-30"  # 시작일 (YYYY-MM-DD)
+period_start = "2026-03-10"  # 시작일 (YYYY-MM-DD)
 period_end = ""    # 종료일 (YYYY-MM-DD), 비우면 오늘 날짜까지
 strategy_name = "str3"  # "str1" 또는 "str2", str3
-target_pdy_ctrt = 0.20   # str1의 전일 등락률 필터 기준값
+target_pdy_ctrt = 0.28   # str1의 전일 등락률 필터 기준값
 
 # 전략 설명
 # str1: 전일 등락률(pdy_ctrt)이 target_pdy_ctrt 이상인 종목만 선택

@@ -38,7 +38,7 @@ echo "[${TS}] started tz=${TZ} python=${VENV_PY} -> ${LOG_FILE}" >> "${LOG_FILE}
 nohup "${VENV_PY}" "${BASE_DIR}/kis_1d_Daily_ohlcv_fetch_manager.py" --freq 1d --end "${END_DATE}" >> "${LOG_FILE}" 2>&1
 
 # 1시간 1회 종목별 OHLCV 데이터(1m) 다운로드
-nohup "${VENV_PY}" "${BASE_DIR}/kis_1m_API_to_Parquet_all_code.py" >> "${LOG_FILE}" 2>&1 &
+nohup "${VENV_PY}" "${BASE_DIR}/kis_1m_API_to_Parquet_all_code.py" > "${LOG_FILE}" 2>&1 &
 # nohup /home/ubuntu/Stoc_Kis/venv/bin/python /home/ubuntu/Stoc_Kis/kis_1m_API_to_Parquet_all_code.py > /home/ubuntu/Stoc_Kis/out/1m_api_parquet.log 2>&1 &
 
 

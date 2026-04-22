@@ -8,7 +8,36 @@
 QUERY_DATE = "all"
 
 CODE_TEXT = """
-넥사다이내믹스
+오에스피                                                                                                                                                                             
+  TIGER 미국채10년                                                                                                                                                                   
+  TIGER 200에너지                                                                                                                                                                      
+  RISE 2차전지TOP                                                                                                                                                                      
+  LS티라유텍                                                                                                                                                                           
+  TIGER 인도빌리언컨                                                                                                                                                                 
+  WISCOM                                                                                                                                                                               
+  HANARO 글로벌피지
+  ACE 구글밸류체인액티                                                                                                                                                                 
+  진흥기업                                                                                                                                                                           
+  PLUS 태양광&ESS
+  KB S&P 인버스 2
+  WON 두산그룹포커스
+  멤레이비티                                                                                                                                                                           
+  TIGER 미국S&P5
+  ACE Fn성장소비주도                                                                                                                                                                   
+  뷰티스킨                                                                                                                                                                           
+  모아라이프플러스
+  RISE 미국AI테크액
+  온타이드                                                                                                                                                                             
+  KIWOOM 200선물
+  인베니아                                                                                                                                                                             
+  대한전선                                                                                                                                                                           
+  에스켐
+  와이랩
+  한진칼우
+  미래아이앤지
+  KoAct 글로벌AI&
+  SOL 국제금
+  HLB펩      
 """
 
 import argparse

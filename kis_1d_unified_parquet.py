@@ -179,8 +179,7 @@ def main() -> None:
     df.write_parquet(out_path)
     t_write_end = time.perf_counter()
 
-    print(df)
-    print(df.columns)
+    print(f"shape: {df.shape}, columns: {df.columns}")
     elapsed = time.perf_counter() - t0
     feature_elapsed = t2 - t1
     query_elapsed = t1 - t0

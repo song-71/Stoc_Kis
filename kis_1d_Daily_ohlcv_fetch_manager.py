@@ -380,7 +380,7 @@ def main() -> None:
 
     if not use_csv_path:
         codes = (
-            symbol_df[symbol_df["group"] == "ST"]["code"]
+            symbol_df["code"]
             .astype(str)
             .tolist()
         )
@@ -409,7 +409,7 @@ def main() -> None:
 
     combined = pd.concat(results, ignore_index=True)
     combined = combined.sort_values(["date", "market", "symbol"]).reset_index(drop=True)
-    print(combined)
+    print(f"{ts_prefix()} combined shape: {combined.shape}")
 
     if args.out_csv:
         base_dir = os.path.dirname(os.path.abspath(__file__))

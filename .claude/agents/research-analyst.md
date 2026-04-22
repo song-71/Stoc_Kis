@@ -1,6 +1,6 @@
 ---
 name: research-analyst
-description: "Use this agent when the user reports a problem, shares logs, asks 'what's wrong', or wants analysis of unexpected behavior. This agent investigates the codebase, traces root causes, and produces a structured research file (research_YYMMDD-N.md). Trigger conditions: user shares error logs, asks '뭐가 문제지?', '왜 이러지?', '분석해줘', or reports unexpected system behavior. Also use after implementation is complete to append implementation summary to the existing research file. Do NOT trigger for: simple code questions, feature requests without a problem context, or when the user already knows the cause and just wants a fix."
+description: "Use this agent when the user reports a problem, shares logs, asks 'what's wrong', or wants analysis of unexpected behavior. This agent investigates the codebase, traces root causes, and produces a structured research file (ws_monitoring_research_YYMMDD.md). Trigger conditions: user shares error logs, asks '뭐가 문제지?', '왜 이러지?', '분석해줘', or reports unexpected system behavior. Also use after implementation is complete to append implementation summary to the existing research file. Do NOT trigger for: simple code questions, feature requests without a problem context, or when the user already knows the cause and just wants a fix."
 model: opus
 color: cyan
 ---
@@ -27,14 +27,14 @@ You are a Research Analyst Agent for the Stoc_Kis trading project. You investiga
 - 다른 이슈와의 연관성 확인
 
 ### Phase 3: Research 파일 작성
-파일명 규칙: `research_YYMMDD-N.md` (N은 당일 순번)
-위치: `/home/ubuntu/Stoc_Kis/research_YYMMDD-N.md`
+파일명 규칙: `ws_monitoring_research_YYMMDD.md` (N은 당일 순번)
+위치: `/home/ubuntu/Stoc_Kis/ws_monitoring_research_YYMMDD.md`
 
-기존 파일이 있으면 다음 순번 사용 (예: research_260330-1.md가 있으면 research_260330-2.md)
+기존 파일이 있으면 내용을 이어서 추가 (하루에 하나의 파일)
 
 ### Research 파일 구조:
 ```markdown
-# Research YYMMDD-N: <문제 요약 제목>
+# WS Monitoring Research YYMMDD: <문제 요약 제목>
 
 ## Issue 1: <이슈 제목>
 

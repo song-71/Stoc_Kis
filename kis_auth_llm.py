@@ -17,6 +17,7 @@ from datetime import datetime
 from io import StringIO
 
 import pandas as pd
+import polars as pl
 
 # pip install requests (패키지설치)
 import requests
@@ -683,7 +684,7 @@ def add_data_map(
 class KISWebSocket:
     api_url: str = ""
     on_result: Callable[
-        [websockets.ClientConnection, str, pd.DataFrame, dict], None
+        [websockets.ClientConnection, str, pl.DataFrame, dict], None
     ] = None
     result_all_data: bool = False
     on_system: Callable[[Any], None] = None
@@ -726,7 +727,7 @@ class KISWebSocket:
                 logging.info("received message >> %s" % raw)
                 show_result = False
 
-                df = pd.DataFrame()
+                df = pl.DataFrame()
 
                 if raw[0] in ["0", "1"]:
                     d1 = raw.split("|")
@@ -755,8 +756,9 @@ class KISWebSocket:
                                 rows.append("^".join(chunk))
                         d = "\n".join(rows)
 
-                    df = pd.read_csv(
-                        StringIO(d), header=None, sep="^", names=columns, dtype=object
+                    df = pl.read_csv(
+                        StringIO(d).read().encode(), has_header=False, separator="^",
+                        new_columns=columns, infer_schema_length=0,
                     )
 
                     show_result = True
@@ -899,7 +901,7 @@ class KISWebSocket:
     def start(
             self,
             on_result: Callable[
-                [websockets.ClientConnection, str, pd.DataFrame, dict], None
+                [websockets.ClientConnection, str, pl.DataFrame, dict], None
             ],
             result_all_data: bool = False,
     ):

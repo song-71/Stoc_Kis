@@ -2140,21 +2140,22 @@ def _write_ccnl_notice_log(df, recv_ts: str) -> None:
         date_str = parts[0]
         time_str = parts[1] if len(parts) > 1 else ""
 
-        out = df.copy()
-        out.insert(0, "date", date_str)
-        out.insert(1, "time", time_str)
+        out = df.with_columns([
+            pl.lit(date_str).alias("date"),
+            pl.lit(time_str).alias("time"),
+        ])
 
         # 없는 컬럼은 빈 값으로 추가
         for c in _CCNL_CSV_COLUMNS:
             if c not in out.columns:
-                out[c] = ""
-        out = out[_CCNL_CSV_COLUMNS]
+                out = out.with_columns(pl.lit("").alias(c))
+        out = out.select(_CCNL_CSV_COLUMNS)
 
         with open(CCNL_NOTICE_CSV_PATH, "a", encoding="utf-8") as f:
             if not _ccnl_notice_header_written:
                 f.write(",".join(_CCNL_CSV_COLUMNS) + "\n")
                 _ccnl_notice_header_written = True
-            for _, row in out.iterrows():
+            for row in out.to_dicts():
                 f.write(",".join(str(row[c]) for c in _CCNL_CSV_COLUMNS) + "\n")
     except Exception as e:
         logger.warning(f"{ts_prefix()} [체결통보로그] 저장 실패: {e}")
@@ -2233,28 +2234,25 @@ _opening_call_auction_cancelled_log: list[tuple[str, str, str]] = []  # (code, n
 
 def _on_ccnl_notice_filled(df, recv_ts: str) -> None:
     """H0STCNI0 체결통보(CNTG_YN==2) 수신 시 filled_qty 갱신 및 state 저장."""
-    col = {str(c).strip().lower(): c for c in df.columns}
-    cntg_yn_col = col.get("cntg_yn") or col.get("CNTG_YN")
-    code_col = col.get("stck_shrn_iscd") or col.get("STCK_SHRN_ISCD")
-    cntg_qty_col = col.get("cntg_qty") or col.get("CNTG_QTY")
-    seln_col = col.get("seln_byov_cls") or col.get("SELN_BYOV_CLS")  # 매도/매수 구분
-    if not all([cntg_yn_col, code_col, cntg_qty_col]):
+    # 컬럼명은 on_result에서 이미 소문자 통일됨
+    cols = set(df.columns)
+    if not all(c in cols for c in ("cntg_yn", "stck_shrn_iscd", "cntg_qty")):
         return
-    for _, row in df.iterrows():
+    for row in df.to_dicts():
         try:
-            cntg_yn = str(row.get(cntg_yn_col, "")).strip()
+            cntg_yn = str(row.get("cntg_yn", "")).strip()
             if cntg_yn != "2":  # 2=체결통보
                 continue
-            code = str(row.get(code_col, "")).strip().zfill(6)
+            code = str(row.get("stck_shrn_iscd", "")).strip().zfill(6)
             if not code:
                 continue
-            qty = int(float(str(row.get(cntg_qty_col, 0) or 0).replace(",", "") or 0))
+            qty = int(float(str(row.get("cntg_qty", 0) or 0).replace(",", "") or 0))
             if qty <= 0:
                 continue
             # 매수/매도 체결 누적
-            seln = str(row.get(seln_col, "")).strip()
+            seln = str(row.get("seln_byov_cls", "")).strip()
             # 체결 단가
-            fill_pr_col = col.get("cntg_unpr") or col.get("stck_prpr") or col.get("CNTG_UNPR")
+            fill_pr_col = "cntg_unpr" if "cntg_unpr" in cols else ("stck_prpr" if "stck_prpr" in cols else None)
             fill_pr = 0.0
             if fill_pr_col:
                 try:
@@ -3389,19 +3387,46 @@ def _log_closing_result_after_window(window_label: str, yymmdd: str | None = Non
     orders = state.get("orders") or []
     code_info = state.get("code_info") or {}
     filled_map = _get_closing_filled_for_remain(state) if target_date == today_yymmdd else _load_closing_filled(target_date)
-    lines = [f"{ts_prefix()} [{window_label} 종료] 주문내역·결과"]
+    title = f"{ts_prefix()} [{window_label} 종료] 주문내역·결과"
+    table_rows: list[dict] = []
+    total_ord, total_filled, total_remain = 0, 0, 0
     for o in orders:
         code = str(o.get("code", "")).zfill(6)
         name = o.get("name", code_info.get(code, {}).get("name", code))
         ord_q = int(o.get("order_qty", o.get("qty", 0)))
         filled = min(ord_q, max(int(o.get("filled_qty", 0)), filled_map.get(code, 0))) if filled_map else int(o.get("filled_qty", 0))
         remain = max(0, ord_q - filled)
-        status = o.get("status", "unknown")
-        lines.append(f"  {name}({code}) 주문수량={ord_q} 매수수량={filled} 미매수={remain} status={status}")
-    lines.append(f"  (체결통보 기반 _closing_filled_by_code 반영)")
-    msg = "\n".join(lines)
-    _notify(msg)
-    logger.info(msg.replace("\n", " | "))
+        total_ord += ord_q
+        total_filled += filled
+        total_remain += remain
+        table_rows.append({
+            "종목명": name,
+            "코드": code,
+            "주문": str(ord_q),
+            "매수": str(filled),
+            "미매수": str(remain),
+            "status": o.get("status", "unknown"),
+        })
+    print(f"\n{title}")
+    if table_rows:
+        print_table(
+            table_rows,
+            columns=["종목명", "코드", "주문", "매수", "미매수", "status"],
+            align={"종목명": "left", "코드": "left", "주문": "right", "매수": "right", "미매수": "right", "status": "left"},
+        )
+    print(f"  합계: 주문={total_ord} 매수={total_filled} 미매수={total_remain}")
+    print(f"  (체결통보 기반 _closing_filled_by_code 반영)\n")
+    # 텔레그램
+    tele_lines = [f"[{window_label} 종료] 주문내역·결과"]
+    for r in table_rows:
+        tele_lines.append(f"  {r['종목명']}({r['코드']}) 주문={r['주문']} 매수={r['매수']} 미매수={r['미매수']}")
+    tele_lines.append(f"  합계: 주문={total_ord} 매수={total_filled} 미매수={total_remain}")
+    if tmsg is not None:
+        try:
+            tmsg("\n".join(tele_lines), "-t")
+        except Exception:
+            pass
+    logger.info(f"{title} | 합계: 주문={total_ord} 매수={total_filled} 미매수={total_remain}")
 
 
 def _log_closing_order_aggregation(slot_label: str, state: dict | None = None) -> None:
@@ -4882,10 +4907,14 @@ _part_seq: int = 0                              # 당일 part 파일 순번 (파
 _ema_state: dict[str, dict[int, float | None]] = {
     c: {n: None for n in INDICATOR_MA_LINE} for c in codes
 }
-# BB용 raw price deque: {code: deque(maxlen=BB_PERIOD)} – 표준편차 계산에 사용
-_price_buf: dict[str, deque] = {
-    c: deque(maxlen=_IND_MAX_WINDOW) for c in codes
+# BB용 raw price list: {code: list} – 최대 _IND_MAX_WINDOW개 유지, deque 대신 list로 복사 없이 직접 계산
+_price_buf: dict[str, list] = {
+    c: [] for c in codes
 }
+# BB incremental 계산용 캐시: sum, sum_of_squares (슬라이딩 윈도우)
+_bb_sum: dict[str, float] = {}
+_bb_sq_sum: dict[str, float] = {}
+
 
 _last_recv_ts: dict[str, float] = {c: 0.0 for c in codes}
 _code_added_ts: dict[str, float] = {c: time.time() for c in codes}  # 종목별 추가 시점 (watchdog 3분 기준)
@@ -5616,9 +5645,9 @@ _mkstatus_sub_codes: set[str] = set()  # H0STMKO0 구독 중인 종목
 
 def _on_market_status_krx(result) -> None:
     """H0STMKO0 장운영정보 수신 → 종목상태 갱신."""
-    if result is None or result.empty:
+    if result is None or len(result) == 0:
         return
-    for _, row in result.iterrows():
+    for row in result.to_dicts():
         code = str(row.get("mksc_shrn_iscd", "")).strip()
         if not code:
             continue
@@ -7358,7 +7387,9 @@ def _log_stale_after_save(threshold_sec: int) -> None:
 def _init_indicator_buf(code: str) -> None:
     """신규 종목 구독 시 EMA·BB 인메모리 상태 초기화."""
     _ema_state[code] = {n: None for n in INDICATOR_MA_LINE}
-    _price_buf[code] = deque(maxlen=_IND_MAX_WINDOW)
+    _price_buf[code] = []
+    _bb_sum.pop(code, None)
+    _bb_sq_sum.pop(code, None)
 
 
 def _save_indicator_snapshot() -> None:
@@ -7382,7 +7413,7 @@ def _save_indicator_snapshot() -> None:
         for code in all_codes:
             ema = _ema_state.get(code, {})
             buf = _price_buf.get(code)
-            buf_list = list(buf) if buf else []
+            buf_list = buf if buf else []
             rows.append({
                 "code": code,
                 "ema_3": ema.get(3),
@@ -7460,7 +7491,13 @@ def _restore_from_snapshot() -> bool:
             # price_buf 복원 (BB 계산용)
             buf_data = row.get("price_buf", [])
             if buf_data:
-                _price_buf[code] = deque(buf_data, maxlen=_IND_MAX_WINDOW)
+                buf_list = [float(x) for x in buf_data[-_IND_MAX_WINDOW:]]
+                _price_buf[code] = buf_list
+                # BB incremental 캐시 초기화
+                bb_window = buf_list[-INDICATOR_BB_PERIOD:]
+                if len(bb_window) >= INDICATOR_BB_PERIOD:
+                    _bb_sum[code] = sum(bb_window)
+                    _bb_sq_sum[code] = sum(x * x for x in bb_window)
             # highest 복원 (트레일스톱용)
             h_val = row.get("highest", 0.0)
             if h_val and float(h_val) > 0:
@@ -7601,15 +7638,17 @@ def _calc_indicators(code: str, price: float) -> dict:
     if state is None:
         return {}
 
-    # ── 첫 틱: EMA 시가 초기화 + price_buf BB기간만큼 pre-fill ──
+    # ── 첫 틱: EMA 초기화 ──
     if len(buf) == 0:
         for n in INDICATOR_MA_LINE:
             state[n] = price
-        for _ in range(INDICATOR_BB_PERIOD):
-            buf.append(price)
-    else:
-        buf.append(price)
 
+    # price_buf 축적 (pre-fill 없이 자연 축적)
+    buf.append(price)
+    if len(buf) > _IND_MAX_WINDOW:
+        buf[:] = buf[-_IND_MAX_WINDOW:]
+
+    # ── EMA 계산 ──
     ema_vals: dict[str, float] = {}
     for n in INDICATOR_MA_LINE:
         alpha = 2.0 / (n + 1)
@@ -7620,11 +7659,34 @@ def _calc_indicators(code: str, price: float) -> dict:
             state[n] = prev + alpha * (price - prev)
         ema_vals[f"ma{n}"] = state[n]
 
+    # ── BB incremental 계산 ──
     bb_vals: dict[str, float | None] = {}
-    if len(buf) >= INDICATOR_BB_PERIOD:
-        window = list(buf)[-INDICATOR_BB_PERIOD:]
-        mean = sum(window) / INDICATOR_BB_PERIOD
-        variance = sum((x - mean) ** 2 for x in window) / (INDICATOR_BB_PERIOD - 1)
+    bb_n = INDICATOR_BB_PERIOD
+    s = _bb_sum.get(code)
+    sq = _bb_sq_sum.get(code)
+
+    if s is None or sq is None:
+        # 캐시 미초기화 → 현재 buf 기준 1회 계산
+        window = buf[-bb_n:]
+        s = sum(window)
+        sq = sum(x * x for x in window)
+    elif len(buf) > bb_n:
+        # 슬라이딩: 새 값 추가 + 오래된 값 제거
+        old_price = buf[-bb_n - 1]
+        s += price - old_price
+        sq += price * price - old_price * old_price
+    else:
+        # 축적 중 (< 200개): 추가만
+        s += price
+        sq += price * price
+
+    _bb_sum[code] = s
+    _bb_sq_sum[code] = sq
+
+    count = min(len(buf), bb_n)
+    if count >= 2:
+        mean = s / count
+        variance = max(0.0, sq / count - mean * mean)
         std = math.sqrt(variance)
         bb_vals["bb_mid"]   = mean
         bb_vals["bb_upper"] = mean + INDICATOR_BB_K * std
@@ -8195,11 +8257,11 @@ def on_result(ws, tr_id, result, data_info):
             pass
         return
 
-    if result is None or getattr(result, "empty", True):
+    if result is None or len(result) == 0:
         return
 
     # 수신 시점 컬럼명 소문자 통일 (ccnl_krx 대문자 vs exp_ccnl_krx 소문자 → concat 시 중복 방지)
-    result.columns = [str(c).strip().lower() for c in result.columns]
+    result = result.rename({c: c.strip().lower() for c in result.columns})
 
     # H0STCNI0 체결통보: 별도 로그 저장 + 체결 시 state 갱신 (parquet 미포함)
     trid = str(tr_id)
@@ -8207,7 +8269,7 @@ def on_result(ws, tr_id, result, data_info):
         recv_ts = datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S.%f")
         _write_ccnl_notice_log(result, recv_ts)
         # ── 가독성 로그 ──
-        for _, row in result.iterrows():
+        for row in result.to_dicts():
             try:
                 cntg_yn = str(row.get("cntg_yn", "")).strip()
                 if cntg_yn not in ("1", "2"):
@@ -8248,8 +8310,7 @@ def on_result(ws, tr_id, result, data_info):
     if trid == "H0STMKO0":
         _on_market_status_krx(result)
         return
-    if result.columns.duplicated().any():
-        result = result.loc[:, ~result.columns.duplicated()]
+    # polars는 중복 컬럼명을 자동으로 suffix 처리하므로 별도 제거 불필요
 
     trid = str(tr_id)
     if trid not in TRID_TO_KIND and trid in KNOWN_TRID_MAP:
@@ -8261,9 +8322,8 @@ def on_result(ws, tr_id, result, data_info):
         is_real = TRID_TO_IS_REAL.get(trid, None)
 
     recv_ts = datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S.%f")
-    # WSS 파서 단계에서 Polars로 변환 → ingest_loop는 Polars 네이티브로 처리
-    result_pl = pl.from_pandas(result)
-    _ingest_queue.put((result_pl, trid, kind, is_real, recv_ts))
+    # result는 이미 Polars DataFrame → ingest_loop는 Polars 네이티브로 처리
+    _ingest_queue.put((result, trid, kind, is_real, recv_ts))
 
 
 def ingest_loop():
@@ -8306,16 +8366,36 @@ def ingest_loop():
             else:
                 save = (SAVE_MODE == "always")
 
-        # 모니터링 카운트 (Polars 네이티브)
+        # ── 통합 zfill + partition_by (1회) ──────────────────────────────
+        prdy_col = col_map.get("prdy_ctrt")
+        pr_col = col_map.get("stck_prpr")
+        mkop_col = col_map.get("new_mkop_cls_code")
+        vi_prc_col = col_map.get("vi_stnd_prc")
+        oprc_col_check = col_map.get("stck_oprc") if (_vi_delayed_codes and kind == "regular_exp") else None
+
         try:
             tmp = result.with_columns(
                 pl.col(code_col).cast(pl.Utf8).str.zfill(6).alias(code_col)
             )
-            with _lock:
-                for df_code in tmp.partition_by(code_col, maintain_order=True):
-                    code = str(df_code[code_col][0])
-                    if code not in _per_sec_counts:
-                        continue
+
+            # 저장용 추가 컬럼 (save=True일 때만)
+            if save:
+                if is_real is None:
+                    is_real = "N" if "exp" in kind else "Y"
+                tmp = tmp.with_columns([
+                    pl.lit(recv_ts).alias("recv_ts"),
+                    pl.lit(trid).alias("tr_id"),
+                    pl.lit(is_real).alias("is_real_ccnl"),
+                ])
+
+            chunks: list[pl.DataFrame] = []
+            _vi_delayed_changed = False
+
+            for df_code in tmp.partition_by(code_col, maintain_order=True):
+                code = str(df_code[code_col][0])
+
+                # ── (1) 모니터링 카운트 ──
+                if code in _per_sec_counts:
                     n = len(df_code)
                     _per_sec_counts[code] = (_per_sec_counts[code] + n) % PER_SEC_ROLLOVER
                     _total_counts[code] += n
@@ -8396,6 +8476,93 @@ def ingest_loop():
                         _regular_real_seen.add(code)
                     if kind == "overtime_real":
                         _overtime_real_seen.add(code)
+
+                # ── (2) 캐시 업데이트 ──
+                if code and code != "None" and code != "000000":
+                    if prdy_col:
+                        try:
+                            _last_prdy_ctrt[code] = float(df_code[prdy_col][-1])
+                        except Exception:
+                            pass
+                    if pr_col:
+                        try:
+                            _last_stck_prpr[code] = float(str(df_code[pr_col][-1]).replace(",", "") or 0)
+                        except Exception:
+                            pass
+                    if mkop_col:
+                        try:
+                            v = str(df_code[mkop_col][-1] or "").strip()
+                            if v:
+                                prev_mkop = _last_mkop_cls_code.get(code, "")
+                                if prev_mkop and prev_mkop != v:
+                                    name = code_name_map.get(code, code)
+                                    _mkop_names = {"00": "장중", "10": "동시호가", "20": "장마감", "30": "시간외단일가"}
+                                    prev_label = _mkop_names.get(prev_mkop, prev_mkop)
+                                    cur_label = _mkop_names.get(v, v)
+                                    logger.info(
+                                        f"{ts_prefix()} [실시간체결통보] {name}({code}) "
+                                        f"new_mkop_cls_code: {prev_mkop}({prev_label}) → {v}({cur_label})"
+                                    )
+                                _last_mkop_cls_code[code] = v
+                        except Exception:
+                            pass
+                    # VI기준가 캐시 (실시간체결에만 존재)
+                    if vi_prc_col:
+                        try:
+                            vp = float(str(df_code[vi_prc_col][-1]).replace(",", "") or 0)
+                            if vp > 0:
+                                _vi_stnd_prc[code] = vp
+                        except Exception:
+                            pass
+
+                # ── (3) VI 지연 해제 ──
+                if oprc_col_check and code in _vi_delayed_codes:
+                    try:
+                        oprc_val = float(str(df_code[oprc_col_check][-1]).replace(",", "") or 0)
+                        if oprc_val > 0:
+                            _vi_delayed_codes.discard(code)
+                            _vi_delayed_changed = True
+                            name = code_name_map.get(code, code)
+                            logger.info(
+                                f"{ts_prefix()} [VI지연해제] {name}({code}) "
+                                f"stck_oprc={oprc_val:,.0f} → 시가형성 확인, 실시간체결 전환"
+                            )
+                    except (ValueError, TypeError):
+                        pass
+
+                # ── (4) 저장 + 지표 계산 ──
+                if save:
+                    # ── 기술적 지표 계산 (EMA + BB) — Polars 네이티브 ──
+                    _pr_col_save = "stck_prpr"
+                    if _pr_col_save in df_code.columns:
+                        ind_rows: list[dict] = []
+                        for pr_val in df_code[_pr_col_save]:
+                            try:
+                                ind_rows.append(_calc_indicators(code, float(pr_val)))
+                            except (TypeError, ValueError):
+                                ind_rows.append({})
+                        if ind_rows:
+                            ind_df = pl.DataFrame(ind_rows)
+                            for col_name in ind_df.columns:
+                                df_code = df_code.with_columns(
+                                    ind_df[col_name].alias(col_name)
+                                )
+                    # ── VI / 장운영 이벤트 컬럼 추가 ──
+                    # vi_start_ts/vi_end_ts는 VI 활성 중에만 기록 (해제 후 계속 기록 방지)
+                    _is_vi = code in _vi_active_codes
+                    _mkt = _code_market_map.get(code, "")
+                    _mkt_evt = _market_wide_event.get(_mkt, "") or _market_event.get(code, "")
+                    df_code = df_code.with_columns([
+                        pl.lit("Y" if _is_vi else "").alias("vi_yn"),
+                        pl.lit(_vi_start_ts.get(code, "") if _is_vi else "").alias("vi_start_ts"),
+                        pl.lit(_mkt_evt).alias("market_event"),
+                    ])
+                    chunks.append(df_code)
+
+            # VI 지연 해제 후 rebuild (루프 밖)
+            if _vi_delayed_changed and not _vi_delayed_codes:
+                _trigger_ws_rebuild()
+
         except Exception:
             pass
 
@@ -8406,135 +8573,17 @@ def ingest_loop():
             except Exception as e:
                 logger.warning(f"{ts_prefix()} [종가모니터] tick 처리 오류: {e}")
 
-        # 최근 전일대비율·체결가·종목상태 캐시 (Polars 네이티브)
-        try:
-            prdy_col = col_map.get("prdy_ctrt")
-            pr_col = col_map.get("stck_prpr")
-            mkop_col = col_map.get("new_mkop_cls_code")
-            tmp2 = result.with_columns(
-                pl.col(code_col).cast(pl.Utf8).str.zfill(6).alias(code_col)
-            )
-            for df_code in tmp2.partition_by(code_col, maintain_order=True):
-                code = str(df_code[code_col][0])
-                if not code or code == "None" or code == "000000":
-                    continue
-                if prdy_col:
-                    try:
-                        _last_prdy_ctrt[code] = float(df_code[prdy_col][-1])
-                    except Exception:
-                        pass
-                if pr_col:
-                    try:
-                        _last_stck_prpr[code] = float(str(df_code[pr_col][-1]).replace(",", "") or 0)
-                    except Exception:
-                        pass
-                if mkop_col:
-                    try:
-                        v = str(df_code[mkop_col][-1] or "").strip()
-                        if v:
-                            prev_mkop = _last_mkop_cls_code.get(code, "")
-                            if prev_mkop and prev_mkop != v:
-                                name = code_name_map.get(code, code)
-                                _mkop_names = {"00": "장중", "10": "동시호가", "20": "장마감", "30": "시간외단일가"}
-                                prev_label = _mkop_names.get(prev_mkop, prev_mkop)
-                                cur_label = _mkop_names.get(v, v)
-                                logger.info(
-                                    f"{ts_prefix()} [실시간체결통보] {name}({code}) "
-                                    f"new_mkop_cls_code: {prev_mkop}({prev_label}) → {v}({cur_label})"
-                                )
-                            _last_mkop_cls_code[code] = v
-                    except Exception:
-                        pass
-                # VI기준가 캐시 (실시간체결에만 존재)
-                vi_prc_col = col_map.get("vi_stnd_prc")
-                if vi_prc_col:
-                    try:
-                        vp = float(str(df_code[vi_prc_col][-1]).replace(",", "") or 0)
-                        if vp > 0:
-                            _vi_stnd_prc[code] = vp
-                    except Exception:
-                        pass
-        except Exception:
-            pass
-
-        # _vi_delayed_codes 조기 해제: stck_oprc > 0이면 시가 형성됨 → VI 아님
-        if _vi_delayed_codes and kind == "regular_exp":
-            oprc_col_check = col_map.get("stck_oprc")
-            if oprc_col_check:
-                try:
-                    tmp2_vi = result.with_columns(
-                        pl.col(code_col).cast(pl.Utf8).str.zfill(6).alias(code_col)
-                    )
-                    for df_code in tmp2_vi.partition_by(code_col, maintain_order=True):
-                        code = str(df_code[code_col][0])
-                        if code in _vi_delayed_codes:
-                            try:
-                                oprc_val = float(str(df_code[oprc_col_check][-1]).replace(",", "") or 0)
-                                if oprc_val > 0:
-                                    _vi_delayed_codes.discard(code)
-                                    name = code_name_map.get(code, code)
-                                    logger.info(
-                                        f"{ts_prefix()} [VI지연해제] {name}({code}) "
-                                        f"stck_oprc={oprc_val:,.0f} → 시가형성 확인, 실시간체결 전환"
-                                    )
-                            except (ValueError, TypeError):
-                                pass
-                    if not _vi_delayed_codes:
-                        _trigger_ws_rebuild()
-                except Exception:
-                    pass
-
-        if save:
-            if is_real is None:
-                is_real = "N" if "exp" in kind else "Y"
-
+        # _part_buffer 에 추가 (1000행 또는 1분마다 part 파일로 flush)
+        if save and chunks:
             try:
-                df_save = result.with_columns([
-                    pl.col(code_col).cast(pl.Utf8).str.zfill(6).alias(code_col),
-                    pl.lit(recv_ts).alias("recv_ts"),
-                    pl.lit(trid).alias("tr_id"),
-                    pl.lit(is_real).alias("is_real_ccnl"),
-                ])
-                chunks: list[pl.DataFrame] = []
-                with _lock:
-                    for df_code in df_save.partition_by(code_col, maintain_order=True):
-                        code = str(df_code[code_col][0])
-                        # ── 기술적 지표 계산 (EMA + BB) — Polars 네이티브 ──
-                        pr_col = "stck_prpr"
-                        if pr_col in df_code.columns:
-                            ind_rows: list[dict] = []
-                            for pr_val in df_code[pr_col]:
-                                try:
-                                    ind_rows.append(_calc_indicators(code, float(pr_val)))
-                                except (TypeError, ValueError):
-                                    ind_rows.append({})
-                            if ind_rows:
-                                ind_df = pl.DataFrame(ind_rows)
-                                for col_name in ind_df.columns:
-                                    df_code = df_code.with_columns(
-                                        ind_df[col_name].alias(col_name)
-                                    )
-                        # ── VI / 장운영 이벤트 컬럼 추가 ──
-                        # vi_start_ts/vi_end_ts는 VI 활성 중에만 기록 (해제 후 계속 기록 방지)
-                        _is_vi = code in _vi_active_codes
-                        _mkt = _code_market_map.get(code, "")
-                        _mkt_evt = _market_wide_event.get(_mkt, "") or _market_event.get(code, "")
-                        df_code = df_code.with_columns([
-                            pl.lit("Y" if _is_vi else "").alias("vi_yn"),
-                            pl.lit(_vi_start_ts.get(code, "") if _is_vi else "").alias("vi_start_ts"),
-                            pl.lit(_mkt_evt).alias("market_event"),
-                        ])
-                        chunks.append(df_code)
-                # _part_buffer 에 추가 (1000행 또는 1분마다 part 파일로 flush)
-                if chunks:
-                    with _part_buffer_lock:
-                        for chunk in chunks:
-                            _part_buffer.append(chunk)
-                        total_n = sum(len(c) for c in chunks)
-                        _part_buffer_rows += total_n
-                    # 1500행 도달 시 오래된 1000행 flush
-                    if _part_buffer_rows >= PART_FLUSH_THRESHOLD:
-                        _flush_part_buffer("1000rows")
+                with _part_buffer_lock:
+                    for chunk in chunks:
+                        _part_buffer.append(chunk)
+                    total_n = sum(len(c) for c in chunks)
+                    _part_buffer_rows += total_n
+                # 1500행 도달 시 오래된 1000행 flush
+                if _part_buffer_rows >= PART_FLUSH_THRESHOLD:
+                    _flush_part_buffer("1000rows")
             except Exception:
                 logger.error("[ingest] part buffer append failed")
                 logger.error(traceback.format_exc())
@@ -8560,9 +8609,8 @@ def ingest_loop():
             _last_print_ts = now
 
         if (now - _last_summary_ts) >= SUMMARY_EVERY_SEC:
-            with _lock:
-                total_rows = sum(_total_counts.values())
-                saved_rows = _written_rows
+            total_rows = sum(_total_counts.values())
+            saved_rows = _written_rows
             accum_rows = _part_buffer_rows
 
             logger.info(
@@ -8782,9 +8830,9 @@ def _on_result_a2(ws, tr_id, result, data_info):
     """a2 WSS on_result 콜백: H0STMKO0 → 기존 처리, H0STANC0 → ingest_queue."""
     if _stop_event.is_set():
         return
-    if result is None or getattr(result, "empty", True):
+    if result is None or len(result) == 0:
         return
-    result.columns = [str(c).strip().lower() for c in result.columns]
+    result = result.rename({c: c.strip().lower() for c in result.columns})
     trid = str(tr_id)
     if trid == "H0STMKO0":
         _on_market_status_krx(result)
@@ -8799,8 +8847,7 @@ def _on_result_a2(ws, tr_id, result, data_info):
             TRID_TO_IS_REAL[trid] = is_real
         recv_ts = datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S.%f")
         try:
-            result_pl = pl.from_pandas(result)
-            _ingest_queue.put((result_pl, trid, kind, is_real, recv_ts))
+            _ingest_queue.put((result, trid, kind, is_real, recv_ts))
         except Exception as e:
             logger.warning(f"{ts_prefix()} [a2-WSS] ingest 실패: {e}")
 

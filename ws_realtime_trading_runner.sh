@@ -49,6 +49,9 @@ while :; do
 
     now_ts=$(date +%s)
     _log "launch (#${restart_count}) at $now_hhmm"
+    echo -e "\n\n============================================================" >> "$OUT_LOG"
+    echo "===== [$(date '+%Y-%m-%d %H:%M:%S')] restart #${restart_count} =====" >> "$OUT_LOG"
+    echo "============================================================" >> "$OUT_LOG"
     "${VENV_PY}" -u "${TARGET}" >> "$OUT_LOG" 2>&1
     exit_code=$?
     end_ts=$(date +%s)

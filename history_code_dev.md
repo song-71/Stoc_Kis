@@ -2,6 +2,44 @@
 
 ---
 
+## [2026-04-22] 5c5f403
+- **Category**: feat
+- **Title**: 듀얼 WSS 구조 도입 + VI 감지 개선 + 잔고조회 버그 수정
+- **Files**: `ws_realtime_trading.py`, `ws_realtime_trading_v0421.py`
+- **Changes**:
+  1. **[체결가 수신 로그 개선]**: tr_id 전환 메시지를 실제 체결가 수신 + 체결가 출력 형태로 개선
+  2. **[실시간체결통보 로그]**: mkop 변경 로그에 코드 의미 표시 (00=장중, 20=장마감 등)
+  3. **[VI 감지 개선]**:
+     - `_recent_tick_ts` 딕셔너리로 종목별 최근 5개 틱 타임스탬프 추적
+     - 틱 간격 추적 기반 "갑자기 끊김" 감지 로직 추가 (`_avg_tick_interval`)
+     - 끊김 감지 시 REST VI 조회(`FHPST01390000`, `_inquire_vi_status_single`) → 발동 확인 후 H0STMKO0 동적 구독
+     - `_vi_trigger_info` 딕셔너리로 REST 조회 확인된 VI 발동 정보 캐싱
+  4. **[듀얼 WSS 구조]**:
+     - `run_ws_a2_forever` 함수 신설: syw_2(a2) 계좌 전용 WSS 데몬 스레드
+     - a2 전담: H0STMKO0(장운영정보) 전 종목 + VI 발동 시 예상체결가(H0STCNI0)
+     - a1에서 H0STMKO0 구독 제거 → 종목 데이터 슬롯 추가 확보 (a1은 체결가/VI 예상체결 전담)
+     - `_a2_active_kws`, `_a2_kws_lock`, `_a2_subscribed`, `_a2_approval_key` 전역 변수 추가
+     - `_vi_exp_sub_switch` / `_vi_exp_sub_restore`: a1/a2 역할 명확 분리
+     - a2 미연결 시 a1 fallback 방어 로직 적용
+     - `_mkstatus_sub_add` / `_mkstatus_sub_remove` → a2 위임 함수로 전환
+     - `_a2_mkstatus_sub_add` / `_a2_mkstatus_sub_remove` 함수 신설
+     - `__main__` 진입점에서 `t_a2_wss` 데몬 스레드 시작
+  5. **[잔고조회 버그 수정]**: 보유종목이 없을 때 output2(잔고요약) 미저장 → 출금가능/주문가능 금액이 0으로 표시되던 문제 수정 (summary 저장 시점을 rows 반복 전으로 이동)
+- **Impact**:
+  - a1 WSS 슬롯 여유 확보로 더 많은 종목 실시간 체결 수신 가능
+  - VI 발동 감지 신뢰성 향상 (WSS 끊김 시 REST 보완)
+  - 보유종목 없는 상태에서도 출금가능/주문가능 금액 정상 표시
+  - syw_2 계좌가 H0STMKO0 전담으로 장운영정보 모니터링 역할 분리
+
+## [2026-04-21] dffdf65
+- **Category**: fix
+- **Title**: V2 멀티계좌 config 구조에서 is_holiday() API 호출 실패 버그 수정
+- **Files**: `kis_utils.py`
+- **Changes**:
+  - `_is_open_day_via_api()` 함수에서 config 최상위에 appkey/appsecret이 없는 경우(V2 멀티계좌 구조) `default_user → users[default_user].accounts.main` 경로로 fallback하여 인증키를 가져오도록 수정
+  - fallback 실패 시(KeyError/TypeError) 기존 RuntimeError 경로로 자연스럽게 넘어가도록 처리
+- **Impact**: V2 멀티계좌 config 사용 환경에서 `is_holiday()` 호출 시 발생하던 RuntimeError가 해소됨. `Daily_inquire_vi_status.py`가 2일간 미실행된 버그 해결
+
 ## [2026-04-15] 34e8225
 - **Category**: refactor
 - **Title**: 4.1 안정 버전 복원 + a2 WSS 최소 추가 (0415 불안정 롤백)
@@ -689,3 +727,17 @@
   2. **research-analyst 에이전트** — 로그/문제 분석 → `research_YYMMDD-N.md` 작성, 구현 후 결과 요약 추가
   3. **commit-manager 에이전트** — diff 분석 → 커밋 → `history_code_dev.md` 일괄 처리
 - **영향**: 구독 변동 이력이 월 단위로 영구 보관되어 사후 분석 가능. 에이전트 기반 워크플로우 자동화
+
+## [2026-04-20] af3e7b2
+- **Category**: feat
+- **Title**: 종가매매 전환 안정화 + 텔레그램 로그 파일 추가
+- **Files**: `ws_realtime_trading.py`
+- **Changes**:
+  1. qty=0 제외 종목 로그 출력: `[종가매수준비]` 태그로 상한가 > 배정액 사유 명시
+  2. 15:20 종가전환 시 WSS 재연결 제거 → WSS 유지, subscribe/unsubscribe만 사용 (`_switch_to_closing_codes`)
+  3. 구독 해제 타이밍 15:19:55 → 15:19:10으로 앞당김 + ccnl_krx 전종목 해제 (종가대상 유지 방식 폐기)
+  4. 15:21에 예상체결가(`exp_ccnl_krx`) 신규 구독 추가 + `_exp_sub_done` 플래그로 중복 방지
+  5. 텔레그램 전송 메시지 전용 로그: `out/logs/YYMMDD_telegram.log` 자동 기록 (`_notify(tele=True)` 경로)
+  6. `OVERTIME_SINGLE_PRICE_BUY` 플래그 신설: False 시 16:01 조기 종료 + 관련 시간외 로직 전부 게이팅
+  7. `_backup_log_file()` 추가: 종료 시 `wss_realtime_trading_YYMMDD.out` 날짜별 백업
+- **Impact**: 종가매매 전환 시 WSS 재연결 없이 안정적으로 구독 전환. 텔레그램 메시지 별도 파일로 사후 추적 가능

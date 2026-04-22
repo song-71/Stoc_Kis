@@ -182,7 +182,7 @@ sudo sysctl -p
 
 ### 7-1. KIS 공식 GitHub 확인 결과
 
-- https://github.com/koreainvestment/open-trading-api
+    https://github.com/koreainvestment/open-trading-api
 - 4.2 공지는 Strategy Builder / Backtester / AI Extension **신규 추가** 안내이며, WebSocket 프로토콜 자체 변경은 아님
 - 그러나 **KIS 공식 WebSocket 예제 코드에서 결정적인 차이점** 발견
 

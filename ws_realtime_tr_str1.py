@@ -1,25 +1,27 @@
 """
-Str1 실전 실시간 매도 전략 모듈
+Str1 실전 실시간 매도 전략 + 상한가 근접 매수 전략 모듈
 
-전략 개요:
-  - 08:29~09:00 (사전 모니터링): 예상체결가(antc_prce)가 전일종가(매수가) 이하
-    → 시초가 시장가 매도 주문 (09:00 동시호가에 체결)
-    → 예상가 복귀(prdy_ctrt>=0 또는 antc>=매수가) 시 주문 취소
-  - 09:00 이후 (정규장): 다음 조건 중 하나 충족 시 즉시 시장가 매도
-    ① bidp1 < wghn_avrg_stck_prc  (가중평균 하락)
-    ② Up_trend 지속 상태에서 ma500 < ma2000 데드크로스 → 매도 (상태 기반)
-       - Up_trend(정배열): ma50 > ma200 > ma300 > ma500 > ma2000 > wghn_avrg
-       - up_trend를 지속 상태로 추적, 매도조건은 매도 성공까지 유지
-       - check_realtime_sell()에서 통합 판단 + up_trend 상태 반환
-    ③ prdy_ctrt < 0  (전일종가 이하 하락)
-  - 종목당 1회 매도, 매도 후 종료
-  - 수수료·세금 포함 실수익 계산
+== 기존 전략 ==
+- 08:29~09:00 사전 모니터링 매도 / 09:00 이후 실시간 매도 (check_realtime_sell)
+- VI 매수 / VI 매도 (vi_buy_strategy / check_vi_sell)
+- 수수료·세금 포함 실수익 계산 (calc_sell_pnl)
 
-※ 이 모듈은 순수 전략 판단 함수만 포함 (API 호출 없음).
-   실제 주문·상태 관리는 ws_realtime_trading.py에서 수행.
+== 상한가 근접 매수 전략 (문서: docs/01. up_limit_buy_str_260420.md) ==
+- 25~28% 구간 다중 필터 AND 통과 시 매수
+  - uplimit_approach_buy_signal(): 13개 필터 pass/fail 판정
+  - uplimit_approach_exit(): 단계적 청산 (29%→28% 절반, 27% 전량) + 손절/타임아웃
+  - calc_uplimit_qty(): 수량 계산 (수수료 0.5% 버퍼)
+  - calc_entry_price(): 지정가 매수 가격 (현재가 + 2틱)
+
+== 종가매수 폭락 방지 필터 (문서: docs/02. Top30_str.md Part B) ==
+- closing_crash_filter_signal(): 외국인/체결강도/거래대금 기반 차단
+- closing_next_day_exit(): 익일 시초 폭락 감지 시 시장가 매도
+
+※ 이 모듈은 순수 전략 판단 함수만 포함 (API 호출·파일 I/O 없음).
+   실제 주문·상태 관리는 ws_realtime_trading.py 에서 수행.
 """
 from __future__ import annotations
-from kis_utils import round_to_tick                    # 호가단위 유틸 (kis_utils 통합)
+from kis_utils import round_to_tick, price_plus_n_ticks  # 호가단위 유틸 (kis_utils 통합)
 
 # ── 수수료·세금 상수 ──────────────────────────────────────────────────────────
 FEE_RATE_MARKET_BUY  = 0.0015   # 시장가 매수 수수료+세금+슬리피지 0.15%
@@ -289,6 +291,313 @@ def calc_sell_pnl(
         "pnl":      pnl,
         "ret_pct":  ret_pct,
     }
+
+
+# =============================================================================
+# 상한가 근접 매수 전략 (문서: docs/01. up_limit_buy_str_260420.md)
+# =============================================================================
+
+# 진입 필터 임계값 (호출측에서 override 가능)
+UPLIMIT_FILTER_CTRT_MIN = 25.0          # 진입 하한
+UPLIMIT_FILTER_CTRT_MAX = 29.0          # 진입 상한 (29%+ 는 EMERGENCY 영역)
+UPLIMIT_FILTER_PREV_CTRT_MAX = 10.0     # 전일 등락률 상한 (작전주 차단)
+UPLIMIT_FILTER_GAP_MIN = 5.0            # 시가 갭 하한 (%)
+UPLIMIT_FILTER_VOL_SURGE_MIN = 3.0      # 직전 5분 거래량 / 당일 분당 평균 배수
+UPLIMIT_FILTER_TIME_TO_25_MAX = 60.0    # 25% 돌파까지 최대 분
+UPLIMIT_FILTER_VOLA_10D_MAX = 0.05      # 10일 일봉 std 상한
+UPLIMIT_FILTER_ASK_VS_BID_MAX = 3.0     # 매도잔량/매수잔량 상한 (매도벽)
+UPLIMIT_FILTER_VOLUME_POWER_MIN = 120.0 # 체결강도 하한
+UPLIMIT_FILTER_MIN_VOLUME = 100_000     # 당일 최소 누적 거래량
+UPLIMIT_FILTER_MIN_PRICE = 1000         # 저가주 제외
+
+# Exit 임계값
+UPLIMIT_EXIT_UPPER_LIMIT = 29.0         # 상한가 근접 인정 (도달 기록 시작)
+UPLIMIT_EXIT_HALF_THRESHOLD = 28.0      # 29% 도달 후 이 값 하회 시 절반 매도
+UPLIMIT_EXIT_FULL_THRESHOLD = 27.0      # 27% 하회 시 전량 매도
+UPLIMIT_EXIT_STOP_LOSS_PCT = 0.03       # -3% 손절
+UPLIMIT_EXIT_CRASH_GUARD_PCT = 0.05     # 상한가 이력 있어도 -5% 이탈 시 강제 청산
+UPLIMIT_EXIT_TIMEOUT_MIN = 10.0         # 매수 후 N분 경과 시 등락률 체크
+UPLIMIT_EXIT_TIMEOUT_CTRT = 25.0        # 타임아웃 시점 이 값 미만이면 청산
+UPLIMIT_EXIT_TRAIL_STOP_PCT = 0.02      # 상한가 미도달 시 트레일링
+
+
+def uplimit_approach_buy_signal(
+    prdy_ctrt: float,
+    prev_close: float,
+    stck_oprc: float,
+    acml_vol: float,
+    day_avg_vol_per_min: float,
+    last_5m_avg_vol_per_min: float,
+    min_since_open: float,
+    min_since_25pct_cross: float | None,
+    vola_10d: float | None,
+    bid_sum_top5: float,
+    ask_sum_top5: float,
+    volume_power: float | None,
+    frgn_3d_net: float | None,
+    prev_day_prdy_ctrt: float,
+    already_holding: bool,
+    now_hm: tuple[int, int],
+    today_buy_count: int,
+    max_daily_buys: int = 3,
+) -> tuple[bool, str, float]:
+    """
+    상한가 근접 매수 진입 판단. 13개 필터 AND — 하나라도 실패 시 매수 안 함.
+
+    Returns (should_buy, reason, strength):
+      should_buy : True 면 매수 주문
+      reason     : 통과/실패 사유
+      strength   : 1.0(통과) 또는 0.0(실패). 시드가 460K로 작아 단일 등급 운영.
+    """
+    # F1. 시간대 (09:30 ≤ now < 14:50)
+    h, m = now_hm
+    if h < 9 or (h == 9 and m < 30):
+        return False, "uplimit_F1_시간대전", 0.0
+    if h >= 15 or (h == 14 and m >= 50):
+        return False, "uplimit_F1_시간대후", 0.0
+
+    # F2. 이미 보유 중
+    if already_holding:
+        return False, "uplimit_F2_보유중", 0.0
+
+    # F3. 등락률 구간
+    if prdy_ctrt < UPLIMIT_FILTER_CTRT_MIN or prdy_ctrt >= UPLIMIT_FILTER_CTRT_MAX:
+        return False, f"uplimit_F3_구간({prdy_ctrt:.2f})", 0.0
+
+    # F4. 전일 등락률 < 10% (작전주/연속급등 차단 — 백테스트 1순위)
+    if prev_day_prdy_ctrt >= UPLIMIT_FILTER_PREV_CTRT_MAX:
+        return False, f"uplimit_F4_전일급등({prev_day_prdy_ctrt:.1f}%)", 0.0
+
+    # F5. 저가주 제외
+    if prev_close < UPLIMIT_FILTER_MIN_PRICE:
+        return False, f"uplimit_F5_저가주({int(prev_close)})", 0.0
+
+    # F6. 시가 갭 ≥ +5%
+    if prev_close <= 0 or stck_oprc <= 0:
+        return False, "uplimit_F6_가격누락", 0.0
+    gap_pct = (stck_oprc / prev_close - 1) * 100
+    if gap_pct < UPLIMIT_FILTER_GAP_MIN:
+        return False, f"uplimit_F6_갭부족({gap_pct:+.1f}%)", 0.0
+
+    # F7. 최소 누적 거래량
+    if acml_vol < UPLIMIT_FILTER_MIN_VOLUME:
+        return False, f"uplimit_F7_거래량부족({int(acml_vol):,})", 0.0
+
+    # F8. 거래량 서지 (직전5분 평균 ≥ 당일 분당 평균 × 3)
+    if day_avg_vol_per_min <= 0 or last_5m_avg_vol_per_min <= 0:
+        return False, "uplimit_F8_서지산출불가", 0.0
+    surge_ratio = last_5m_avg_vol_per_min / day_avg_vol_per_min
+    if surge_ratio < UPLIMIT_FILTER_VOL_SURGE_MIN:
+        return False, f"uplimit_F8_서지부족(x{surge_ratio:.2f})", 0.0
+
+    # F9. 25% 도달 시간 — 60분 이내
+    if min_since_25pct_cross is None:
+        return False, "uplimit_F9_돌파시각누락", 0.0
+    if min_since_25pct_cross > UPLIMIT_FILTER_TIME_TO_25_MAX:
+        return False, f"uplimit_F9_돌파지연({min_since_25pct_cross:.0f}분)", 0.0
+
+    # F10. 변동성 ≤ 5%
+    if vola_10d is None:
+        return False, "uplimit_F10_변동성누락", 0.0
+    if vola_10d > UPLIMIT_FILTER_VOLA_10D_MAX:
+        return False, f"uplimit_F10_고변동({vola_10d:.3f})", 0.0
+
+    # F11. 호가 매도벽 (매도잔량 < 매수잔량 × 3)
+    if bid_sum_top5 <= 0:
+        return False, "uplimit_F11_호가누락", 0.0
+    if ask_sum_top5 >= bid_sum_top5 * UPLIMIT_FILTER_ASK_VS_BID_MAX:
+        return False, f"uplimit_F11_매도벽(ask/bid={ask_sum_top5/bid_sum_top5:.2f})", 0.0
+
+    # F12. 체결강도
+    if volume_power is None:
+        return False, "uplimit_F12_VP누락", 0.0
+    if volume_power < UPLIMIT_FILTER_VOLUME_POWER_MIN:
+        return False, f"uplimit_F12_VP약({volume_power:.0f})", 0.0
+
+    # F13. 외국인 — 3일 순매도만 차단, 데이터 없음은 허용
+    if frgn_3d_net is not None and frgn_3d_net < 0:
+        return False, f"uplimit_F13_외인매도({int(frgn_3d_net):,})", 0.0
+
+    # 일일 매수 한도
+    if today_buy_count >= max_daily_buys:
+        return False, f"uplimit_일한도초과({today_buy_count}/{max_daily_buys})", 0.0
+
+    reason = (
+        f"uplimit_매수(ctrt{prdy_ctrt:.1f}%,갭{gap_pct:+.1f}%,"
+        f"서지x{surge_ratio:.1f},돌파{min_since_25pct_cross:.0f}분,"
+        f"vol{vola_10d:.3f},VP{volume_power:.0f},"
+        f"bid/ask={bid_sum_top5/max(ask_sum_top5,1):.1f})"
+    )
+    return True, reason, 1.0
+
+
+def uplimit_approach_exit(
+    prdy_ctrt: float,
+    bidp1: float,
+    buy_price: float,
+    max_prdy_ctrt: float,
+    highest_since_buy: float,
+    minutes_since_buy: float,
+    half_sold: bool,
+    now_hm: tuple[int, int],
+) -> tuple[str, str, float]:
+    """
+    상한가 근접 매수 포지션의 단계적 Exit 판단.
+
+    Returns (action, reason, sell_ratio):
+      action     : "hold" | "sell_half" | "sell_all"
+      sell_ratio : 0.0 | 0.5 | 1.0
+    """
+    if buy_price <= 0 or bidp1 <= 0:
+        return "hold", "uplimit_exit_가격누락", 0.0
+
+    reached_upper = max_prdy_ctrt >= UPLIMIT_EXIT_UPPER_LIMIT
+
+    # 1) 마감 청산 (최우선)
+    h, m = now_hm
+    if h == 15 and m >= 10:
+        return "sell_all", "uplimit_마감청산(15:10+)", 1.0
+
+    # 2) 손실 방어 (단계적 청산보다 우선)
+    #    2-a) 상한가 도달 후 대폭락 -5% → 단계적 청산 건너뛰고 전량 (매우 빠른 낙하)
+    if reached_upper and bidp1 <= buy_price * (1 - UPLIMIT_EXIT_CRASH_GUARD_PCT):
+        return "sell_all", f"uplimit_대폭락방지-5%({bidp1}/{buy_price})", 1.0
+    #    2-b) 고정 손절 -3% (매수가 대비, 상한가 도달 여부 무관)
+    if bidp1 <= buy_price * (1 - UPLIMIT_EXIT_STOP_LOSS_PCT):
+        return "sell_all", f"uplimit_손절-3%({bidp1}/{buy_price})", 1.0
+
+    # 3) 단계적 청산 — 상한가(29%) 도달 이력 있음 (정상 이익 실현)
+    if reached_upper:
+        # 3-a) 27% 하회 → 전량
+        if prdy_ctrt < UPLIMIT_EXIT_FULL_THRESHOLD:
+            return "sell_all", f"uplimit_27하회전량({prdy_ctrt:.1f}%)", 1.0
+        # 3-b) 28% 하회 && 아직 절반 매도 안 함 → 절반
+        if (not half_sold) and prdy_ctrt < UPLIMIT_EXIT_HALF_THRESHOLD:
+            return "sell_half", f"uplimit_29→28하회절반({prdy_ctrt:.1f}%)", 0.5
+
+    # 4) 타임아웃 — 10분 경과 + 25% 미만
+    if minutes_since_buy >= UPLIMIT_EXIT_TIMEOUT_MIN and prdy_ctrt < UPLIMIT_EXIT_TIMEOUT_CTRT:
+        return "sell_all", f"uplimit_타임아웃({prdy_ctrt:.1f}%,{minutes_since_buy:.1f}분)", 1.0
+
+    # 5) 트레일링 (상한가 미도달일 때만 적용 — 도달 시엔 단계적 청산이 우선)
+    if (not reached_upper) and highest_since_buy > 0:
+        trail_level = highest_since_buy * (1 - UPLIMIT_EXIT_TRAIL_STOP_PCT)
+        if bidp1 <= trail_level and highest_since_buy > buy_price:
+            return "sell_all", f"uplimit_트레일링-2%(고가{int(highest_since_buy):,})", 1.0
+
+    return "hold", "", 0.0
+
+
+def calc_uplimit_qty(avail_cash: float, buy_price: float, market: str = "KOSPI") -> int:
+    """수량 계산. 수수료 0.5% 버퍼 반영."""
+    if avail_cash <= 0 or buy_price <= 0:
+        return 0
+    rounded = round_to_tick(buy_price, market)
+    if rounded <= 0:
+        return 0
+    return max(0, int(avail_cash * 0.995 / rounded))
+
+
+def calc_entry_price(current_price: float, market: str = "KOSPI", n_ticks: int = 2) -> float:
+    """지정가 매수 가격 = 현재가 + N틱. VI 발동 중이면 호출측에서 상한가로 override."""
+    if current_price <= 0:
+        return 0.0
+    return price_plus_n_ticks(current_price, n_ticks, market)
+
+
+# =============================================================================
+# 종가매수 폭락 방지 필터 (문서: docs/02. Top30_str.md Part B)
+# =============================================================================
+
+CLOSING_FILTER_FRGN_BLOCK = -1.0           # 외국인 3일 순매수 < 0 이면 차단 (음수 기준)
+CLOSING_FILTER_VP_MIN = 100.0              # 체결강도 하한 (강제 차단)
+CLOSING_FILTER_TRADE_AMT_MIN = 5_000_000_000  # 거래대금 하한 50억
+CLOSING_FILTER_PASS_STRENGTH = 0.60        # 통과 임계값
+
+
+def closing_crash_filter_signal(
+    prdy_ctrt: float,
+    stck_prpr: float,
+    stck_hgpr: float,
+    prdy_sign: str,
+    volume_power: float | None,
+    acml_tr_pbmn: float,
+    uplimit_bid_ratio: float | None,
+    frgn_3d_net: float | None,
+    vola_10d: float | None,
+    institution_net_today: float | None = None,
+) -> tuple[bool, str, float]:
+    """
+    15:18 종가매수 후보 선정 시 폭락 방지 필터.
+
+    Returns (pass_filter, reason, strength):
+      pass_filter : True 면 종가매수 대상 유지
+      strength    : 최종 강도 (0.5 기준, 0.60 이상 통과)
+    """
+    # 기본 컷 (기존 closing_buy 조건)
+    if prdy_sign not in ("1", "2"):
+        return False, f"closing_prdy_sign({prdy_sign})", 0.0
+    if prdy_ctrt < 20.0:
+        return False, f"closing_등락률부족({prdy_ctrt:.1f}%)", 0.0
+    if stck_hgpr > 0 and (stck_prpr / stck_hgpr) < 0.97:
+        return False, f"closing_고가대비약({stck_prpr}/{stck_hgpr})", 0.0
+
+    # 강제 차단 (사용자 결정)
+    if acml_tr_pbmn < CLOSING_FILTER_TRADE_AMT_MIN:
+        return False, f"closing_거래대금부족({int(acml_tr_pbmn/1e8)}억)", 0.0
+    if volume_power is None:
+        return False, "closing_VP누락", 0.0
+    if volume_power < CLOSING_FILTER_VP_MIN:
+        return False, f"closing_VP약({volume_power:.0f})", 0.0
+    if frgn_3d_net is not None and frgn_3d_net < 0:
+        return False, f"closing_외인매도({int(frgn_3d_net):,})", 0.0
+
+    # Signal Strength (0.5 기준, 통과 시 0.60+)
+    s = 0.50
+    detail = [f"VP{volume_power:.0f}"]
+
+    if frgn_3d_net is not None and frgn_3d_net > 0:
+        s += 0.15
+        detail.append("외인매수")
+    if volume_power >= 150.0:
+        s += 0.10
+        detail.append("VP강")
+    if uplimit_bid_ratio is not None and uplimit_bid_ratio >= 0.20:
+        s += 0.10
+        detail.append(f"상잔{uplimit_bid_ratio:.2f}")
+    elif uplimit_bid_ratio is not None and uplimit_bid_ratio < 0.05:
+        s -= 0.10
+    if vola_10d is not None and vola_10d < 0.02:
+        s += 0.10
+        detail.append("저변동")
+    if institution_net_today is not None and institution_net_today > 0:
+        s += 0.05
+
+    if s >= CLOSING_FILTER_PASS_STRENGTH:
+        return True, f"closing_통과({','.join(detail)})/s={s:.2f}", s
+    return False, f"closing_약함({','.join(detail)})/s={s:.2f}", s
+
+
+def closing_next_day_exit(
+    antc_prce: float,
+    buy_price: float,
+    is_opening_tick: bool,
+) -> tuple[bool, str]:
+    """
+    종가매수 보유 종목 익일 시초 폭락 감지.
+
+    is_opening_tick=False (08:30~09:00 동시호가): 예상가 < 매수가 × 0.97 → 시초 시장가 매도
+    is_opening_tick=True  (09:00 시초 체결 직후): 시초가 < 매수가 × 0.95 → 즉시 시장가 매도
+    """
+    if buy_price <= 0 or antc_prce <= 0:
+        return False, ""
+    if not is_opening_tick:
+        if antc_prce < buy_price * 0.97:
+            return True, f"closing_익일갭손절예상({antc_prce}/{buy_price})"
+        return False, ""
+    if antc_prce < buy_price * 0.95:
+        return True, f"closing_익일시초손절({antc_prce}/{buy_price})"
+    return False, ""
 
 
 # ── 핫스왑: 이 파일을 직접 실행하면 config에 전략 변경 요청 기록 ──────────────

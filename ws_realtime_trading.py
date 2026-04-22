@@ -76,6 +76,24 @@ VI_TRADE_MODE = "off"
 # 상한가 스톱 연속 이탈 확인 틱 수 (서버 스톱지정가 대신 클라이언트에서 N틱 연속 확인 후 매도)
 STOP_LIMIT_CONFIRM_TICKS = 30
 
+# ─────────────────────────────────────────────────────────────────────────────
+# [v_1 신규] 상한가 근접 매수 전략 (문서: docs/01. up_limit_buy_str_260420.md)
+#   - 25~28% 구간 다중 필터 AND 통과 시 매수
+#   - 단계적 청산: 29% 도달 → 28% 하회 절반, 27% 하회 전량
+#   - 손절 -3%, 상한가 도달 후 대폭락 -5% 강제 청산
+#   - 가용현금 전량 1종목 집중 (460K 시드 가정, 동시 보유 1종목)
+UPLIMIT_BUY_ENABLED = True          # False: 전략 비활성 (회귀 테스트용)
+UPLIMIT_MAX_DAILY_BUYS = 3          # 일일 신규 매수 최대 횟수
+UPLIMIT_BUY_START = dtime(9, 30)    # 매수 허용 시작
+UPLIMIT_BUY_END = dtime(14, 50)     # 신규 매수 금지
+UPLIMIT_CLOSE_TIME = dtime(15, 10)  # 미도달 청산 시각 (Exit 내 처리)
+UPLIMIT_MAX_POSITIONS = 1           # 동시 보유 상한
+UPLIMIT_VP_TTL_SEC = 30             # 체결강도 캐시 TTL
+UPLIMIT_ENTRY_TICKS = 2             # 매수 지정가 = 현재가 + N틱
+
+# [v_1 신규] 종가매수 폭락 방지 필터 (문서: docs/02. Top30_str.md Part B)
+CLOSING_CRASH_FILTER_ENABLED = True
+
 # 직전 영업일 종가매수 선정 종목을 당일 base codes로 자동 사용
 AUTO_CODE_FROM_PREV_CLOSING = True
 
@@ -359,11 +377,18 @@ sys.modules["kis_auth"] = ka
 
 from domestic_stock_functions_ws import *  # noqa: F403,E402
 import json  # noqa: E402
-from kis_utils import is_holiday, load_config, load_symbol_master, save_config, calc_limit_up_price, price_minus_one_tick, print_table, KRX_code_batch  # noqa: E402
-from ws_realtime_tr_str1 import (  # noqa: E402
+from kis_utils import is_holiday, load_config, load_symbol_master, save_config, calc_limit_up_price, price_minus_one_tick, price_plus_n_ticks, print_table, KRX_code_batch  # noqa: E402
+from ws_realtime_tr_str1 import (  # noqa: E402  (상한가 근접 매수 + 종가 폭락 필터 포함)
     check_opening_call_auction_sell, check_opening_call_auction_cancel, check_realtime_sell,
     vi_buy_strategy, vi_should_cancel, check_vi_sell,
     calc_sell_pnl, FEE_RATE_MARKET_SELL,
+    # 상한가 근접 매수 전략 (docs/01. up_limit_buy_str_260420.md):
+    uplimit_approach_buy_signal, uplimit_approach_exit,
+    closing_crash_filter_signal, closing_next_day_exit,
+    calc_uplimit_qty, calc_entry_price,
+)
+from kis_signal_apis import (  # noqa: E402
+    fetch_volume_power, fetch_frgn_3day_net,
 )
 from kis_API_ohlcv_download_Utils import DEFAULT_BASE_URL, KisClient, KisConfig  # noqa: E402
 from symulation.Select_Tr_target_list_symulation_pdy_ctrt import get_closing_buy_candidates  # noqa: E402
@@ -2071,6 +2096,7 @@ def _check_sell_by_prdy_ctrt_periodic() -> None:
             for code, st in _str1_sell_state.items()
             if not st.get("sold") and not st.get("sell_ordered") and not st.get("opening_call_auction_ordered")
             and code not in _no_sell_codes
+            and code not in _uplimit_positions  # [v_1] 상한가 근접 매수 종목은 EMERGENCY/3%손절 제외 (별도 Exit 로직)
         ]
 
     for code, st in targets:
@@ -2223,6 +2249,27 @@ _ema_sell_cond: dict[str, bool] = {}
 # code → {buy_price, buy_ts, qty, highest, sold, name, ordno}
 _vi_positions: dict[str, dict] = {}
 
+# ── [v_1 신규] 상한가 근접 매수 포지션 추적 ────────────────────────────────
+# code → {buy_price, buy_ts, qty, ordno, max_prdy_ctrt, highest_since_buy,
+#         half_sold, name, status}
+_uplimit_positions: dict[str, dict] = {}
+_uplimit_buy_pending: dict[str, str] = {}   # code → ordno (매수 주문 송신 후 체결 대기)
+_uplimit_exit_pending: dict[str, str] = {}  # code → ordno (매도 주문 송신 후 체결 대기)
+_uplimit_today_buy_count: int = 0
+_uplimit_blacklist: set[str] = set()        # 당일 재매수 금지 (손절/타임아웃 후)
+_uplimit_state_lock = threading.Lock()
+_uplimit_state_last_save_ts: float = 0.0
+
+# Signal Strength 보조 캐시
+_uplimit_day_vol_bucket: dict[str, list] = {}        # code → [(minute_ts_int, minute_vol), ...] (slide 5분)
+_uplimit_prev_min_vol: dict[str, tuple[int, float]] = {}  # code → (cur_minute_ts, cur_minute_acml_vol) — 분봉 경계 계산용
+_uplimit_25pct_cross_ts: dict[str, datetime] = {}    # code → 25% 최초 돌파 시각
+_uplimit_vola_10d: dict[str, float] = {}             # code → 10일 로그수익률 std (장 시작 전 계산)
+_uplimit_prev_day_ctrt: dict[str, float] = {}        # code → 전일 등락률
+_uplimit_volume_power: dict[str, tuple[float, float]] = {}  # code → (value, fetched_ts)
+_uplimit_frgn_3d: dict[str, float] = {}              # code → 외국인 3일 순매수
+_uplimit_precache_done: bool = False
+
 # ── 장전 동시호가 모니터링 ──────────────────────────────────────────────────
 # code → {antc_prce, prdy_ctrt, buy_price, in_sell_cond, first_sell_ts, first_printed}
 _opening_call_auction_watch: dict[str, dict] = {}
@@ -2260,6 +2307,13 @@ def _on_ccnl_notice_filled(df, recv_ts: str) -> None:
                 except Exception:
                     pass
             name_fill = code_name_map.get(code, "") or code
+
+            # [v_1] uplimit 체결 처리 우선 (매수/매도 양쪽)
+            if code in _uplimit_positions or code in _uplimit_buy_pending or code in _uplimit_exit_pending:
+                try:
+                    _handle_uplimit_ccnl_fill(code, seln, qty, fill_pr, name_fill, recv_ts)
+                except Exception as _e:
+                    logger.warning(f"{ts_prefix()} [uplimit_ccnl] {name_fill}({code}) 처리 오류: {_e}")
 
             if seln in ("01", "1"):  # 매도
                 _closing_filled_by_code[code] = max(0, _closing_filled_by_code.get(code, 0) - qty)
@@ -2647,6 +2701,7 @@ def _prepare_closing_buy_orders() -> None:
 
         # 종목별 전일종가·상한가 사전 조회
         code_prices: dict[str, dict] = {}
+        _filtered_out: list[tuple[str, str]] = []  # [v_1] 폭락 필터로 제외된 종목 (name, reason)
         for code in _closing_codes:
             info = _closing_code_info.get(code, {})
             prev_close = info.get("prev_close") or 0
@@ -2661,12 +2716,57 @@ def _prepare_closing_buy_orders() -> None:
             if prev_close <= 0:
                 logger.warning(f"{ts_prefix()} [종가매수준비] {code} 전일종가 없음, 스킵")
                 continue
+
+            name = info.get("name", code_name_map.get(code, code))
+
+            # [v_1] 폭락 방지 필터 적용 (CLOSING_CRASH_FILTER_ENABLED)
+            if CLOSING_CRASH_FILTER_ENABLED:
+                try:
+                    resp = client.inquire_price(code) or {}
+                    prdy_sign = str(resp.get("prdy_vrss_sign") or "").strip()
+                    prdy_ctrt = float(str(resp.get("prdy_ctrt") or 0).replace(",", "") or 0)
+                    stck_prpr = float(str(resp.get("stck_prpr") or 0).replace(",", "") or 0)
+                    stck_hgpr = float(str(resp.get("stck_hgpr") or 0).replace(",", "") or 0)
+                    acml_tr_pbmn = float(str(resp.get("acml_tr_pbmn") or 0).replace(",", "") or 0)
+                    volume_power = None
+                    try:
+                        vp_raw = resp.get("tday_rltv") or resp.get("prdy_vrss_rltv_rate")
+                        if vp_raw is not None:
+                            volume_power = float(str(vp_raw).replace(",", ""))
+                    except Exception:
+                        pass
+                    # 보조 데이터
+                    frgn_3d = fetch_frgn_3day_net(client, code)
+                    vola_10d = _uplimit_vola_10d.get(code)
+                    passed, freason, fstr = closing_crash_filter_signal(
+                        prdy_ctrt=prdy_ctrt, stck_prpr=stck_prpr, stck_hgpr=stck_hgpr,
+                        prdy_sign=prdy_sign, volume_power=volume_power,
+                        acml_tr_pbmn=acml_tr_pbmn, uplimit_bid_ratio=None,
+                        frgn_3d_net=frgn_3d, vola_10d=vola_10d,
+                        institution_net_today=None,
+                    )
+                    if not passed:
+                        _filtered_out.append((f"{name}({code})", freason))
+                        logger.info(f"{ts_prefix()} [종가매수필터] 제외 {name}({code}) {freason}")
+                        continue
+                    else:
+                        logger.info(f"{ts_prefix()} [종가매수필터] 통과 {name}({code}) {freason}")
+                except Exception as _fe:
+                    logger.warning(f"{ts_prefix()} [종가매수필터] {name}({code}) 필터 오류(통과 처리): {_fe}")
+
             code_prices[code] = {
                 "prev_close": prev_close,
                 "limit_up": calc_limit_up_price(prev_close),
-                "name": info.get("name", code_name_map.get(code, code)),
+                "name": name,
                 "prdy_ctrt": float(info.get("prdy_ctrt", _last_prdy_ctrt.get(code, 0.0))),
             }
+
+        if _filtered_out:
+            _notify(
+                f"{ts_prefix()} [종가매수필터] 폭락방지 제외 {len(_filtered_out)}건: "
+                + ", ".join(f"{n}[{r}]" for n, r in _filtered_out[:10]),
+                tele=True,
+            )
 
         # 계좌별 주문 준비
         for acct in accounts:
@@ -5640,6 +5740,499 @@ def _try_vi_buy_cancel(code: str, name: str, antc_prce: float, stck_prpr: float)
         logger.error(f"[VI매수취소] {name}({code}) 취소 실패: {e}")
 
 
+# =============================================================================
+# [v_1 신규] 상한가 근접 매수 — 헬퍼 / 매수 / 청산
+# =============================================================================
+
+def _uplimit_state_path(yymmdd: str | None = None):
+    """상태 파일 경로: data/fetch_top_list/uplimit_buy_state_{yymmdd}.json."""
+    if yymmdd is None:
+        yymmdd = datetime.now(KST).strftime("%y%m%d")
+    return TOP_RANK_OUT_DIR / f"uplimit_buy_state_{yymmdd}.json"
+
+
+def _save_uplimit_state(force: bool = False) -> None:
+    """uplimit 전략 상태를 JSON 으로 저장 (throttled 5s)."""
+    global _uplimit_state_last_save_ts
+    now_ts = time.time()
+    if not force and (now_ts - _uplimit_state_last_save_ts) < 5.0:
+        return
+    try:
+        path = _uplimit_state_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with _uplimit_state_lock:
+            data = {
+                "date": datetime.now(KST).strftime("%y%m%d"),
+                "updated_at": datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S"),
+                "positions": {
+                    c: {k: (v.isoformat() if isinstance(v, datetime) else v)
+                        for k, v in p.items()}
+                    for c, p in _uplimit_positions.items()
+                },
+                "buy_pending": dict(_uplimit_buy_pending),
+                "exit_pending": dict(_uplimit_exit_pending),
+                "today_buy_count": _uplimit_today_buy_count,
+                "blacklist": sorted(_uplimit_blacklist),
+            }
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        _uplimit_state_last_save_ts = now_ts
+    except Exception as e:
+        logger.warning(f"{ts_prefix()} [uplimit] 상태 저장 실패: {e}")
+
+
+def _restore_uplimit_state_on_startup() -> None:
+    """당일 uplimit_buy_state_*.json 을 메모리로 복원."""
+    global _uplimit_today_buy_count
+    try:
+        path = _uplimit_state_path()
+        if not path.exists():
+            return
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        with _uplimit_state_lock:
+            for c, p in (data.get("positions") or {}).items():
+                # buy_ts 복원
+                bt = p.get("buy_ts")
+                if isinstance(bt, str):
+                    try:
+                        p["buy_ts"] = datetime.fromisoformat(bt)
+                    except Exception:
+                        p["buy_ts"] = datetime.now(KST)
+                _uplimit_positions[str(c).zfill(6)] = p
+            for c, o in (data.get("buy_pending") or {}).items():
+                _uplimit_buy_pending[str(c).zfill(6)] = str(o)
+            for c, o in (data.get("exit_pending") or {}).items():
+                _uplimit_exit_pending[str(c).zfill(6)] = str(o)
+            _uplimit_today_buy_count = int(data.get("today_buy_count") or 0)
+            for c in (data.get("blacklist") or []):
+                _uplimit_blacklist.add(str(c).zfill(6))
+        logger.info(
+            f"{ts_prefix()} [uplimit] 상태 복원: positions={len(_uplimit_positions)}, "
+            f"buy_pending={len(_uplimit_buy_pending)}, today_buy_count={_uplimit_today_buy_count}"
+        )
+    except Exception as e:
+        logger.warning(f"{ts_prefix()} [uplimit] 상태 복원 실패: {e}")
+
+
+def _precache_uplimit_signals() -> None:
+    """장 시작 전 10일 변동성/전일 등락률/외국인 캐시 일괄 구축.
+    감시 대상 = 현재 구독 중인 codes ∪ 전일 closing_buy_state.codes.
+    """
+    global _uplimit_precache_done
+    if _uplimit_precache_done:
+        return
+    try:
+        target_codes: set[str] = set()
+        with _lock:
+            target_codes.update(c.zfill(6) for c in codes)
+        # 전일 closing_buy 후보 추가
+        try:
+            prev_state = _load_closing_buy_state()
+            if prev_state:
+                for c in prev_state.get("codes") or []:
+                    target_codes.add(str(c).zfill(6))
+        except Exception:
+            pass
+        if not target_codes:
+            _uplimit_precache_done = True
+            return
+
+        logger.info(f"{ts_prefix()} [uplimit_precache] 대상 {len(target_codes)} 종목 사전 캐시 시작")
+
+        # 10일 일봉 변동성 + 전일 등락률 — kis_1d parquet 재사용 시도
+        try:
+            import polars as _pl
+            from pathlib import Path as _Path
+            daily_path = _Path("/home/ubuntu/Stoc_Kis/data/fetch_daily_KRX_ohlcv/kis_1d_parquet")
+            if daily_path.exists():
+                # 최근 20일 일봉 (buffered) 로드
+                import glob
+                files = sorted(glob.glob(str(daily_path / "*.parquet")))[-20:]
+                if files:
+                    df = _pl.concat([_pl.read_parquet(f) for f in files])
+                    if "code" in df.columns and "close" in df.columns:
+                        import math
+                        for code in target_codes:
+                            sub = df.filter(_pl.col("code") == code).sort("date")
+                            if sub.height < 11:
+                                continue
+                            closes = sub.tail(11).get_column("close").to_list()
+                            if len(closes) < 11:
+                                continue
+                            rets = []
+                            for i in range(1, len(closes)):
+                                if closes[i-1] > 0 and closes[i] > 0:
+                                    rets.append(math.log(closes[i] / closes[i-1]))
+                            if len(rets) >= 5:
+                                mean = sum(rets) / len(rets)
+                                var = sum((x - mean) ** 2 for x in rets) / len(rets)
+                                _uplimit_vola_10d[code] = math.sqrt(var)
+                            # 전일 등락률
+                            if len(closes) >= 2 and closes[-2] > 0:
+                                _uplimit_prev_day_ctrt[code] = (closes[-1] / closes[-2] - 1) * 100
+        except Exception as e:
+            logger.warning(f"{ts_prefix()} [uplimit_precache] 일봉 기반 변동성 계산 실패: {e}")
+
+        # 외국인 3일 순매수 — REST 일괄 (rate limit 고려)
+        client = _top_client or _init_top_client()
+        fetched = 0
+        for code in list(target_codes)[:40]:  # 과도한 호출 방지
+            try:
+                v = fetch_frgn_3day_net(client, code)
+                if v is not None:
+                    _uplimit_frgn_3d[code] = v
+                    fetched += 1
+                time.sleep(0.05)
+            except Exception:
+                pass
+
+        logger.info(
+            f"{ts_prefix()} [uplimit_precache] 완료: "
+            f"vola_10d={len(_uplimit_vola_10d)}, "
+            f"prev_ctrt={len(_uplimit_prev_day_ctrt)}, "
+            f"frgn_3d={fetched}"
+        )
+        _uplimit_precache_done = True
+    except Exception as e:
+        logger.error(f"{ts_prefix()} [uplimit_precache] 실패: {e}")
+
+
+def _update_uplimit_minute_vol(code: str, acml_vol: float, now_dt: datetime) -> None:
+    """틱마다 분봉 경계 감지하여 직전 분의 거래량을 5분 버킷에 누적."""
+    if acml_vol <= 0:
+        return
+    try:
+        cur_min = int(now_dt.timestamp() // 60)
+        prev_key, prev_vol = _uplimit_prev_min_vol.get(code, (cur_min, acml_vol))
+        if cur_min != prev_key:
+            # 분이 바뀜 → 직전 분 거래량 확정 (delta)
+            delta = max(0.0, prev_vol - (_uplimit_prev_min_vol.get(code, (0, 0))[1] if False else 0.0))
+            # 간단하게: 직전 분 '시작 acml_vol' 대비 현재 acml_vol 차 = 분봉 vol 근사
+            # 정확도보다는 서지 감지가 목적
+            bucket = _uplimit_day_vol_bucket.setdefault(code, [])
+            bucket.append((prev_key, prev_vol))
+            # 최근 6분만 유지
+            if len(bucket) > 6:
+                del bucket[:-6]
+            _uplimit_prev_min_vol[code] = (cur_min, acml_vol)
+        else:
+            _uplimit_prev_min_vol[code] = (cur_min, acml_vol)
+    except Exception:
+        pass
+
+
+def _calc_uplimit_last5m_avg_vol_per_min(code: str) -> float:
+    """최근 5분 구간의 분당 평균 거래량 (당일 분봉 근사)."""
+    bucket = _uplimit_day_vol_bucket.get(code, [])
+    if len(bucket) < 2:
+        return 0.0
+    # 가장 최근 5개 분의 acml_vol 변화량 합 / 분 수
+    recent = bucket[-6:]
+    diffs = []
+    for i in range(1, len(recent)):
+        d = recent[i][1] - recent[i-1][1]
+        if d > 0:
+            diffs.append(d)
+    if not diffs:
+        return 0.0
+    return sum(diffs) / len(diffs)
+
+
+def _calc_uplimit_day_avg_vol_per_min(code: str, acml_vol: float, now_dt: datetime) -> float:
+    """09:00 이후 경과 분 기준 분당 평균 누적 거래량."""
+    open_dt = now_dt.replace(hour=9, minute=0, second=0, microsecond=0)
+    mins = max(1.0, (now_dt - open_dt).total_seconds() / 60.0)
+    return acml_vol / mins
+
+
+def _get_uplimit_volume_power(client, code: str) -> float | None:
+    """체결강도 조회 (30초 TTL 캐시)."""
+    cached = _uplimit_volume_power.get(code)
+    if cached and (time.time() - cached[1]) < UPLIMIT_VP_TTL_SEC:
+        return cached[0]
+    try:
+        v = fetch_volume_power(client, code)
+        if v is not None:
+            _uplimit_volume_power[code] = (v, time.time())
+        return v
+    except Exception:
+        return None
+
+
+def _try_uplimit_buy(
+    code: str,
+    name: str,
+    prdy_ctrt: float,
+    stck_prpr: float,
+    stck_oprc: float,
+    prev_close: float,
+    acml_vol: float,
+    bid_sum_top5: float,
+    ask_sum_top5: float,
+    now_dt: datetime,
+) -> None:
+    """25~28% 도달 종목 매수 판단 → 조건 통과 시 주문."""
+    global _uplimit_today_buy_count
+    if not UPLIMIT_BUY_ENABLED:
+        return
+    # 이미 매수/매도 중이거나 블랙리스트면 스킵
+    if code in _uplimit_positions or code in _uplimit_buy_pending:
+        return
+    with _uplimit_state_lock:
+        if code in _uplimit_blacklist:
+            return
+        if _uplimit_today_buy_count >= UPLIMIT_MAX_DAILY_BUYS:
+            return
+        if len(_uplimit_positions) >= UPLIMIT_MAX_POSITIONS:
+            return
+
+    # 다른 전략 보유 종목 제외 (VI / 종가매수)
+    if code in _vi_positions and not _vi_positions[code].get("sold"):
+        return
+
+    # 보조 데이터
+    client = _top_client or _init_top_client()
+    volume_power = _get_uplimit_volume_power(client, code)
+    frgn_3d = _uplimit_frgn_3d.get(code)  # 없으면 None (허용)
+
+    # 거래량 서지
+    day_avg = _calc_uplimit_day_avg_vol_per_min(code, acml_vol, now_dt)
+    last5m_avg = _calc_uplimit_last5m_avg_vol_per_min(code)
+
+    # 25% 돌파 시각
+    cross_ts = _uplimit_25pct_cross_ts.get(code)
+    min_since_cross = (now_dt - cross_ts).total_seconds() / 60.0 if cross_ts else None
+    open_dt = now_dt.replace(hour=9, minute=0, second=0, microsecond=0)
+    min_since_open = (now_dt - open_dt).total_seconds() / 60.0
+
+    should_buy, reason, _ = uplimit_approach_buy_signal(
+        prdy_ctrt=prdy_ctrt,
+        prev_close=prev_close,
+        stck_oprc=stck_oprc,
+        acml_vol=acml_vol,
+        day_avg_vol_per_min=day_avg,
+        last_5m_avg_vol_per_min=last5m_avg,
+        min_since_open=min_since_open,
+        min_since_25pct_cross=min_since_cross,
+        vola_10d=_uplimit_vola_10d.get(code),
+        bid_sum_top5=bid_sum_top5,
+        ask_sum_top5=ask_sum_top5,
+        volume_power=volume_power,
+        frgn_3d_net=frgn_3d,
+        prev_day_prdy_ctrt=_uplimit_prev_day_ctrt.get(code, 0.0),
+        already_holding=False,
+        now_hm=(now_dt.hour, now_dt.minute),
+        today_buy_count=_uplimit_today_buy_count,
+        max_daily_buys=UPLIMIT_MAX_DAILY_BUYS,
+    )
+
+    if not should_buy:
+        # 디버그 로그 (쏟아짐 방지: 5초 쿨다운)
+        last_log_ts = getattr(_try_uplimit_buy, "_last_log_ts", {})
+        if time.time() - last_log_ts.get(code, 0) > 5:
+            logger.debug(f"{ts_prefix()} [uplimit_skip] {name}({code}) {reason}")
+            last_log_ts[code] = time.time()
+            setattr(_try_uplimit_buy, "_last_log_ts", last_log_ts)
+        return
+
+    # ── 주문 실행 ──
+    try:
+        accts = _iter_enabled_accounts(trade_only=True)
+        if not accts:
+            logger.warning(f"{ts_prefix()} [uplimit] {name}({code}) 활성 계좌 없음 → 매수 스킵")
+            return
+        acct = accts[0]  # a1
+        cano = acct["cano"]
+        acnt = acct.get("acnt_prdt_cd", "01") or "01"
+        acct_client = _init_account_client(acct)
+        avail_cash = _get_account_available_cash(acct_client, acct)
+        if avail_cash <= 0:
+            logger.info(f"{ts_prefix()} [uplimit] {name}({code}) 가용현금=0 → 매수 스킵")
+            return
+
+        entry_price = calc_entry_price(stck_prpr, "KOSPI", UPLIMIT_ENTRY_TICKS)
+        qty = calc_uplimit_qty(avail_cash, entry_price, "KOSPI")
+        if qty <= 0:
+            msg = (
+                f"{ts_prefix()} [uplimit] {name}({code}) 수량=0 "
+                f"(잔고={int(avail_cash):,}원, 단가={int(entry_price):,}원)"
+            )
+            _notify(msg, tele=True)
+            logger.info(msg)
+            return
+
+        j = _buy_order_cash(acct_client, cano, acnt, "TTTC0802U",
+                            code, qty, entry_price, ord_dvsn="00")
+        out = j.get("output") or {}
+        ordno = str(out.get("ODNO") or out.get("odno") or "").strip()
+
+        with _uplimit_state_lock:
+            _uplimit_buy_pending[code] = ordno
+            _uplimit_positions[code] = {
+                "name": name, "qty": qty, "buy_price": entry_price,
+                "buy_ts": now_dt, "ordno": ordno,
+                "max_prdy_ctrt": prdy_ctrt, "highest_since_buy": entry_price,
+                "half_sold": False, "reason": reason,
+                "source": "uplimit",
+            }
+            _uplimit_today_buy_count += 1
+        _save_uplimit_state(force=True)
+
+        msg = (
+            f"{ts_prefix()} [uplimit매수] {name}({code}) ctrt={prdy_ctrt:.2f}%"
+            f"  수량={qty}  단가={int(entry_price):,}  주문번호={ordno}"
+            f"  사유={reason}"
+        )
+        _notify(msg, tele=True)
+        logger.info(msg)
+        _append_ledger(
+            order_type="buy_order", code=code, name=name,
+            buy_price=entry_price, order_qty=qty, reason=f"uplimit_{reason}",
+            ord_no=ordno, stck_prpr=stck_prpr,
+        )
+    except Exception as e:
+        logger.error(f"{ts_prefix()} [uplimit매수] {name}({code}) 주문 실패: {e}")
+
+
+def _try_uplimit_exit(
+    code: str,
+    action: str,
+    reason: str,
+    sell_ratio: float,
+    now_dt: datetime,
+) -> None:
+    """단계적 청산: sell_half / sell_all."""
+    with _uplimit_state_lock:
+        pos = _uplimit_positions.get(code)
+        if pos is None:
+            return
+        if code in _uplimit_exit_pending:
+            return  # 이미 주문 송신
+        qty_total = int(pos.get("qty") or 0)
+        if qty_total <= 0:
+            return
+        if action == "sell_half":
+            if pos.get("half_sold"):
+                return
+            sell_qty = max(1, qty_total // 2)
+        else:
+            sell_qty = qty_total
+        name = pos.get("name", code)
+
+    try:
+        accts = _iter_enabled_accounts(trade_only=True)
+        if not accts:
+            logger.warning(f"{ts_prefix()} [uplimit_exit] {name}({code}) 활성 계좌 없음")
+            return
+        acct = accts[0]
+        cano = acct["cano"]
+        acnt = acct.get("acnt_prdt_cd", "01") or "01"
+        client = _init_account_client(acct)
+        # 시장가 매도
+        j = _sell_order_cash(client, cano, acnt, code, sell_qty, ord_dvsn="01")
+        out = j.get("output") or {}
+        ordno = str(out.get("ODNO") or out.get("odno") or "").strip()
+
+        with _uplimit_state_lock:
+            _uplimit_exit_pending[code] = ordno
+            pos = _uplimit_positions.get(code)
+            if pos:
+                pos["last_exit_reason"] = reason
+                pos["last_exit_ordno"] = ordno
+                if action == "sell_half":
+                    pos["half_sold"] = True
+                    pos["qty_after_half"] = qty_total - sell_qty
+        _save_uplimit_state(force=True)
+
+        msg = (
+            f"{ts_prefix()} [uplimit매도] {name}({code}) {action}"
+            f"  수량={sell_qty}/{qty_total}  주문번호={ordno}  사유={reason}"
+        )
+        _notify(msg, tele=True)
+        logger.info(msg)
+    except Exception as e:
+        logger.error(f"{ts_prefix()} [uplimit_exit] {name}({code}) 주문 실패: {e}")
+
+
+def _handle_uplimit_ccnl_fill(
+    code: str,
+    seln: str,
+    qty: int,
+    fill_pr: float,
+    name: str,
+    recv_ts: str,
+) -> None:
+    """H0STCNI0 체결통보 처리: uplimit 매수/매도 체결 반영."""
+    is_sell = seln in ("01", "1")
+    with _uplimit_state_lock:
+        pos = _uplimit_positions.get(code)
+        if is_sell:
+            # 매도 체결
+            ordno = _uplimit_exit_pending.pop(code, "")
+            reason = (pos or {}).get("last_exit_reason", "")
+            if pos:
+                remaining = max(0, int(pos.get("qty", 0)) - qty)
+                pos["qty"] = remaining
+                pos["last_sell_fill_price"] = fill_pr
+                if remaining <= 0:
+                    # 전량 매도 완료 → 포지션 제거 + 블랙리스트 추가 (당일 재매수 금지)
+                    _uplimit_positions.pop(code, None)
+                    _uplimit_blacklist.add(code)
+            log_msg = (
+                f"{ts_prefix()} [uplimit체결] 매도 {name}({code}) 수량={qty} "
+                f"단가={int(fill_pr):,} 주문번호={ordno} 사유={reason}"
+            )
+        else:
+            # 매수 체결
+            ordno = _uplimit_buy_pending.pop(code, "")
+            if pos:
+                pos["buy_price"] = fill_pr if fill_pr > 0 else pos.get("buy_price")
+                pos["qty"] = qty  # 체결수량 확정 (부분체결은 합산으로 추후 확장)
+                pos["highest_since_buy"] = max(pos.get("highest_since_buy", 0), fill_pr)
+            log_msg = (
+                f"{ts_prefix()} [uplimit체결] 매수 {name}({code}) 수량={qty} "
+                f"단가={int(fill_pr):,} 주문번호={ordno}"
+            )
+    _save_uplimit_state(force=True)
+    _notify(log_msg, tele=True)
+    logger.info(log_msg)
+
+
+def _check_uplimit_exit_for_tick(
+    code: str,
+    prdy_ctrt: float,
+    bidp1: float,
+    now_dt: datetime,
+) -> None:
+    """틱 수신 시마다 보유 포지션 Exit 조건 확인."""
+    if code not in _uplimit_positions:
+        return
+    with _uplimit_state_lock:
+        pos = _uplimit_positions.get(code)
+        if pos is None:
+            return
+        # 최고가/최고 등락률 갱신
+        if prdy_ctrt > pos.get("max_prdy_ctrt", 0):
+            pos["max_prdy_ctrt"] = prdy_ctrt
+        if bidp1 > pos.get("highest_since_buy", 0):
+            pos["highest_since_buy"] = bidp1
+
+    mins_since = (now_dt - pos["buy_ts"]).total_seconds() / 60.0
+    action, reason, sell_ratio = uplimit_approach_exit(
+        prdy_ctrt=prdy_ctrt,
+        bidp1=bidp1,
+        buy_price=float(pos.get("buy_price") or 0),
+        max_prdy_ctrt=float(pos.get("max_prdy_ctrt") or 0),
+        highest_since_buy=float(pos.get("highest_since_buy") or 0),
+        minutes_since_buy=mins_since,
+        half_sold=bool(pos.get("half_sold", False)),
+        now_hm=(now_dt.hour, now_dt.minute),
+    )
+    if action in ("sell_half", "sell_all"):
+        _try_uplimit_exit(code, action, reason, sell_ratio, now_dt)
+
+
 # ── H0STMKO0 장운영정보 수신 처리 (VI 감지) ──
 _mkstatus_sub_codes: set[str] = set()  # H0STMKO0 구독 중인 종목
 
@@ -8001,6 +8594,107 @@ def _check_str1_sell_conditions(
         _print_opening_call_auction_monitor(newly_triggered, now_ts, is_opening_call_auction=is_opening_call_auction)
 
 
+# =============================================================================
+# [v_1 신규] 상한가 근접 매수 — 틱 기반 25~28% 감지 + Exit 모니터링
+# =============================================================================
+def _check_uplimit_conditions_from_tick(
+    result: "pl.DataFrame",
+    col_map: dict,
+    code_col: str,
+    kind: str,
+) -> None:
+    """
+    ingest_loop 에서 호출: 정규장 체결 틱마다
+      1) 25~28% 최초 돌파 감지 → _uplimit_25pct_cross_ts 기록 + 보조 데이터 프리페치
+      2) 25~28% 구간 유지 시 매수 판단 (_try_uplimit_buy)
+      3) 보유 포지션 Exit 조건 확인 (_check_uplimit_exit_for_tick)
+    """
+    if not UPLIMIT_BUY_ENABLED:
+        return
+    if kind != "regular_real":
+        return
+
+    pr_col    = col_map.get("stck_prpr")
+    prdy_col  = col_map.get("prdy_ctrt")
+    oprc_col  = col_map.get("stck_oprc")
+    vol_col   = col_map.get("acml_vol")
+    bidp1_col = col_map.get("bidp1")
+    # 호가 잔량 합 (가능하면 top5, 없으면 top1)
+    ask_sum_cols = [col_map.get(f"askp_rsqn{i}") for i in range(1, 6)]
+    bid_sum_cols = [col_map.get(f"bidp_rsqn{i}") for i in range(1, 6)]
+
+    df_tmp = result.with_columns(
+        pl.col(code_col).cast(pl.Utf8).str.zfill(6).alias(code_col)
+    )
+    now_dt = datetime.now(KST)
+    h, m = now_dt.hour, now_dt.minute
+    in_window = (UPLIMIT_BUY_START <= dtime(h, m) < UPLIMIT_BUY_END)
+
+    for df_code in df_tmp.partition_by(code_col, maintain_order=True):
+        try:
+            code = str(df_code[code_col][0])
+            if not code or code in ("None", "000000"):
+                continue
+            row = df_code.row(-1, named=True)
+
+            def _f(col):
+                if not col:
+                    return 0.0
+                try:
+                    return float(str(row.get(col) or 0).replace(",", "") or 0)
+                except Exception:
+                    return 0.0
+
+            prdy_ctrt = _f(prdy_col)
+            stck_prpr = _f(pr_col)
+            stck_oprc = _f(oprc_col) or _oprc_cache.get(code, 0.0)
+            acml_vol  = _f(vol_col)
+            bidp1     = _f(bidp1_col)
+
+            # 분봉 거래량 서지 집계 갱신
+            _update_uplimit_minute_vol(code, acml_vol, now_dt)
+
+            # 25% 최초 돌파 감지
+            prev = _last_prdy_ctrt.get(code, 0.0)  # 이 함수는 캐시 업데이트 이후에 호출됨
+            if code not in _uplimit_25pct_cross_ts and 25.0 <= prdy_ctrt < 29.0:
+                _uplimit_25pct_cross_ts[code] = now_dt
+
+            # 보유 포지션 Exit (bidp1 가 있어야 정확)
+            if code in _uplimit_positions and bidp1 > 0:
+                _check_uplimit_exit_for_tick(code, prdy_ctrt, bidp1, now_dt)
+
+            # 매수 판단 — 시간대/구간/잔고/한도 체크 후
+            if not in_window:
+                continue
+            if not (25.0 <= prdy_ctrt < 29.0):
+                continue
+
+            name = code_name_map.get(code, code)
+            # 전일종가 추정: stck_prpr / (1 + prdy_ctrt/100)
+            prev_close = 0.0
+            if stck_prpr > 0 and abs(prdy_ctrt) < 100:
+                prev_close = stck_prpr / (1 + prdy_ctrt / 100.0)
+
+            # 호가 잔량 합 (누락 시 0)
+            bid_sum = 0.0
+            ask_sum = 0.0
+            for c in bid_sum_cols:
+                bid_sum += _f(c)
+            for c in ask_sum_cols:
+                ask_sum += _f(c)
+
+            _try_uplimit_buy(
+                code=code, name=name,
+                prdy_ctrt=prdy_ctrt, stck_prpr=stck_prpr,
+                stck_oprc=stck_oprc, prev_close=prev_close,
+                acml_vol=acml_vol,
+                bid_sum_top5=bid_sum, ask_sum_top5=ask_sum,
+                now_dt=now_dt,
+            )
+        except Exception as _e:
+            logger.debug(f"[uplimit_tick] 예외 {code if 'code' in locals() else '?'}: {_e}")
+
+
 def _run_balance_monitor_bg(sell_lines: list[str]) -> None:
     """별도 스레드에서 REST 잔고조회 + 결과 출력. ingest_loop 블로킹 방지."""
     try:
@@ -8594,6 +9288,13 @@ def ingest_loop():
                 _check_str1_sell_conditions(result, col_map, code_col, kind)
             except Exception as _e:
                 logger.debug(f"[str1_sell] 조건 체크 예외: {_e}")
+
+        # ── [v_1] 상한가 근접 매수: 25~28% 감지 + Exit 모니터링 ───────────────
+        if UPLIMIT_BUY_ENABLED:
+            try:
+                _check_uplimit_conditions_from_tick(result, col_map, code_col, kind)
+            except Exception as _e:
+                logger.debug(f"[uplimit] 조건 체크 예외: {_e}")
 
         # ── VI 발동 종목 예상체결가 모니터링 ──────────────────────────────────
         if _vi_active_codes and "exp" in kind:
@@ -9316,6 +10017,17 @@ if __name__ == "__main__":
 
     # Str1 매도 상태 복원 — 시작잔고 결과 전달 (중복 API 호출 없이 재사용)
     _load_str1_sell_state_on_startup(_startup_balance_map)
+
+    # [v_1] uplimit 전략 상태 복원 + 사전 캐시 구축
+    if UPLIMIT_BUY_ENABLED:
+        try:
+            _restore_uplimit_state_on_startup()
+        except Exception as _e:
+            logger.warning(f"{ts_prefix()} [uplimit] 시작 복원 실패: {_e}")
+        try:
+            _precache_uplimit_signals()
+        except Exception as _e:
+            logger.warning(f"{ts_prefix()} [uplimit] 사전 캐시 실패: {_e}")
 
     # 매도 금지 종목 로드
     _load_no_sell_codes()

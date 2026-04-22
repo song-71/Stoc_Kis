@@ -82,11 +82,12 @@ STOP_LIMIT_CONFIRM_TICKS = 30
 #   - 단계적 청산: 29% 도달 → 28% 하회 절반, 27% 하회 전량
 #   - 손절 -3%, 상한가 도달 후 대폭락 -5% 강제 청산
 #   - 가용현금 전량 1종목 집중 (460K 시드 가정, 동시 보유 1종목)
+# (주의: 이 섹션은 파일 최상단이라 하단 import 전 — datetime 은 tuple 로 저장)
 UPLIMIT_BUY_ENABLED = True          # False: 전략 비활성 (회귀 테스트용)
 UPLIMIT_MAX_DAILY_BUYS = 3          # 일일 신규 매수 최대 횟수
-UPLIMIT_BUY_START = dtime(9, 30)    # 매수 허용 시작
-UPLIMIT_BUY_END = dtime(14, 50)     # 신규 매수 금지
-UPLIMIT_CLOSE_TIME = dtime(15, 10)  # 미도달 청산 시각 (Exit 내 처리)
+UPLIMIT_BUY_START_HM = (9, 30)      # 매수 허용 시작 (hour, minute)
+UPLIMIT_BUY_END_HM = (14, 50)       # 신규 매수 금지
+UPLIMIT_CLOSE_TIME_HM = (15, 10)    # 미도달 청산 시각 (Exit 내 처리)
 UPLIMIT_MAX_POSITIONS = 1           # 동시 보유 상한
 UPLIMIT_VP_TTL_SEC = 30             # 체결강도 캐시 TTL
 UPLIMIT_ENTRY_TICKS = 2             # 매수 지정가 = 현재가 + N틱
@@ -8628,7 +8629,7 @@ def _check_uplimit_conditions_from_tick(
     )
     now_dt = datetime.now(KST)
     h, m = now_dt.hour, now_dt.minute
-    in_window = (UPLIMIT_BUY_START <= dtime(h, m) < UPLIMIT_BUY_END)
+    in_window = (UPLIMIT_BUY_START_HM <= (h, m) < UPLIMIT_BUY_END_HM)
 
     for df_code in df_tmp.partition_by(code_col, maintain_order=True):
         try:

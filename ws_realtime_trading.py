@@ -913,6 +913,8 @@ def _query_and_print_balance(label: str, *, trade_only: bool = True,
             ctx_fk, ctx_nk = "", ""
             for _ in range(10):
                 out1, out2, ctx_fk, ctx_nk = _get_balance_page(client, cano, acnt, "TTTC8434R", ctx_fk, ctx_nk)
+                if not summary:
+                    summary = out2 if isinstance(out2, dict) else (out2[0] if isinstance(out2, list) and out2 else {})
                 rows = out1 if isinstance(out1, list) else ([out1] if isinstance(out1, dict) else [])
                 if not rows:
                     break
@@ -923,8 +925,6 @@ def _query_and_print_balance(label: str, *, trade_only: bool = True,
                         row["_acct_alias"] = f"{alias}({cano})"
                         hold_rows.append(row)
                         _code_account_map[c] = acct
-                if not summary:
-                    summary = out2 if isinstance(out2, dict) else (out2[0] if isinstance(out2, list) and out2 else {})
                 if not ctx_fk.strip() and not ctx_nk.strip():
                     break
             logger.info(f"[{label}] {alias}({cano}) 조회 완료")
@@ -3774,6 +3774,12 @@ _ws_rebuild_event = threading.Event()
 _kws_lock = threading.RLock()
 _active_kws = None
 
+# ── a2 (syw_2) 전용 WSS 전역 변수 ──
+_a2_kws_lock = threading.RLock()
+_a2_active_kws = None
+_a2_subscribed: dict[str, set[str]] = {}
+_a2_approval_key: str = ""
+
 
 def _trigger_ws_rebuild():
     """종목 변경 시 즉시 동적 구독/해제 적용 (재연결 없이)."""
@@ -4888,6 +4894,8 @@ _last_summary_ts = time.time()
 # ── 장중 미수신 감시 상태 ──
 _last_stale_check_ts: dict[str, float] = {}  # 종목별 마지막 REST 상태확인 시각
 _halted_codes: set[str] = set()               # 거래정지 확인된 종목
+_recent_tick_ts: dict[str, deque] = {}        # 종목별 최근 5개 틱 타임스탬프 (갑자기 끊김 감지용)
+_vi_trigger_info: dict[str, dict] = {}        # VI REST 조회로 확인된 발동 정보 {code: {vi_time, vi_cls_code}}
 _vi_active_codes: set[str] = set()            # VI 발동 확인된 종목
 _last_wss_recv_ts: dict[str, float] = {}     # WSS 전용 수신 시각 (REST 제외)
 _vi_cls_cache: dict[str, str] = {}            # code → 마지막 vi_cls_code (H0STMKO0)
@@ -5315,50 +5323,85 @@ _REST_VI_UNTIL      = dtime(9, 2)     # VI 발동 종목 REST 보충 제외 시�
 _REST_GRACE_SEC     = 30              # 시작/재시작 후 WSS warmup 대기 시간(초)
 
 def _vi_exp_sub_switch(code: str) -> None:
-    """VI 발동: 실시간체결가 해제 → 예상체결가 구독 (슬롯 1 유지). H0STMKO0에도 추가."""
+    """VI 발동: a1에서 실시간체결가 해제, a2에서 예상체결가 구독. H0STMKO0은 a2에서 이미 구독 중."""
     if code in _vi_exp_sub_ts:
         return  # 이미 전환됨
     _vi_exp_sub_ts[code] = time.time()
     _vi_active_codes.add(code)
     name = code_name_map.get(code, code)
+    # a1: 실시간체결가 해제
     with _kws_lock:
-        if _active_kws is None:
-            return
-        try:
-            _send_subscribe(_active_kws, ccnl_krx, [code], "2")      # noqa: F405  실시간 해제
-            _send_subscribe(_active_kws, exp_ccnl_krx, [code], "1")  # noqa: F405  예상 구독
-            logger.info(f"{ts_prefix()} [VI전환] {name}({code}) 실시간→예상 교체 완료")
-        except Exception as e:
-            logger.warning(f"{ts_prefix()} [VI전환] {name}({code}) 구독 교체 실패: {e}")
-    # H0STMKO0에 해당 종목 추가 (VI 해제 감지용)
+        if _active_kws is not None:
+            try:
+                _send_subscribe(_active_kws, ccnl_krx, [code], "2")      # noqa: F405  실시간 해제
+                logger.info(f"{ts_prefix()} [VI전환] {name}({code}) a1 실시간 해제 완료")
+            except Exception as e:
+                logger.warning(f"{ts_prefix()} [VI전환] {name}({code}) a1 실시간 해제 실패: {e}")
+    # a2: 예상체결가 구독
+    with _a2_kws_lock:
+        if _a2_active_kws is not None:
+            try:
+                _a2_active_kws.send_request(request=exp_ccnl_krx, tr_type="1", data=[code])  # noqa: F405
+                existing = _a2_subscribed.get("exp_ccnl_krx", set())
+                _a2_subscribed["exp_ccnl_krx"] = existing | {code}
+                logger.info(f"{ts_prefix()} [VI전환] {name}({code}) a2 예상체결 구독 완료")
+            except Exception as e:
+                logger.warning(f"{ts_prefix()} [VI전환] {name}({code}) a2 예상체결 구독 실패: {e}")
+                # fallback: a1에서 예상체결 구독
+                with _kws_lock:
+                    if _active_kws is not None:
+                        try:
+                            _send_subscribe(_active_kws, exp_ccnl_krx, [code], "1")  # noqa: F405
+                            logger.info(f"{ts_prefix()} [VI전환] {name}({code}) a1 fallback 예상체결 구독")
+                        except Exception:
+                            pass
+        else:
+            # a2 미연결 → a1에서 예상체결 구독 (기존 방식 fallback)
+            with _kws_lock:
+                if _active_kws is not None:
+                    try:
+                        _send_subscribe(_active_kws, exp_ccnl_krx, [code], "1")  # noqa: F405
+                        logger.info(f"{ts_prefix()} [VI전환] {name}({code}) a1 fallback 예상체결 구독 (a2 미연결)")
+                    except Exception as e:
+                        logger.warning(f"{ts_prefix()} [VI전환] {name}({code}) a1 fallback 실패: {e}")
+    # H0STMKO0: a2에서 동적 추가 (이미 전 종목 구독 중이므로 대부분 불필요하나 안전장치)
     try:
-        _mkstatus_sub_add({code})
+        _a2_mkstatus_sub_add({code})
     except Exception as e:
-        logger.warning(f"{ts_prefix()} [VI전환] H0STMKO0 추가 실패 {code}: {e}")
+        logger.warning(f"{ts_prefix()} [VI전환] a2 H0STMKO0 추가 실패 {code}: {e}")
 
 
 def _vi_exp_sub_restore(code: str) -> None:
-    """VI 해제: 예상체결가 해제 → 실시간체결가 재구독 + H0STMKO0 keep-alive 순환."""
+    """VI 해제: a2에서 예상체결가 해제, a1에서 실시간체결가 재구독."""
     _vi_exp_sub_ts.pop(code, None)
     _vi_active_codes.discard(code)
     _vi_exp_last_notify.pop(code, None)
     name = code_name_map.get(code, code)
+    # a2: 예상체결가 해제
+    with _a2_kws_lock:
+        if _a2_active_kws is not None:
+            try:
+                _a2_active_kws.send_request(request=exp_ccnl_krx, tr_type="2", data=[code])  # noqa: F405
+                existing = _a2_subscribed.get("exp_ccnl_krx", set())
+                _a2_subscribed["exp_ccnl_krx"] = existing - {code}
+                logger.info(f"{ts_prefix()} [VI복구] {name}({code}) a2 예상체결 해제 완료")
+            except Exception as e:
+                logger.warning(f"{ts_prefix()} [VI복구] {name}({code}) a2 예상체결 해제 실패: {e}")
+    # a1: 실시간체결가 복구 (+ a1 fallback 예상체결 해제도 시도)
     with _kws_lock:
-        if _active_kws is None:
-            return
-        try:
-            _send_subscribe(_active_kws, exp_ccnl_krx, [code], "2")  # noqa: F405  예상 해제
-            _send_subscribe(_active_kws, ccnl_krx, [code], "1")      # noqa: F405  실시간 복구
-            logger.info(f"{ts_prefix()} [VI복구] {name}({code}) 예상→실시간 교체 완료")
-        except Exception as e:
-            logger.warning(f"{ts_prefix()} [VI복구] {name}({code}) 구독 교체 실패: {e}")
-    # ── H0STMKO0 keep-alive 순환: 이 종목을 새 keep-alive로 지정, 이전은 해제 ──
+        if _active_kws is not None:
+            try:
+                _send_subscribe(_active_kws, exp_ccnl_krx, [code], "2")  # noqa: F405  a1 fallback 해제 (있으면)
+                _send_subscribe(_active_kws, ccnl_krx, [code], "1")      # noqa: F405  실시간 복구
+                logger.info(f"{ts_prefix()} [VI복구] {name}({code}) a1 실시간 복구 완료")
+            except Exception as e:
+                logger.warning(f"{ts_prefix()} [VI복구] {name}({code}) a1 구독 복구 실패: {e}")
+    # ── H0STMKO0 keep-alive 순환: a2에서 처리 ──
     market = _code_market_map.get(code, "")
     if market:
         prev_keepalive = _mkt_keepalive_current.get(market, "")
         if prev_keepalive != code:
             _mkt_keepalive_current[market] = code
-            # 이전 keep-alive 해제 (VI 중이거나 보유종목이면 유지)
             held_codes = set()
             try:
                 with _str1_sell_state_lock:
@@ -5370,10 +5413,10 @@ def _vi_exp_sub_restore(code: str) -> None:
                 and prev_keepalive not in held_codes
                 and prev_keepalive != code):
                 try:
-                    _mkstatus_sub_remove({prev_keepalive})
-                    logger.info(f"{ts_prefix()} [VI복구] keep-alive 순환: {prev_keepalive}→{code} ({market})")
+                    _a2_mkstatus_sub_remove({prev_keepalive})
+                    logger.info(f"{ts_prefix()} [VI복구] a2 keep-alive 순환: {prev_keepalive}→{code} ({market})")
                 except Exception as e:
-                    logger.warning(f"{ts_prefix()} [VI복구] 이전 keep-alive 해제 실패 {prev_keepalive}: {e}")
+                    logger.warning(f"{ts_prefix()} [VI복구] a2 이전 keep-alive 해제 실패 {prev_keepalive}: {e}")
 
 
 # 하위 호환 alias (기존 호출부 유지)
@@ -5661,43 +5704,91 @@ def _on_market_status_krx(result) -> None:
                     _vi_exp_sub_restore(code)
                     _vi_end_ts[code] = datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S")
                     _market_event.pop(code, None)
+                    _vi_trigger_info.pop(code, None)
                     msg = (f"{ts_prefix()} [VI해제] {name}({code}) "
                            f"vi_cls={vi_cls}")
                     logger.info(msg)
                     _notify(msg, tele=True)
+                    # H0STMKO0 동적 구독 해제 (keepalive/보유 종목 제외)
+                    keepalive_set = set(_mkt_keepalive_current.values())
+                    if code not in keepalive_set:
+                        held_codes_vi = set()
+                        try:
+                            with _str1_sell_state_lock:
+                                held_codes_vi = {c for c, st in _str1_sell_state.items() if not st.get("sold")}
+                        except Exception:
+                            pass
+                        if code not in held_codes_vi:
+                            try:
+                                _mkstatus_sub_remove({code})
+                            except Exception as e:
+                                logger.warning(f"{ts_prefix()} [VI해제] H0STMKO0 해제 실패 {code}: {e}")
 
 
 def _mkstatus_sub_add(codes_to_add: set[str]) -> None:
-    """보유종목에 대해 H0STMKO0 장운영정보 구독 추가."""
-    new_codes = codes_to_add - _mkstatus_sub_codes
-    if not new_codes:
-        return
-    with _kws_lock:
-        if _active_kws is not None:
-            try:
-                _send_subscribe(_active_kws, market_status_krx, list(new_codes), "1")  # noqa: F405
-                _mkstatus_sub_codes.update(new_codes)
-                names = [f"{code_name_map.get(c, c)}({c})" for c in new_codes]
-                logger.info(f"{ts_prefix()} [H0STMKO0] 장운영정보 구독 추가: {', '.join(names)}")
-            except Exception as e:
-                logger.warning(f"{ts_prefix()} [H0STMKO0] 구독 실패: {e}")
+    """보유종목에 대해 H0STMKO0 장운영정보 구독 추가 → a2 WSS로 위임."""
+    _a2_mkstatus_sub_add(codes_to_add)
 
 
 def _mkstatus_sub_remove(codes_to_remove: set[str]) -> None:
-    """매도 완료 종목의 H0STMKO0 구독 해제."""
-    global _mkstatus_sub_codes
-    active = codes_to_remove & _mkstatus_sub_codes
-    if not active:
-        return
-    with _kws_lock:
-        if _active_kws is not None:
-            try:
-                _send_subscribe(_active_kws, market_status_krx, list(active), "2")  # noqa: F405
-                _mkstatus_sub_codes -= active
-                names = [f"{code_name_map.get(c, c)}({c})" for c in active]
-                logger.info(f"{ts_prefix()} [H0STMKO0] 장운영정보 구독 해제: {', '.join(names)}")
-            except Exception as e:
-                logger.warning(f"{ts_prefix()} [H0STMKO0] 해제 실패: {e}")
+    """매도 완료 종목의 H0STMKO0 구독 해제 → a2 WSS로 위임."""
+    _a2_mkstatus_sub_remove(codes_to_remove)
+
+
+def _avg_tick_interval(code: str) -> float:
+    """종목의 최근 틱 간격 평균(초) 반환. 데이터 부족 시 999.0."""
+    dq = _recent_tick_ts.get(code)
+    if not dq or len(dq) < 2:
+        return 999.0
+    intervals = [dq[i] - dq[i - 1] for i in range(1, len(dq))]
+    return sum(intervals) / len(intervals)
+
+
+def _inquire_vi_status_single(client: KisClient, code: str) -> tuple[bool, str, str]:
+    """단일 종목 VI 상태 REST 조회.
+
+    Returns:
+        (is_vi, vi_time, vi_cls_code)
+        - is_vi: VI 발동 중이면 True
+        - vi_time: 발동시각 (HHMMSS)
+        - vi_cls_code: "1"=정적VI, "2"=동적VI, "3"=정적&동적
+    """
+    url = f"{client.cfg.base_url}/uapi/domestic-stock/v1/quotations/inquire-vi-status"
+    headers = client._headers(tr_id="FHPST01390000")
+    today = datetime.now(KST).strftime("%Y%m%d")
+    params = {
+        "FID_COND_SCR_DIV_CODE": "20139",
+        "FID_INPUT_ISCD": code,
+        "FID_MRKT_CLS_CODE": "0",
+        "FID_DIV_CLS_CODE": "0",      # 전체(상승+하락)
+        "FID_RANK_SORT_CLS_CODE": "0", # 전체 VI 종류
+        "FID_INPUT_DATE_1": today,
+        "FID_TRGT_CLS_CODE": "",
+        "FID_TRGT_EXLS_CLS_CODE": "",
+    }
+    try:
+        r = requests.get(url, headers=headers, params=params, timeout=10)
+        r.raise_for_status()
+        j = r.json()
+        if str(j.get("rt_cd")) != "0":
+            logger.warning(f"{ts_prefix()} [VI조회] {code} 실패: {j.get('msg1', '')}")
+            return (False, "", "")
+        rows = j.get("output") or []
+        # 해당 종목의 가장 최근 VI 발동 중인 레코드 찾기
+        for row in rows:
+            row_code = str(row.get("mksc_shrn_iscd", "")).strip().zfill(6)
+            if row_code != code:
+                continue
+            vi_cls = str(row.get("vi_cls_code", "")).strip()
+            vi_cancel = str(row.get("vi_cncl_hour", "")).strip()
+            vi_time = str(row.get("cntg_vi_hour", "")).strip()
+            # vi_cncl_hour 가 비어있거나 "000000" 이면 아직 발동 중
+            if vi_cls and vi_cls != "N" and (not vi_cancel or vi_cancel == "000000"):
+                return (True, vi_time, vi_cls)
+        return (False, "", "")
+    except Exception as e:
+        logger.warning(f"{ts_prefix()} [VI조회] {code} 오류: {e}")
+        return (False, "", "")
 
 
 def _handle_stale_check_result(code: str, output: dict) -> None:
@@ -5720,11 +5811,27 @@ def _handle_stale_check_result(code: str, output: dict) -> None:
         sys.stdout.write("\n")
         _notify(msg)
 
-    # ── 장중 일시정지 (VI 등) → 유지 ──
+    # ── 장중 일시정지 (VI 등) → VI 상태 REST 조회 후 후속처리 ──
     if temp_stop == "Y":
         if code not in _halted_codes:
             _halted_codes.add(code)
             _status_notify(f"{ts_prefix()} [종목상태] {name}({code}) 일시정지 중 (temp_stop_yn=Y)")
+        # VI 발동 여부 REST 확인 (이미 예상체결 구독 중이면 스킵)
+        if code not in _vi_exp_sub_ts:
+            try:
+                _vi_client = _price_client or _init_price_client()
+                is_vi, vi_time, vi_cls = _inquire_vi_status_single(_vi_client, code)
+                if is_vi:
+                    _vi_trigger_info[code] = {"vi_time": vi_time, "vi_cls_code": vi_cls}
+                    _VI_CLS_NAMES = {"1": "정적VI", "2": "동적VI", "3": "정적&동적"}
+                    vi_label = _VI_CLS_NAMES.get(vi_cls, vi_cls)
+                    msg = (f"{ts_prefix()} [VI감지-REST] {name}({code}) "
+                           f"{vi_label} 발동시각={vi_time} → 예상체결 전환")
+                    logger.warning(msg)
+                    _notify(msg, tele=True)
+                    _vi_exp_sub_switch(code)
+            except Exception as e:
+                logger.warning(f"{ts_prefix()} [VI감지-REST] {name}({code}) 조회 실패: {e}")
         _enqueue_rest_price_row(code, output)
         return
 
@@ -5896,6 +6003,24 @@ def _price_watchdog_loop() -> None:
                         continue
                     last_wss = _last_wss_recv_ts.get(c, 0.0)
                     idle = (now - last_wss) if last_wss > 0 else (now - start_ts)
+
+                    # ── "갑자기 끊김" 감지: 활발히 거래되던 종목이 갑자기 멈춤 → VI 의심 ──
+                    avg_itv = _avg_tick_interval(c)
+                    if (avg_itv < 5.0
+                            and last_wss > 0
+                            and idle >= max(10.0, avg_itv * 3)
+                            and c not in _vi_exp_sub_ts
+                            and c not in _halted_codes):
+                        last_check = _last_stale_check_ts.get(c, 0.0)
+                        if (now - last_check) >= 10.0:
+                            _last_stale_check_ts[c] = now
+                            _rest_pending.add(c)
+                            try:
+                                _price_queue.put_nowait(("stale_check", c))
+                            except Exception:
+                                pass
+                            continue
+
                     # 상태별 재확인 간격 적용
                     if c in _halted_codes:
                         check_interval = STALE_CHECK_HALTED_SEC    # 300초
@@ -8199,13 +8324,19 @@ def ingest_loop():
                     _last_recv_ts[code] = now
                     _last_any_recv_ts = now
                     _no_data_rebuild_count = 0  # 데이터 수신 → 재구독 실패 카운터 리셋
-                    # 종목별 tr_id 전환 감지 로깅
+                    # 종목별 구독 전환 후 첫 체결가 수신 로깅
                     prev_trid = _last_trid_per_code.get(code)
                     if prev_trid and prev_trid != trid:
                         name = code_name_map.get(code, code)
+                        _pr_col = col_map.get("stck_prpr")
+                        _price = ""
+                        if _pr_col and _pr_col in df_code.columns:
+                            try:
+                                _price = f" 체결가={int(float(str(df_code[_pr_col][-1]).replace(',', '') or 0)):,}"
+                            except Exception:
+                                pass
                         logger.info(
-                            f"{ts_prefix()} [tr_id전환] {name}({code}) "
-                            f"{prev_trid} → {trid}"
+                            f"{ts_prefix()} [체결가 수신] {name}({code}){_price}"
                         )
                     _last_trid_per_code[code] = trid
                     # 57/59 종목이 H0STCNT0(실시간체결) 수신 → 30분 단일가 아님 → 일반종목 전환
@@ -8257,6 +8388,10 @@ def ingest_loop():
                     # WSS 전용 수신 시각 (REST 제외)
                     if trid != "FHKST01010100":
                         _last_wss_recv_ts[code] = now
+                        # 틱 간격 추적 (갑자기 끊김 감지용)
+                        if code not in _recent_tick_ts:
+                            _recent_tick_ts[code] = deque(maxlen=5)
+                        _recent_tick_ts[code].append(now)
                     if kind == "regular_real" and _get_mode() == RunMode.CLOSE_REAL:
                         _regular_real_seen.add(code)
                     if kind == "overtime_real":
@@ -8300,9 +8435,12 @@ def ingest_loop():
                             prev_mkop = _last_mkop_cls_code.get(code, "")
                             if prev_mkop and prev_mkop != v:
                                 name = code_name_map.get(code, code)
+                                _mkop_names = {"00": "장중", "10": "동시호가", "20": "장마감", "30": "시간외단일가"}
+                                prev_label = _mkop_names.get(prev_mkop, prev_mkop)
+                                cur_label = _mkop_names.get(v, v)
                                 logger.info(
-                                    f"{ts_prefix()} [mkop변경] {name}({code}) "
-                                    f"{prev_mkop} → {v}"
+                                    f"{ts_prefix()} [실시간체결통보] {name}({code}) "
+                                    f"new_mkop_cls_code: {prev_mkop}({prev_label}) → {v}({cur_label})"
                                 )
                             _last_mkop_cls_code[code] = v
                     except Exception:
@@ -8454,6 +8592,14 @@ def _shutdown(reason: str):
         if _active_kws is not None:
             _request_ws_close(_active_kws)
             _active_kws = None  # 다른 스레드의 추가 send 방지
+    # a2 WSS 종료
+    with _a2_kws_lock:
+        if _a2_active_kws is not None:
+            try:
+                _request_ws_close(_a2_active_kws)
+            except Exception:
+                pass
+            _a2_active_kws = None
     # ── 메모리 데이터 저장 (WSS 종료 후, 큐 소진 대기 → flush → snapshot) ──
     deadline = time.time() + 8.0
     try:
@@ -8604,6 +8750,228 @@ def _apply_subscriptions(kws, desired: dict, force: bool = False) -> None:
         else:
             _subscribed.pop(req.__name__, None)
 
+# =============================================================================
+# a2 (syw_2) 듀얼 WSS — H0STMKO0 장운영정보 + VI 예상체결가 전담
+# =============================================================================
+def _get_a2_approval_key() -> str:
+    """syw_2 계정의 approval_key를 직접 발급받아 반환."""
+    cfg = load_config(str(SCRIPT_DIR / "config.json"))
+    acct = cfg.get("accounts", {}).get("syw_2", {})
+    appkey = acct.get("appkey", "")
+    appsecret = acct.get("appsecret", "")
+    base_url = cfg.get("base_url", "")
+    if not appkey or not appsecret or not base_url:
+        raise ValueError("[a2-WSS] syw_2 appkey/appsecret/base_url 누락")
+    p = {
+        "grant_type": "client_credentials",
+        "appkey": appkey,
+        "secretkey": appsecret,
+    }
+    url = f"{base_url}/oauth2/Approval"
+    headers = {"Content-Type": "application/json", "Accept": "text/plain", "charset": "UTF-8"}
+    resp = requests.post(url, data=json.dumps(p), headers=headers, timeout=10)
+    if resp.status_code != 200:
+        raise RuntimeError(f"[a2-WSS] approval_key 발급 실패: HTTP {resp.status_code} {resp.text[:200]}")
+    key = resp.json().get("approval_key", "")
+    if not key:
+        raise RuntimeError(f"[a2-WSS] approval_key 비어있음: {resp.text[:200]}")
+    return key
+
+
+def _on_result_a2(ws, tr_id, result, data_info):
+    """a2 WSS on_result 콜백: H0STMKO0 → 기존 처리, H0STANC0 → ingest_queue."""
+    if _stop_event.is_set():
+        return
+    if result is None or getattr(result, "empty", True):
+        return
+    result.columns = [str(c).strip().lower() for c in result.columns]
+    trid = str(tr_id)
+    if trid == "H0STMKO0":
+        _on_market_status_krx(result)
+        return
+    # H0STANC0 (예상체결가) — VI 종목 예상체결 데이터
+    if trid in KNOWN_TRID_MAP or trid in TRID_TO_KIND:
+        kind = TRID_TO_KIND.get(trid)
+        is_real = TRID_TO_IS_REAL.get(trid)
+        if kind is None and trid in KNOWN_TRID_MAP:
+            kind, is_real = KNOWN_TRID_MAP[trid]
+            TRID_TO_KIND[trid] = kind
+            TRID_TO_IS_REAL[trid] = is_real
+        recv_ts = datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S.%f")
+        try:
+            result_pl = pl.from_pandas(result)
+            _ingest_queue.put((result_pl, trid, kind, is_real, recv_ts))
+        except Exception as e:
+            logger.warning(f"{ts_prefix()} [a2-WSS] ingest 실패: {e}")
+
+
+def run_ws_a2_forever():
+    """a2 전용 WSS: H0STMKO0(전 종목) + VI 예상체결가 구독. 데몬 스레드로 실행."""
+    global _a2_active_kws, _a2_approval_key
+    backoff = 2
+    attempt = 0
+
+    # approval_key 발급
+    try:
+        _a2_approval_key = _get_a2_approval_key()
+        logger.info(f"{ts_prefix()} [a2-WSS] approval_key 발급 완료")
+    except Exception as e:
+        logger.error(f"{ts_prefix()} [a2-WSS] approval_key 발급 실패: {e} — a2 WSS 비활성")
+        _notify(f"{ts_prefix()} [a2-WSS] 시작 실패: {e}", tele=True)
+        return
+
+    while not _stop_event.is_set():
+        attempt += 1
+        kws = None
+        try:
+            logger.info(f"{ts_prefix()} [a2-WSS] connect attempt={attempt}")
+
+            # 재연결 시 approval_key 갱신
+            if attempt > 1:
+                try:
+                    _a2_approval_key = _get_a2_approval_key()
+                    logger.info(f"{ts_prefix()} [a2-WSS] approval_key 재발급 완료")
+                except Exception as ae:
+                    logger.warning(f"{ts_prefix()} [a2-WSS] approval_key 재발급 실패: {ae}")
+
+            # a2는 open_map 사용하지 않음 (독립 인스턴스)
+            kws = ka.KISWebSocket(api_url="", approval_key=_a2_approval_key)
+            with _a2_kws_lock:
+                _a2_active_kws = kws
+                _a2_subscribed.clear()
+
+            def _on_system_a2(rsp):
+                if rsp.isOk and rsp.tr_msg and "SUCCESS" in rsp.tr_msg:
+                    return
+                if rsp.tr_msg:
+                    msg = str(rsp.tr_msg)
+                    if "not found" in msg.lower() or "ALREADY IN SUBSCRIBE" in msg:
+                        logger.debug(f"{ts_prefix()} [a2-WSS][system] {msg}")
+                    else:
+                        logger.warning(f"{ts_prefix()} [a2-WSS][system] tr_id={rsp.tr_id} msg={msg}")
+
+            kws.on_system = _on_system_a2
+
+            # 연결 후 콜백에서 초기 구독 실행
+            # kws.start()는 블로킹이므로 먼저 구독 세팅 후 start
+            # 그러나 send_request는 start 이후에만 가능 → start 직후 별도 스레드에서 구독
+            def _a2_initial_subscribe():
+                """a2 연결 직후 H0STMKO0 전 종목 구독."""
+                time.sleep(1.0)  # WebSocket 연결 안정화 대기
+                try:
+                    # 구독 대상: 보유종목 + keepalive 종목 + codes (전 종목)
+                    held_codes = set()
+                    try:
+                        with _str1_sell_state_lock:
+                            held_codes = {c for c, st in _str1_sell_state.items() if not st.get("sold")}
+                    except Exception:
+                        pass
+                    all_mko = set(codes) | held_codes
+                    for mkt, rep_code in _MKT_KEEPALIVE_INITIAL.items():
+                        all_mko.add(rep_code)
+                    for c in _mkt_keepalive_current.values():
+                        if c:
+                            all_mko.add(c)
+
+                    if all_mko:
+                        mko_list = list(all_mko)
+                        with _a2_kws_lock:
+                            if _a2_active_kws is not None:
+                                for i in range(0, len(mko_list), MAX_CODES_PER_SESSION):
+                                    batch = mko_list[i:i + MAX_CODES_PER_SESSION]
+                                    try:
+                                        _a2_active_kws.send_request(request=market_status_krx, tr_type="1", data=batch)  # noqa: F405
+                                    except Exception as e:
+                                        logger.warning(f"{ts_prefix()} [a2-WSS] H0STMKO0 구독 실패 (batch): {e}")
+                                _a2_subscribed["market_status_krx"] = set(mko_list)
+                                _mkstatus_sub_codes.update(all_mko)
+                        logger.info(
+                            f"{ts_prefix()} [a2-WSS] H0STMKO0 구독 완료: {len(all_mko)}종목"
+                        )
+                    # VI 활성 종목이 있으면 예상체결가도 구독
+                    vi_codes = list(_vi_active_codes)
+                    if vi_codes:
+                        with _a2_kws_lock:
+                            if _a2_active_kws is not None:
+                                for i in range(0, len(vi_codes), MAX_CODES_PER_SESSION):
+                                    batch = vi_codes[i:i + MAX_CODES_PER_SESSION]
+                                    try:
+                                        _a2_active_kws.send_request(request=exp_ccnl_krx, tr_type="1", data=batch)  # noqa: F405
+                                    except Exception as e:
+                                        logger.warning(f"{ts_prefix()} [a2-WSS] 예상체결 구독 실패: {e}")
+                                _a2_subscribed["exp_ccnl_krx"] = set(vi_codes)
+                        logger.info(f"{ts_prefix()} [a2-WSS] VI 예상체결 구독: {len(vi_codes)}종목")
+                except Exception as e:
+                    logger.error(f"{ts_prefix()} [a2-WSS] 초기 구독 실패: {e}")
+
+            t_sub = threading.Thread(target=_a2_initial_subscribe, daemon=True)
+            t_sub.start()
+
+            logger.info(f"{ts_prefix()} [a2-WSS] start on_result")
+            kws.start(on_result=_on_result_a2)
+            logger.info(f"{ts_prefix()} [a2-WSS] kws.start returned")
+
+        except SystemExit:
+            break
+        except Exception as e:
+            logger.error(f"{ts_prefix()} [a2-WSS] connection exception: {e}")
+            logger.error(traceback.format_exc())
+        finally:
+            with _a2_kws_lock:
+                if _a2_active_kws is kws:
+                    _a2_active_kws = None
+            _a2_subscribed.clear()
+
+        if _stop_event.is_set():
+            break
+
+        wait = min(backoff * (2 ** min(attempt - 1, 5)), 60)
+        logger.info(f"{ts_prefix()} [a2-WSS] reconnect in {wait}s...")
+        time.sleep(wait)
+
+    logger.info(f"{ts_prefix()} [a2-WSS] stopped")
+
+
+def _a2_mkstatus_sub_add(codes_to_add: set[str]) -> None:
+    """a2 WSS에서 H0STMKO0 구독 추가."""
+    new_codes = codes_to_add - _a2_subscribed.get("market_status_krx", set())
+    if not new_codes:
+        return
+    with _a2_kws_lock:
+        if _a2_active_kws is not None:
+            try:
+                for i in range(0, len(list(new_codes)), MAX_CODES_PER_SESSION):
+                    batch = list(new_codes)[i:i + MAX_CODES_PER_SESSION]
+                    _a2_active_kws.send_request(request=market_status_krx, tr_type="1", data=batch)  # noqa: F405
+                existing = _a2_subscribed.get("market_status_krx", set())
+                _a2_subscribed["market_status_krx"] = existing | new_codes
+                _mkstatus_sub_codes.update(new_codes)
+                names = [f"{code_name_map.get(c, c)}({c})" for c in new_codes]
+                logger.info(f"{ts_prefix()} [a2-WSS][H0STMKO0] 구독 추가: {', '.join(names)}")
+            except Exception as e:
+                logger.warning(f"{ts_prefix()} [a2-WSS][H0STMKO0] 구독 실패: {e}")
+
+
+def _a2_mkstatus_sub_remove(codes_to_remove: set[str]) -> None:
+    """a2 WSS에서 H0STMKO0 구독 해제."""
+    existing = _a2_subscribed.get("market_status_krx", set())
+    active = codes_to_remove & existing
+    if not active:
+        return
+    with _a2_kws_lock:
+        if _a2_active_kws is not None:
+            try:
+                for i in range(0, len(list(active)), MAX_CODES_PER_SESSION):
+                    batch = list(active)[i:i + MAX_CODES_PER_SESSION]
+                    _a2_active_kws.send_request(request=market_status_krx, tr_type="2", data=batch)  # noqa: F405
+                _a2_subscribed["market_status_krx"] = existing - active
+                _mkstatus_sub_codes -= active
+                names = [f"{code_name_map.get(c, c)}({c})" for c in active]
+                logger.info(f"{ts_prefix()} [a2-WSS][H0STMKO0] 구독 해제: {', '.join(names)}")
+            except Exception as e:
+                logger.warning(f"{ts_prefix()} [a2-WSS][H0STMKO0] 해제 실패: {e}")
+
+
 def _desired_subscription_map(now: datetime) -> dict:
     """
     종목별 구독 매핑을 반환: {request_func: set(종목코드)}
@@ -8729,41 +9097,25 @@ def run_ws_forever():
                 logger.warning(warn_msg)
                 _notify(warn_msg, tele=True)
 
-            # H0STMKO0 장운영정보: 보유종목 VI 감지 + 장운영 keep-alive (정규장 시간대)
-            mko_codes: set[str] = set()
-            if dtime(8, 50) <= now_t < dtime(15, 30):
-                held_codes = set()
-                with _str1_sell_state_lock:
-                    held_codes = {c for c, st in _str1_sell_state.items() if not st.get("sold")}
-                keepalive_codes: set[str] = set()
-                for mkt, rep_code in _MKT_KEEPALIVE_INITIAL.items():
-                    if not _mkt_keepalive_current.get(mkt):
-                        _mkt_keepalive_current[mkt] = rep_code
-                    keepalive_codes.add(_mkt_keepalive_current[mkt])
-                mko_codes = held_codes | keepalive_codes
-
-            # ── 슬롯 상한 준수: H0STCNI0(1) + H0STMKO0(N) + 종목데이터(M) <= 40 ──
+            # H0STMKO0 → a2 WSS로 이관됨 (a1에서 제거)
+            # ── 슬롯 상한 준수: H0STCNI0(1) + 종목데이터(M) <= 40 ──
             ccnl_notice_slots = 1  # H0STCNI0 이미 구독됨
-            mko_slots = len(mko_codes)
             desired_map = _desired_subscription_map(datetime.now(KST))
             data_slots = sum(len(v) for v in desired_map.values())
-            total_sub = ccnl_notice_slots + mko_slots + data_slots
+            total_sub = ccnl_notice_slots + data_slots
 
             if total_sub > MAX_WSS_SUBSCRIBE:
-                # 종목 데이터 슬롯을 줄여서 상한 준수
-                max_data = MAX_WSS_SUBSCRIBE - ccnl_notice_slots - mko_slots
+                max_data = MAX_WSS_SUBSCRIBE - ccnl_notice_slots
                 logger.warning(
                     f"{ts_prefix()} [ws] 구독 상한 초과: {total_sub} > {MAX_WSS_SUBSCRIBE}"
                     f" → 종목데이터 {data_slots} → {max_data}로 축소"
                 )
-                # 종목 데이터 축소: 각 req 타입별 비례 축소
                 over = data_slots - max_data
                 for req in list(desired_map.keys()):
                     if over <= 0:
                         break
                     cs = desired_map[req]
                     if len(cs) > over:
-                        # 우선순위 낮은 종목 제거 (base_codes 우선 유지)
                         removable = cs - _base_codes
                         remove_n = min(len(removable), over)
                         for c in list(removable)[:remove_n]:
@@ -8773,29 +9125,19 @@ def run_ws_forever():
                         over -= len(cs)
                         desired_map[req] = set()
                 data_slots = sum(len(v) for v in desired_map.values())
-                total_sub = ccnl_notice_slots + mko_slots + data_slots
+                total_sub = ccnl_notice_slots + data_slots
 
             for req, code_set in desired_map.items():
                 if code_set:
                     ka.KISWebSocket.subscribe(req, list(code_set))
                 _subscribed[req.__name__] = set(code_set)
 
-            if mko_codes:
-                ka.KISWebSocket.subscribe(market_status_krx, list(mko_codes))  # noqa: F405
-                _mkstatus_sub_codes.update(mko_codes)
-                _subscribed["market_status_krx"] = set(mko_codes)
-                logger.info(
-                    f"{ts_prefix()} [장운영] H0STMKO0 구독: 보유 {len(held_codes)}개 + keep-alive {len(keepalive_codes)}개 "
-                    f"({','.join(f'{mkt}={code_name_map.get(c, c)}' for mkt, c in _mkt_keepalive_current.items())})"
-                )
             sub_desc = ", ".join(f"{r.__name__}={len(c)}종목" for r, c in desired_map.items() if c)
-            if mko_codes:
-                sub_desc += f", H0STMKO0={len(mko_codes)}종목"
             sub_desc += ", H0STCNI0=1"
             logger.info(
                 f"{ts_prefix()} [ws] open_map prepared: {sub_desc} total={total_sub}/{MAX_WSS_SUBSCRIBE}"
+                f" (H0STMKO0→a2 WSS)"
             )
-
             # 재연결 도중 쌓인 이벤트 클리어
             # (open_map에 최신 codes가 이미 반영되었으므로 이전 이벤트는 무효)
             _ws_rebuild_event.clear()
@@ -8969,6 +9311,11 @@ if __name__ == "__main__":
     # 상위 랭킹 추가 구독 루프 시작
     t_top = threading.Thread(target=_top_rank_loop, daemon=True)
     t_top.start()
+
+    # a2 (syw_2) 듀얼 WSS: H0STMKO0 장운영정보 + VI 예상체결가 전담
+    t_a2_wss = threading.Thread(target=run_ws_a2_forever, daemon=True, name="a2-WSS")
+    t_a2_wss.start()
+    logger.info(f"{ts_prefix()} [a2-WSS] 데몬 스레드 시작")
 
     try:
         run_ws_forever()

@@ -793,6 +793,14 @@ class KISWebSocket:
                 continue
 
     async def __runner(self):
+        # ── WSS 연결 안정화 변경 이력 (260422) ──
+        # [변경 전] websockets.connect(url)  — 기본 ping_interval=20s (클라이언트→서버 ping)
+        #           PINGPONG 응답: await ws.pong()
+        # [변경 후] websockets.connect(url, ping_interval=None) — 클라이언트 ping 비활성화
+        #           PINGPONG 응답: await ws.send(raw) — 원본 프레임 그대로 재전송
+        # [이유]   KIS 서버가 서버 주도 PING을 보내며, 클라이언트 ping과 충돌 가능성.
+        #          ws.pong()은 표준 WebSocket PONG이지만 KIS는 JSON PINGPONG 프레임 기대.
+        # [복원]   끊김이 더 잦아질 경우 ping_interval 제거(기본값 복원) + ws.send(raw)→ws.pong() 복원 후 비교
         if len(open_map.keys()) > 40:
             raise ValueError("Subscription's max is 40")
 

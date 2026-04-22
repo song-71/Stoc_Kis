@@ -2,8 +2,18 @@
 # ws_realtime_trading.py 감시/재시작 래퍼
 # - 사망 시 Telegram 알림 + 자동 재시작
 # - 20:10 이후 재시작 안 함, 하루 최대 20회 제한
+#
+# 로그 모드 (첫 인자):
+#   fresh  (기본) — 매일 자동 cron 시작용. 기존 .out 을 날짜스탬프로 rotate 후 새 파일 시작
+#   append         — ws_realtime_trading_Restart.py 수동 재시작용. 기존 .out 에 이어서 append
 set -u
 export TZ="Asia/Seoul"
+
+LOG_MODE="${1:-fresh}"   # 기본값 fresh (crontab 수정 불필요)
+if [[ "$LOG_MODE" != "fresh" && "$LOG_MODE" != "append" ]]; then
+    echo "[runner] 알 수 없는 로그 모드: '$LOG_MODE' (허용: fresh|append) — fresh 로 폴백" >&2
+    LOG_MODE="fresh"
+fi
 
 BASE_DIR="/home/ubuntu/Stoc_Kis"
 VENV_PY="${BASE_DIR}/venv/bin/python"
@@ -15,6 +25,24 @@ END_HHMM="20:10"
 START_HHMM="07:45"
 
 mkdir -p "$(dirname "$RUNNER_LOG")"
+
+# ── 로그 모드에 따른 OUT_LOG 처리 ─────────────────────────────────────────
+# fresh  : 기존 .out 이 있으면 .{yymmdd_HHMM}.out 으로 rotate 후 새로 시작
+# append : 아무것도 안 함 (기존 파일 뒤에 이어서 기록)
+if [[ "$LOG_MODE" == "fresh" ]]; then
+    if [[ -s "$OUT_LOG" ]]; then
+        ROTATE_TS="$(date +%y%m%d_%H%M)"
+        ROTATED="${OUT_LOG%.out}_${ROTATE_TS}.out"
+        mv "$OUT_LOG" "$ROTATED" 2>/dev/null || true
+        : > "$OUT_LOG"
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] [runner] LOG_MODE=fresh — rotated to $(basename "$ROTATED")" | tee -a "$RUNNER_LOG"
+    else
+        : > "$OUT_LOG"
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] [runner] LOG_MODE=fresh — created new $(basename "$OUT_LOG")" | tee -a "$RUNNER_LOG"
+    fi
+else
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [runner] LOG_MODE=append — appending to existing $(basename "$OUT_LOG")" | tee -a "$RUNNER_LOG"
+fi
 
 _tele() {
     "${VENV_PY}" -c "
@@ -30,8 +58,8 @@ _log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "$RUNNER_LOG"
 }
 
-_log "runner start pid=$$ target=${TARGET}"
-_tele "[runner] ws_realtime_trading.py 시작 (runner pid=$$)"
+_log "runner start pid=$$ target=${TARGET} log_mode=${LOG_MODE}"
+_tele "[runner] ws_realtime_trading.py 시작 (runner pid=$$, log_mode=${LOG_MODE})"
 
 restart_count=0
 

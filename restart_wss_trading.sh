@@ -31,8 +31,8 @@ if [ "$EXITED" -eq 0 ]; then
     sleep 1
 fi
 
-echo "[restart] runner를 통해 새 프로세스 시작..."
-nohup bash "$RUNNER_SCRIPT" > /dev/null 2>&1 &
+echo "[restart] runner를 통해 새 프로세스 시작 (log_mode=append: 기존 .out 에 이어서 기록)..."
+nohup bash "$RUNNER_SCRIPT" append > /dev/null 2>&1 &
 sleep 2
 if pgrep -f "$SCRIPT_NAME" > /dev/null 2>&1; then
     pgrep -af "$SCRIPT_NAME"

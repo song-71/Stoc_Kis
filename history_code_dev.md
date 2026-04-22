@@ -2,6 +2,35 @@
 
 ---
 
+## [2026-04-22] ecbd05c
+- **Category**: docs
+- **Title**: WSS 연결 안정화 변경 이력 주석 추가
+- **Files**: `kis_auth_llm.py`
+- **Changes**:
+  1. `__runner` 메서드 내부에 WSS 연결 안정화 변경 이력 주석 8줄 추가
+  2. 변경 전/후 상태 명시: `ping_interval` 기본값(20s) → `None` 비활성화
+  3. PINGPONG 응답 방식 변경: `ws.pong()` → `ws.send(raw)` (KIS JSON 프레임 기대)
+  4. 끊김 재발 시 복원 방법 가이드 포함
+- **Impact**:
+  - 코드 동작 변경 없음 (주석 추가만)
+  - 향후 담당자가 WSS 설정을 롤백하거나 비교 실험할 때 근거 자료로 활용 가능
+
+## [2026-04-22] 9295fa7
+- **Category**: perf
+- **Title**: ingest_loop 성능 최적화 및 Polars 전환 + 완료 리서치 파일 정리
+- **Files**: `ws_realtime_trading.py`, `kis_auth_llm.py`, `fetch_top30_each_1m.py`, `kis_1d_unified_parquet.py`, `kis_1d_Daily_ohlcv_fetch_manager.py`, `Daily_inquire_vi_status.py`, `Daily_fetch_auto_run.sh`, `restart_wss_trading.sh`, `ws_realtime_trading_runner.sh`, `symulation/Query_Krx_code.py`, `symulation/Select_Tr_target_list_symulation_pdy_ctrt.py`
+- **Changes**:
+  1. **[ingest_loop 성능 최적화]**: partition_by 통합, `_lock` 제거, BB(볼린저밴드) incremental 처리, zfill 통합으로 불필요한 반복 연산 제거
+  2. **[Pandas → Polars 전환]**: `ws_realtime_trading.py` 핵심 루프 및 `kis_auth_llm.py`의 `pd.read_csv` → `pl.read_csv` 전환으로 처리 속도 개선
+  3. **[종가 결과 로그 개선]**: `_log_closing_result_after_window`를 print_table 정렬 출력 방식으로 변경하여 가독성 향상
+  4. **[스크립트 개선]**: `restart_wss_trading.sh`, `ws_realtime_trading_runner.sh`, `Daily_fetch_auto_run.sh` 운영 개선
+  5. **[리서치 파일 정리]**: 완료된 리서치 파일 5개 삭제 (research_260330-1.md, ws_monitoring_research_260402-2.md, 260404.md, 260407.md, 260408.md)
+  6. **[기타]**: symulation 파일, Daily 운영 스크립트 업데이트
+- **Impact**:
+  - ingest_loop 처리 속도 향상으로 실시간 틱 데이터 처리 지연 감소
+  - Polars 전환으로 대용량 데이터 로딩/처리 성능 개선
+  - 완료된 리서치 파일 정리로 프로젝트 구조 간소화
+
 ## [2026-04-22] 5c5f403
 - **Category**: feat
 - **Title**: 듀얼 WSS 구조 도입 + VI 감지 개선 + 잔고조회 버그 수정

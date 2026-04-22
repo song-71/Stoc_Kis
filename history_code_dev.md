@@ -2,6 +2,40 @@
 
 ---
 
+## [2026-04-22] 1197b66
+- **Category**: feat
+- **Title**: 상한가 근접 매수 전략 (_1 백업 파일 분리 구현)
+- **Files**: `ws_realtime_trading_1.py` (신규), `ws_realtime_tr_str1_1.py` (신규), `kis_signal_apis.py` (신규), `kis_utils.py`
+- **Changes**:
+  1. **[ws_realtime_trading_1.py]** 원본 복사 후 상한가 근접 전략 통합 11포인트
+     - 상단 옵션 플래그 15개: `UPLIMIT_TRADE_ENABLED`, `UPLIMIT_MAX_POSITIONS`, `UPLIMIT_SEED_KRW`, `UPLIMIT_APPROACH_PCT_LOW/HIGH`, `UPLIMIT_EXIT_*` 등
+     - 상태 dict 10개: `uplimit_holdings`, `uplimit_entry_price`, `uplimit_entry_qty`, `uplimit_peak_price`, `uplimit_half_exited`, `uplimit_signal_cache` 등
+     - 신규 함수 8개: `_try_uplimit_buy`, `_try_uplimit_exit`, `_check_uplimit_exit_for_tick`, `_check_uplimit_conditions_from_tick`, `_handle_uplimit_ccnl_fill`, `_precache_uplimit_signals`, `_save_uplimit_state`, `_restore_uplimit_state_on_startup`
+     - `ingest_loop` 내 전일대비 25~28% 구간 진입 감지 분기 추가
+     - uplimit 보유 종목은 기존 `EMERGENCY_29PCT_SELL` (check_sell_by_prdy_ctrt_periodic) 대상 제외
+     - 종가매수 `_prepare_closing_buy_orders`에 폭락 필터 통합 (`closing_crash_filter_signal`)
+     - `_on_ccnl_notice_filled` 체결통보에 uplimit 체결 분기 추가
+     - startup 시 `_restore_uplimit_state_on_startup` 호출로 재시작 연속성 보장
+  2. **[ws_realtime_tr_str1_1.py]** 원본 복사 후 순수 판단 함수 6개 추가
+     - `uplimit_approach_buy_signal`: 13필터 AND (등락률 범위, 시총, 거래대금, Volume Power, frgnmem 순매수, BB 위치, 시간, iscd_stat_cls_code 정상, VI 이력 없음 등)
+     - `uplimit_approach_exit`: 5단계 우선순위 청산 판단 (대폭락 -5% > 손절 -3% > 단계적 29%→28% 절반→27% 전량 > 타임아웃 > 트레일링)
+     - `closing_crash_filter_signal`: 종가매수 전 당일 급락 종목 차단 (-5% 이상 하락 또는 VP 급감)
+     - `closing_next_day_exit`: 종가매수 익일 청산 판단 (갭상승/갭하락/시간 기반)
+     - `calc_uplimit_qty`: 시드 기반 수량 계산 (호가단위 반올림)
+     - `calc_entry_price`: 진입 기준가 계산 (현재가 + N틱)
+  3. **[kis_signal_apis.py]** 신규 모듈
+     - `get_volume_power`: `inquire_price` 응답의 `tday_rltv` 필드 재활용 Volume Power 조회
+     - `get_frgnmem_net_buy_3d`: 3일 외국인+기관 순매수 집계 래퍼
+     - `get_ranking_wrapper`: 거래량/등락률 랭킹 조회 공통 래퍼
+  4. **[kis_utils.py]** `price_plus_n_ticks(price, n, market)` 헬퍼 추가
+     - `_kr_tick_size` / `round_to_tick` 기반으로 `price_minus_one_tick`과 대칭 구조
+- **Impact**:
+  - 원본 `ws_realtime_trading.py` / `ws_realtime_tr_str1.py` 완전 무수정 — 두 버전 나란히 실행 가능
+  - 시드 460K 고정, UPLIMIT_MAX_POSITIONS=1 (1종목 집중 투자)
+  - 단계적 청산으로 상한가 도달 시 수익 극대화 + 대폭락 방지 손실 방어 우선
+  - py_compile 4개 파일 통과, 신규 함수 6개 import 검증 완료, Buy/Exit 시나리오 sanity 통과
+- **Related Docs**: `docs/01. up_limit_buy_str_260420.md`, `docs/02. Top30_str.md`, `docs/str_exec_research_0422.md`, `.claude/plans/1-elegant-tome.md`
+
 ## [2026-04-22] ecbd05c
 - **Category**: docs
 - **Title**: WSS 연결 안정화 변경 이력 주석 추가

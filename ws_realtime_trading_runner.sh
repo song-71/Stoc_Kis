@@ -4,8 +4,8 @@
 # - 20:10 이후 재시작 안 함, 하루 최대 20회 제한
 #
 # 로그 모드 (첫 인자):
-#   fresh  (기본) — 매일 자동 cron 시작용. 기존 .out 을 날짜스탬프로 rotate 후 새 파일 시작
-#   append         — ws_realtime_trading_Restart.py 수동 재시작용. 기존 .out 에 이어서 append
+#   fresh  (기본) — 매일 자동 cron 시작용. 기존 .out 을 덮어쓰기(truncate) 후 처음부터 시작
+#   append         — ws_realtime_trading_Restart.py 수동 재시작용. 기존 .out 에 이어서 기록
 set -u
 export TZ="Asia/Seoul"
 
@@ -27,21 +27,13 @@ START_HHMM="07:45"
 mkdir -p "$(dirname "$RUNNER_LOG")"
 
 # ── 로그 모드에 따른 OUT_LOG 처리 ─────────────────────────────────────────
-# fresh  : 기존 .out 이 있으면 .{yymmdd_HHMM}.out 으로 rotate 후 새로 시작
-# append : 아무것도 안 함 (기존 파일 뒤에 이어서 기록)
+# fresh  : 기존 .out 을 덮어쓰기 (truncate) — 매일 자동 실행 시 처음부터 시작
+# append : 아무것도 안 함 (기존 파일 뒤에 이어서 기록) — 당일 중 수동 재시작용
 if [[ "$LOG_MODE" == "fresh" ]]; then
-    if [[ -s "$OUT_LOG" ]]; then
-        ROTATE_TS="$(date +%y%m%d_%H%M)"
-        ROTATED="${OUT_LOG%.out}_${ROTATE_TS}.out"
-        mv "$OUT_LOG" "$ROTATED" 2>/dev/null || true
-        : > "$OUT_LOG"
-        echo "[$(date '+%Y-%m-%d %H:%M:%S')] [runner] LOG_MODE=fresh — rotated to $(basename "$ROTATED")" | tee -a "$RUNNER_LOG"
-    else
-        : > "$OUT_LOG"
-        echo "[$(date '+%Y-%m-%d %H:%M:%S')] [runner] LOG_MODE=fresh — created new $(basename "$OUT_LOG")" | tee -a "$RUNNER_LOG"
-    fi
+    : > "$OUT_LOG"
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [runner] LOG_MODE=fresh — $(basename "$OUT_LOG") 덮어쓰기 (처음부터 시작)" | tee -a "$RUNNER_LOG"
 else
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [runner] LOG_MODE=append — appending to existing $(basename "$OUT_LOG")" | tee -a "$RUNNER_LOG"
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [runner] LOG_MODE=append — $(basename "$OUT_LOG") 이어쓰기" | tee -a "$RUNNER_LOG"
 fi
 
 _tele() {

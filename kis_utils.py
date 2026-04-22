@@ -994,6 +994,14 @@ def price_minus_one_tick(price: float, market: str = "KOSPI") -> float:
     return max(tick, price - tick)
 
 
+def price_plus_n_ticks(price: float, n: int = 1, market: str = "KOSPI") -> float:
+    """가격 + N틱 (호가단위 기반). 상한가 초과 방지는 호출측 책임."""
+    if price <= 0 or n <= 0:
+        return price
+    tick = _kr_tick_size(price, market)
+    return round_to_tick(price + tick * n, market)
+
+
 def calc_limit_down_price(prev_close: float, market: str = "KOSPI") -> float:
     """KRX 공식 하한가: 변동폭(기준가×30%)을 호가단위로 절사 → 기준가-변동폭을 호가단위로 올림(ceil)."""
     if prev_close is None or prev_close != prev_close or prev_close <= 0:

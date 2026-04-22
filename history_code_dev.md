@@ -2,6 +2,24 @@
 
 ---
 
+## [2026-04-22] 87695d0
+- **Category**: chore
+- **Title**: _1 백업 파일을 정식 파일로 승격 및 _0422 날짜 백업 보존
+- **Files**: `ws_realtime_trading.py`, `ws_realtime_tr_str1.py`, `ws_realtime_trading_0422.py` (신규), `ws_realtime_tr_str1_0422.py` (신규), `ws_realtime_trading_1.py` (삭제), `ws_realtime_tr_str1_1.py` (삭제)
+- **Changes**:
+  1. **파일 승격**: 1197b66 커밋에서 `_1` 백업으로 구현한 파일을 정식 운영 파일로 대체
+     - `ws_realtime_trading_1.py` → `ws_realtime_trading.py` 덮어쓰기 (상한가 근접 매수 + 종가 폭락 필터 포함)
+     - `ws_realtime_tr_str1_1.py` → `ws_realtime_tr_str1.py` 덮어쓰기
+  2. **날짜 백업 보존**: 직전 정식 파일을 `_0422` 날짜 스탬프로 보존
+     - `ws_realtime_trading.py` → `ws_realtime_trading_0422.py`
+     - `ws_realtime_tr_str1.py` → `ws_realtime_tr_str1_0422.py`
+  3. **내부 참조 정리**:
+     - `ws_realtime_trading.py` import 경로 `ws_realtime_tr_str1_1` → `ws_realtime_tr_str1` 복구
+     - `ws_realtime_tr_str1.py` docstring 내 `(v_1)` 라벨 및 `_1` 파일 참조 정식 이름으로 정정
+     - 본문 `[v_1 신규]` 주석 태그는 이력 추적 용도로 의도적 보존 (다음 리팩토링 시 정리 예정)
+  4. **컴파일 검증**: `python3 -m py_compile` 통과, import 정상 확인
+- **Impact**: 향후 운영은 `ws_realtime_trading.py` 정식 파일로 진행. 기존 `_1` 파일 제거로 파일 구조 정리.
+
 ## [2026-04-22] 1197b66
 - **Category**: feat
 - **Title**: 상한가 근접 매수 전략 (_1 백업 파일 분리 구현)

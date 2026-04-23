@@ -5061,6 +5061,9 @@ _MKOP_EVENT_NAMES = {
 }
 _CB_ACTIVE_EVENTS = {"서킷브레이크발동", "서킷브레이크개시", "서킷브레이크동시호가"}
 _rest_fail_backoff: dict[str, int] = {}       # REST 500 에러 연속 횟수 (백오프용)
+_price_block_until: dict[str, float] = {}     # [v_1] code → TTL 만료 unix_ts (500 에러 3회+ 종목 30분 조회 차단)
+PRICE_BLOCK_FAIL_THRESHOLD = 3                # 500 에러 N회 연속 시 차단 시작
+PRICE_BLOCK_TTL_SEC = 1800                    # 차단 유지 시간 (30분)
 _single_price_codes: dict[str, str] = {}       # code → iscd_stat ("57" or "59") 30분 단일가 매매 종목
 _single_price_pending: dict[str, str] = {}     # code → iscd_stat, 틱 확인 전 대기 종목
 _single_price_observe: dict[str, dict] = {}    # code → {"stat", "first_ts", "tick_count"} 정시 윈도우 관찰 중
@@ -6722,6 +6725,18 @@ def _price_request_loop() -> None:
         else:
             code = item
 
+        # [v_1] 500 에러 3회+ 차단 종목은 건너뜀 (TTL 만료 시 자동 복구)
+        _blk_until = _price_block_until.get(code, 0.0)
+        if _blk_until > time.time():
+            _rest_pending.discard(code)
+            continue
+        elif _blk_until > 0:
+            # TTL 만료 → 차단 해제 + 카운터 초기화 (한 번 더 시도)
+            _price_block_until.pop(code, None)
+            _rest_fail_backoff.pop(code, None)
+            name = code_name_map.get(code, code)
+            logger.info(f"{ts_prefix()} [price_block] {name}({code}) 30분 경과 → 차단 해제, 재시도")
+
         now = time.time()
         # 현재가 요청 초당 제한 (8건)
         now_sec = int(now)
@@ -6742,6 +6757,7 @@ def _price_request_loop() -> None:
             _price_req_count += 1
             last_req_ts = time.time()
             prev_fc = _rest_fail_backoff.pop(code, None)  # 성공 → 거래정지 의심 해제
+            _price_block_until.pop(code, None)             # [v_1] 성공 시 차단 상태도 해제
             if prev_fc:
                 name = code_name_map.get(code, code)
                 logger.info(f"{ts_prefix()} [price] REST 복구: {name}({code}) fc={prev_fc}→0")
@@ -6788,6 +6804,19 @@ def _price_request_loop() -> None:
                         _notify(
                             f"{ts_prefix()} [price] ★ REST 500 연속 + WSS 미수신 "
                             f"→ 거래정지 의심: {name}({code})"
+                        )
+                # [v_1] 3회 이상 연속 500 → 30분 조회 차단 (로그/쿼터 낭비 방지)
+                if fc >= PRICE_BLOCK_FAIL_THRESHOLD:
+                    _price_block_until[code] = time.time() + PRICE_BLOCK_TTL_SEC
+                    if fc == PRICE_BLOCK_FAIL_THRESHOLD:  # 최초 차단 시 1회만 알림
+                        _notify(
+                            f"{ts_prefix()} [price_block] {name}({code}) REST 500 "
+                            f"{fc}회 연속 → {PRICE_BLOCK_TTL_SEC//60}분 조회 차단",
+                            tele=True,
+                        )
+                        logger.warning(
+                            f"{ts_prefix()} [price_block] {name}({code}) 차단 "
+                            f"until={datetime.fromtimestamp(_price_block_until[code], KST).strftime('%H:%M:%S')}"
                         )
                 # _halted_codes 등록 후 → watchdog (C)에서 STALE_CHECK_HALTED_SEC(300초) 간격 적용
                 # 인증 오류일 때만 재초기화

@@ -563,10 +563,10 @@ def calc_entry_price(current_price: float, market: str = "KOSPI", n_ticks: int =
 # 종가매수 폭락 방지 필터 (문서: docs/02. Top30_str.md Part B)
 # =============================================================================
 
-CLOSING_FILTER_FRGN_BLOCK = -1.0           # 외국인 3일 순매수 < 0 이면 차단 (음수 기준)
-CLOSING_FILTER_VP_MIN = 100.0              # 체결강도 하한 (강제 차단)
-CLOSING_FILTER_TRADE_AMT_MIN = 5_000_000_000  # 거래대금 하한 50억
-CLOSING_FILTER_PASS_STRENGTH = 0.60        # 통과 임계값
+CLOSING_FILTER_FRGN_BLOCK = -1.0           # 외국인 3일 순매수 < 0 이면 차단 (유일한 강제 차단)
+CLOSING_FILTER_VP_MIN = 80.0               # [260423] 완화: 100 → 80 (종가매매 대상은 이미 20%+ 상승이라 VP 기준 완화 가능)
+CLOSING_FILTER_TRADE_AMT_MIN = 3_000_000_000  # [260423] 완화: 50억 → 30억
+CLOSING_FILTER_PASS_STRENGTH = 0.50        # [260423] 완화: 0.60 → 0.50 (점수 기반 가산은 보너스)
 
 
 def closing_crash_filter_signal(
@@ -596,24 +596,28 @@ def closing_crash_filter_signal(
     if stck_hgpr > 0 and (stck_prpr / stck_hgpr) < 0.97:
         return False, f"closing_고가대비약({stck_prpr}/{stck_hgpr})", 0.0
 
-    # 강제 차단 (사용자 결정)
-    if acml_tr_pbmn < CLOSING_FILTER_TRADE_AMT_MIN:
+    # [260423 수정] 강제 차단 완화 — 기존 20%+ 상승 + 고가대비 97%+ 조건이 이미 엄격.
+    # 추가 필터는 "보수적 허용" 원칙: 데이터 누락(VP/외인)은 통과, 명확한 부정 신호만 차단.
+    if acml_tr_pbmn > 0 and acml_tr_pbmn < CLOSING_FILTER_TRADE_AMT_MIN:
+        # 거래대금 30억 미만만 차단 (유동성 리스크 명확)
         return False, f"closing_거래대금부족({int(acml_tr_pbmn/1e8)}억)", 0.0
-    if volume_power is None:
-        return False, "closing_VP누락", 0.0
-    if volume_power < CLOSING_FILTER_VP_MIN:
+    # VP 누락(None)은 허용 — REST 조회 실패/토큰 이슈 등에서 종가매매 전체 막는 사고 방지
+    # VP 있는데 너무 낮은 경우만 차단 (매도 우세)
+    if volume_power is not None and volume_power < CLOSING_FILTER_VP_MIN:
         return False, f"closing_VP약({volume_power:.0f})", 0.0
+    # 외국인 3일 순매도 "명확한" 경우만 차단 (None은 허용)
     if frgn_3d_net is not None and frgn_3d_net < 0:
         return False, f"closing_외인매도({int(frgn_3d_net):,})", 0.0
 
-    # Signal Strength (0.5 기준, 통과 시 0.60+)
+    # Signal Strength (0.5 기준, 통과 임계 0.50 — 기본 조건 통과만 해도 허용)
     s = 0.50
-    detail = [f"VP{volume_power:.0f}"]
+    vp_label = f"VP{volume_power:.0f}" if volume_power is not None else "VP_n/a"
+    detail = [vp_label]
 
     if frgn_3d_net is not None and frgn_3d_net > 0:
         s += 0.15
         detail.append("외인매수")
-    if volume_power >= 150.0:
+    if volume_power is not None and volume_power >= 150.0:
         s += 0.10
         detail.append("VP강")
     if uplimit_bid_ratio is not None and uplimit_bid_ratio >= 0.20:

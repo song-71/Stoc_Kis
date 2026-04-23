@@ -10331,6 +10331,33 @@ def run_ws_forever():
                 except Exception as ae:
                     logger.warning(f"{ts_prefix()} [ws] auth_ws 재발급 실패: {ae}")
 
+                # [260423] auth_ws 실패 감지 — approval_key 가 없거나 빈 상태면 연속 실패 카운터 증가
+                _ak = (getattr(ka, "_base_headers_ws", {}) or {}).get("approval_key")
+                if not _ak:
+                    _auth_fail = getattr(run_ws_forever, "_auth_fail_count", 0) + 1
+                    run_ws_forever._auth_fail_count = _auth_fail
+                    _notify(
+                        f"{ts_prefix()} [ws] ★ approval_key 재발급 실패 ({_auth_fail}회 연속) — "
+                        f"KIS 토큰 서버 응답 없음",
+                        tele=True,
+                    )
+                    # 3회 연속 실패 시 프로세스 강제 종료 → runner 가 자동 재시작 (fresh approval_key)
+                    if _auth_fail >= 3:
+                        _notify(
+                            f"{ts_prefix()} [ws] ★★ approval_key 3회 연속 실패 → "
+                            f"프로세스 종료 (runner 재시작 유도)",
+                            tele=True,
+                        )
+                        logger.error(f"{ts_prefix()} [ws] auth_ws 3회 연속 실패 → sys.exit(1)")
+                        # 짧은 대기 후 강제 종료 (정상 shutdown 경로 생략 — 이미 WSS 끊긴 상태)
+                        time.sleep(1.0)
+                        os._exit(1)  # noqa — runner 가 감지하여 재시작
+                    # 다음 재시도 전 대기 (60초 후 재시도)
+                    time.sleep(60)
+                    continue
+                else:
+                    run_ws_forever._auth_fail_count = 0   # 성공 시 리셋
+
             # open_map 초기화 후 현재 시각에 맞는 구독 등록 (종목별 매핑)
             ka.open_map.clear()
             _subscribed.clear()

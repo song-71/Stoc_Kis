@@ -7990,8 +7990,16 @@ def _top_rank_loop():
                 # --- 2) 25% 이상 모든 Top 종목 → 구독 추가 (신규만)
                 candidates = []
                 for code in current_top_codes:
-                    if current_top_ctrt.get(code, 0.0) < UPLIMIT_SUBSCRIBE_MIN_CTRT:
+                    _ctrt_cur = current_top_ctrt.get(code, 0.0)
+                    if _ctrt_cur < UPLIMIT_SUBSCRIBE_MIN_CTRT:
                         continue   # [260423] 25% 미만은 편입 대상 아님
+                    # [260423] 상한가 30% 초과 이상치 제외 (SPAC/재상장/오류 데이터)
+                    if _ctrt_cur > 30.0:
+                        continue
+                    # [260423] SPAC(스팩) 제외 — 상한가 규정 무의미, 변동성 예측 불가
+                    _nm = code_name_map.get(code, "")
+                    if "스팩" in _nm or "SPAC" in _nm.upper():
+                        continue
                     if code in _base_codes:
                         continue
                     if code in codes:

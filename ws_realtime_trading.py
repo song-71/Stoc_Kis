@@ -6004,18 +6004,30 @@ def _calc_uplimit_day_avg_vol_per_min(code: str, acml_vol: float, now_dt: dateti
     return acml_vol / mins
 
 
+UPLIMIT_VP_FAIL_TTL_SEC = 10  # VP 조회 실패 시 재시도 억제 기간
+
+
 def _get_uplimit_volume_power(client, code: str) -> float | None:
-    """체결강도 조회 (30초 TTL 캐시)."""
+    """체결강도 조회 (성공 30초 / 실패 10초 TTL 캐시 + 500 block 존중).
+
+    실패도 캐시하여 매 틱 재호출로 인한 inquire_price retry 루프 폭주를 방지.
+    """
+    # 500 차단 중인 종목은 inquire_price 자체가 실패할 것이므로 skip
+    if _price_block_until.get(code, 0.0) > time.time():
+        return None
     cached = _uplimit_volume_power.get(code)
-    if cached and (time.time() - cached[1]) < UPLIMIT_VP_TTL_SEC:
-        return cached[0]
+    if cached is not None:
+        cached_val, cached_ts = cached
+        age = time.time() - cached_ts
+        ttl = UPLIMIT_VP_TTL_SEC if cached_val is not None else UPLIMIT_VP_FAIL_TTL_SEC
+        if age < ttl:
+            return cached_val
     try:
         v = fetch_volume_power(client, code)
-        if v is not None:
-            _uplimit_volume_power[code] = (v, time.time())
-        return v
     except Exception:
-        return None
+        v = None
+    _uplimit_volume_power[code] = (v, time.time())
+    return v
 
 
 def _try_uplimit_buy(

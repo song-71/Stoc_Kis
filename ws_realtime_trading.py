@@ -5956,6 +5956,76 @@ def _precache_uplimit_signals() -> None:
         logger.error(f"{ts_prefix()} [uplimit_precache] 실패: {e}")
 
 
+def _precache_uplimit_for_new_codes(new_codes: list[str]) -> None:
+    """[v_1] Top30 장중 동적 추가 종목에 대한 uplimit 필터용 캐시 구축.
+    - vola_10d (10일 일봉 std) : kis_1d parquet 에서 즉시 계산
+    - prev_day_prdy_ctrt       : 일봉 최근 2개 비교
+    - frgn_3d_net              : REST 호출 (코드당 1회, 짧은 sleep 포함)
+    이미 캐시된 코드는 skip.
+    """
+    if not new_codes:
+        return
+    target = [c.zfill(6) for c in new_codes
+              if c.zfill(6) not in _uplimit_vola_10d]
+    if not target:
+        return
+
+    # 일봉 parquet 기반 vola_10d + prev_day_ctrt
+    try:
+        import polars as _pl
+        import glob
+        import math
+        from pathlib import Path as _Path
+        daily_path = _Path("/home/ubuntu/Stoc_Kis/data/fetch_daily_KRX_ohlcv/kis_1d_parquet")
+        if daily_path.exists():
+            files = sorted(glob.glob(str(daily_path / "*.parquet")))[-20:]
+            if files:
+                df = _pl.concat([_pl.read_parquet(f) for f in files])
+                if "code" in df.columns and "close" in df.columns:
+                    for code in target:
+                        sub = df.filter(_pl.col("code") == code).sort("date")
+                        if sub.height < 11:
+                            continue
+                        closes = sub.tail(11).get_column("close").to_list()
+                        if len(closes) < 11:
+                            continue
+                        rets = [math.log(closes[i]/closes[i-1])
+                                for i in range(1, len(closes))
+                                if closes[i-1] > 0 and closes[i] > 0]
+                        if len(rets) >= 5:
+                            mean = sum(rets)/len(rets)
+                            var = sum((x-mean)**2 for x in rets)/len(rets)
+                            _uplimit_vola_10d[code] = math.sqrt(var)
+                        if len(closes) >= 2 and closes[-2] > 0:
+                            _uplimit_prev_day_ctrt[code] = (closes[-1]/closes[-2] - 1) * 100
+    except Exception as e:
+        logger.warning(f"{ts_prefix()} [uplimit_precache_top] 일봉 계산 실패: {e}")
+
+    # 외국인 3일 순매수 (REST, 비동기 제출로 블로킹 최소화)
+    try:
+        client = _top_client or _init_top_client()
+        frgn_fetched = 0
+        for code in target[:10]:  # 한 번에 최대 10개만
+            if code in _uplimit_frgn_3d:
+                continue
+            try:
+                v = fetch_frgn_3day_net(client, code)
+                if v is not None:
+                    _uplimit_frgn_3d[code] = v
+                    frgn_fetched += 1
+                time.sleep(0.05)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    logger.info(
+        f"{ts_prefix()} [uplimit_precache_top] Top30 신규 {len(target)}종목 캐시 "
+        f"vola={sum(1 for c in target if c in _uplimit_vola_10d)}, "
+        f"prev_ctrt={sum(1 for c in target if c in _uplimit_prev_day_ctrt)}"
+    )
+
+
 def _update_uplimit_minute_vol(code: str, acml_vol: float, now_dt: datetime) -> None:
     """틱마다 분봉 경계 감지하여 직전 분의 거래량을 5분 버킷에 누적."""
     if acml_vol <= 0:
@@ -6098,10 +6168,10 @@ def _try_uplimit_buy(
     )
 
     if not should_buy:
-        # 디버그 로그 (쏟아짐 방지: 5초 쿨다운)
+        # INFO 로그 (종목당 10초 쿨다운 — skip 사유 가시화)
         last_log_ts = getattr(_try_uplimit_buy, "_last_log_ts", {})
-        if time.time() - last_log_ts.get(code, 0) > 5:
-            logger.debug(f"{ts_prefix()} [uplimit_skip] {name}({code}) {reason}")
+        if time.time() - last_log_ts.get(code, 0) > 10:
+            logger.info(f"{ts_prefix()} [uplimit_skip] {name}({code}) {reason}")
             last_log_ts[code] = time.time()
             setattr(_try_uplimit_buy, "_last_log_ts", last_log_ts)
         return
@@ -7725,6 +7795,12 @@ def _top_rank_loop():
                     _top_added_codes.add(c)
                     name = code_name_map.get(c, c)
                     _log_top_sub_event(c, name, "추가")
+                # [v_1] Top30 신규 추가 종목에 uplimit 프리캐시 (vola_10d, prev_day_ctrt, frgn_3d)
+                if UPLIMIT_BUY_ENABLED and added:
+                    try:
+                        _precache_uplimit_for_new_codes(added)
+                    except Exception as _e:
+                        logger.warning(f"{ts_prefix()} [uplimit_precache_top] 실패: {_e}")
                 added_names = [code_name_map.get(c, c) for c in added]
                 if added:
                     msg2 = f"{ts_prefix()} [top] 구독 추가: {added} / {added_names} (총 {len(codes)}/{MAX_WSS_SUBSCRIBE})"

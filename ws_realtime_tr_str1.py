@@ -542,6 +542,220 @@ def uplimit_should_setup_stop_orders(
     return False, ""
 
 
+# =============================================================================
+# [260423] Strategy B — MA trend-following (틱 EMA 기반)
+#   매수 F: ma50>ma500 골든크로스 순간 edge-trigger + 15~29% 구간 + 필수
+#   매도 E: ma10<ma500 데드크로스 또는 손절/트레일/마감
+# =============================================================================
+
+MA_TREND_BUY_CTRT_MIN = 15.0        # 매수 대상 등락률 하한
+MA_TREND_BUY_CTRT_MAX = 29.0        # 상한 (Strategy A 영역과 겹치지 않게)
+MA_TREND_PREV_CTRT_MAX = 10.0       # 전일 등락률 상한 (작전주 차단)
+MA_TREND_MIN_VOLUME = 100_000       # 최소 거래량
+MA_TREND_STOP_LOSS_PCT = 0.03       # 매수가 대비 -3% 손절
+MA_TREND_TRAIL_PCT = 0.03           # 고점 대비 -3% 트레일링
+MA_TREND_TRAIL_ACTIVATE_PCT = 0.03  # 매수가 대비 +3% 상승 후 트레일 활성
+
+
+def ma_trend_buy_signal(
+    prdy_ctrt: float,
+    prev_day_prdy_ctrt: float,
+    acml_vol: float,
+    ma50_cur: float,
+    ma500_cur: float,
+    ma50_prev: float,
+    ma500_prev: float,
+    already_holding: bool,
+    now_hm: tuple[int, int],
+) -> tuple[bool, str]:
+    """Strategy B 매수 판단 — ma50 > ma500 골든크로스 순간 edge-trigger.
+
+    조건 (AND):
+      F1. 09:30 ≤ 시간 ≤ 14:30
+      F2. 15% ≤ prdy_ctrt < 29%
+      F3. ma50 > ma500 (현재)
+      F4. 직전 틱 ma50 ≤ ma500 (골든크로스 edge)
+      F5. 전일 등락률 < 10%
+      F6. 거래량 ≥ 100,000주
+      F7. 이미 보유 중 아님
+    """
+    h, m = now_hm
+    if h < 9 or (h == 9 and m < 30):
+        return False, "ma_trend_F1_시간대전"
+    if h >= 15 or (h == 14 and m >= 30):
+        return False, "ma_trend_F1_시간대후"
+    if already_holding:
+        return False, "ma_trend_F7_보유중"
+    if not (MA_TREND_BUY_CTRT_MIN <= prdy_ctrt < MA_TREND_BUY_CTRT_MAX):
+        return False, f"ma_trend_F2_구간({prdy_ctrt:.2f}%)"
+    if prev_day_prdy_ctrt >= MA_TREND_PREV_CTRT_MAX:
+        return False, f"ma_trend_F5_전일급등({prev_day_prdy_ctrt:.1f}%)"
+    if acml_vol < MA_TREND_MIN_VOLUME:
+        return False, f"ma_trend_F6_거래량부족({int(acml_vol):,})"
+    # MA 값 유효성
+    if ma50_cur <= 0 or ma500_cur <= 0 or ma50_prev <= 0 or ma500_prev <= 0:
+        return False, "ma_trend_F3_MA누락"
+    # F3+F4: 골든크로스 순간 (prev ≤, cur >)
+    if not (ma50_prev <= ma500_prev and ma50_cur > ma500_cur):
+        return False, f"ma_trend_F3_골든크로스아님(prev:{ma50_prev:.1f}/{ma500_prev:.1f},cur:{ma50_cur:.1f}/{ma500_cur:.1f})"
+    return True, (
+        f"ma_trend_매수_골든크로스(ma50:{ma50_prev:.1f}→{ma50_cur:.1f}, "
+        f"ma500:{ma500_prev:.1f}→{ma500_cur:.1f}, ctrt:{prdy_ctrt:.2f}%)"
+    )
+
+
+def ma_trend_exit_signal(
+    ma10_cur: float,
+    ma500_cur: float,
+    bidp1: float,
+    buy_price: float,
+    highest_since_buy: float,
+    now_hm: tuple[int, int],
+) -> tuple[bool, str]:
+    """Strategy B 매도 판단 — ma10 < ma500 데드크로스 OR 손절 OR 트레일 OR 마감.
+
+    OR 조건:
+      E1. ma10 < ma500 데드크로스
+      E2. bidp1 ≤ buy_price × (1 - 0.03) 손절
+      E3. 고점 대비 -3% 트레일 (매수가 +3% 상승 후 활성)
+      E4. 14:55 마감 청산
+    """
+    if buy_price <= 0 or bidp1 <= 0:
+        return False, ""
+    h, m = now_hm
+    # E4 마감 청산
+    if h == 14 and m >= 55:
+        return True, "ma_trend_마감청산(14:55+)"
+    if h >= 15:
+        return True, "ma_trend_마감청산(15:00+)"
+    # E2 손절
+    if bidp1 <= buy_price * (1 - MA_TREND_STOP_LOSS_PCT):
+        return True, f"ma_trend_손절-3%({bidp1}/{buy_price})"
+    # E3 트레일링 (매수가 대비 +3% 상승 후 활성)
+    if highest_since_buy > 0 and highest_since_buy >= buy_price * (1 + MA_TREND_TRAIL_ACTIVATE_PCT):
+        trail_level = highest_since_buy * (1 - MA_TREND_TRAIL_PCT)
+        if bidp1 <= trail_level:
+            return True, f"ma_trend_트레일-3%(고가{int(highest_since_buy):,})"
+    # E1 데드크로스
+    if ma10_cur > 0 and ma500_cur > 0 and ma10_cur < ma500_cur:
+        return True, f"ma_trend_ma10<ma500_데드크로스({ma10_cur:.1f}<{ma500_cur:.1f})"
+    return False, ""
+
+
+# =============================================================================
+# [260423] Strategy C — 볼린저 밴드 squeeze → expansion + 하단 반등
+#   매수 F: BB 폭 압축 후 확장 + bidp1 < bb_lower 이탈 후 복귀 + 첫 양틱
+#   매도 E: bidp1 < bb_mid 절반 / < bb_lower 전량
+# =============================================================================
+
+BB_EXP_WIDTH_SQUEEZE = 20.0         # 이 값 미만이면 "압축" (참고: 정규화 고려 대상)
+BB_EXP_WIDTH_EXPAND = 24.0          # 이 값 초과면 "확장"
+BB_EXP_CROSSBACK_LOOKBACK = 30      # bb_lower 이탈 이력 조회 범위 (틱)
+BB_EXP_BUY_CTRT_MIN = 0.0           # 하루 상승중 종목만 (하락중 제외)
+BB_EXP_STOP_LOSS_PCT = 0.03
+BB_EXP_TRAIL_PCT = 0.03
+BB_EXP_TRAIL_ACTIVATE_PCT = 0.03
+
+
+def bb_expansion_buy_signal(
+    prdy_ctrt: float,
+    bidp1: float,
+    bidp1_prev: float,
+    bb_lower_cur: float,
+    bb_width_cur: float,
+    bb_width_min_recent: float,
+    bb_lower_crossed_recent: bool,
+    bb_lower_crossed_prev_tick: bool,
+    already_holding: bool,
+    now_hm: tuple[int, int],
+) -> tuple[bool, str]:
+    """Strategy C 매수 판단 — BB squeeze→expansion + 하단 이탈-복귀 반등.
+
+    입력:
+      bb_width_min_recent : 최근 100틱 bb_width 최소값 (squeeze 확인)
+      bb_lower_crossed_recent : 최근 N틱 내 bidp1 < bb_lower 발생 여부
+      bb_lower_crossed_prev_tick : 직전 틱에 bidp1 < bb_lower 였는지 (복귀 순간 판정)
+
+    조건 (AND):
+      F1. 09:30 ≤ 시간 ≤ 14:30
+      F2. 변동성 압축 이력 : bb_width_min_recent < 20
+      F3. 변동성 확장 : bb_width_cur > 24
+      F4. 하단 이탈 이력 있음
+      F5. 직전 틱 이탈 상태 → 현재 틱 복귀 (bidp1 ≥ bb_lower)
+      F6. 상승 시작 : bidp1 > bidp1_prev (첫 양틱)
+      F7. 하루 상승중 : prdy_ctrt > 0
+      F8. 중복 방지
+    """
+    h, m = now_hm
+    if h < 9 or (h == 9 and m < 30):
+        return False, "bb_exp_F1_시간대전"
+    if h >= 15 or (h == 14 and m >= 30):
+        return False, "bb_exp_F1_시간대후"
+    if already_holding:
+        return False, "bb_exp_F8_보유중"
+    if prdy_ctrt <= BB_EXP_BUY_CTRT_MIN:
+        return False, f"bb_exp_F7_하락중({prdy_ctrt:.2f}%)"
+    if bb_width_min_recent >= BB_EXP_WIDTH_SQUEEZE:
+        return False, f"bb_exp_F2_압축없음(min={bb_width_min_recent:.2f})"
+    if bb_width_cur <= BB_EXP_WIDTH_EXPAND:
+        return False, f"bb_exp_F3_확장아님(cur={bb_width_cur:.2f})"
+    if not bb_lower_crossed_recent:
+        return False, "bb_exp_F4_하단이탈이력없음"
+    if not bb_lower_crossed_prev_tick:
+        return False, "bb_exp_F5_직전틱이탈아님"
+    if not (bidp1 >= bb_lower_cur):
+        return False, f"bb_exp_F5_아직복귀전(bidp1={bidp1}/lower={bb_lower_cur:.1f})"
+    if bidp1 <= bidp1_prev:
+        return False, f"bb_exp_F6_상승아님(prev={bidp1_prev},cur={bidp1})"
+    return True, (
+        f"bb_exp_매수_압축후복귀반등(width:{bb_width_min_recent:.1f}→{bb_width_cur:.1f}, "
+        f"lower={bb_lower_cur:.1f}, ctrt={prdy_ctrt:.2f}%)"
+    )
+
+
+def bb_expansion_exit_signal(
+    bidp1: float,
+    bb_mid_cur: float,
+    bb_lower_cur: float,
+    buy_price: float,
+    highest_since_buy: float,
+    now_hm: tuple[int, int],
+) -> tuple[str, str]:
+    """Strategy C 매도 판단.
+
+    Returns (action, reason) where action in ("hold","sell_half","sell_all")
+
+    OR 조건:
+      E1. bidp1 < bb_mid → 1차 절반
+      E2. bidp1 < bb_lower → 전량
+      E3. 손절 -3%
+      E4. 트레일 -3% (+3% 상승 후 활성)
+      E5. 14:55 마감 전량
+    """
+    if buy_price <= 0 or bidp1 <= 0:
+        return "hold", ""
+    h, m = now_hm
+    if h == 14 and m >= 55:
+        return "sell_all", "bb_exp_마감청산(14:55+)"
+    if h >= 15:
+        return "sell_all", "bb_exp_마감청산(15:00+)"
+    # 손절
+    if bidp1 <= buy_price * (1 - BB_EXP_STOP_LOSS_PCT):
+        return "sell_all", f"bb_exp_손절-3%({bidp1}/{buy_price})"
+    # bb_lower 재이탈 전량
+    if bb_lower_cur > 0 and bidp1 < bb_lower_cur:
+        return "sell_all", f"bb_exp_bb_lower재이탈({bidp1}<{bb_lower_cur:.1f})"
+    # 트레일링
+    if highest_since_buy > 0 and highest_since_buy >= buy_price * (1 + BB_EXP_TRAIL_ACTIVATE_PCT):
+        trail_level = highest_since_buy * (1 - BB_EXP_TRAIL_PCT)
+        if bidp1 <= trail_level:
+            return "sell_all", f"bb_exp_트레일-3%(고가{int(highest_since_buy):,})"
+    # bb_mid 하회 — 1차 절반
+    if bb_mid_cur > 0 and bidp1 < bb_mid_cur:
+        return "sell_half", f"bb_exp_bb_mid하회절반({bidp1}<{bb_mid_cur:.1f})"
+    return "hold", ""
+
+
 def calc_uplimit_qty(avail_cash: float, buy_price: float, market: str = "KOSPI") -> int:
     """수량 계산. 수수료 0.5% 버퍼 반영."""
     if avail_cash <= 0 or buy_price <= 0:

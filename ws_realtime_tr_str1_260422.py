@@ -310,18 +310,15 @@ UPLIMIT_FILTER_VOLUME_POWER_MIN = 120.0 # 체결강도 하한
 UPLIMIT_FILTER_MIN_VOLUME = 100_000     # 당일 최소 누적 거래량
 UPLIMIT_FILTER_MIN_PRICE = 1000         # 저가주 제외
 
-# Exit 임계값 — [260423] 재설계: 서버 스톱 지정가(ord_dvsn=22) 사용
-UPLIMIT_EXIT_UPPER_LIMIT = 29.5         # 상한가 근접 인정 기준 (이 값 도달 시 스톱 지정가 주문 발주)
-UPLIMIT_EXIT_HALF_THRESHOLD = 29.0      # 상한가 도달 후 이 값 하회 시 1차 절반 매도 (CNDT_PRIC)
-UPLIMIT_EXIT_FULL_THRESHOLD = 28.0      # 이 값 하회 시 2차 나머지 절반 매도 (CNDT_PRIC)
-UPLIMIT_EXIT_MARKET_SELL_CTRT = 25.0    # 25% 하회 시 기존 스톱 취소 + 시장가 전량 매도
-UPLIMIT_EXIT_STOP_LOSS_PCT = 0.03       # -3% 손절 (매수가 대비, 상한가 미도달 시)
-UPLIMIT_EXIT_TRIGGER_CTRT = 28.0        # 28% 상향 돌파 edge-trigger 임계값 (매수 진입)
-# @deprecated — 아래 상수는 구 uplimit_approach_exit 참조용 (사용 안 함)
-UPLIMIT_EXIT_TIMEOUT_MIN = 10.0         # deprecated
-UPLIMIT_EXIT_TIMEOUT_CTRT = 25.0        # deprecated
-UPLIMIT_EXIT_TRAIL_STOP_PCT = 0.02      # deprecated
-UPLIMIT_EXIT_CRASH_GUARD_PCT = 0.05     # deprecated
+# Exit 임계값
+UPLIMIT_EXIT_UPPER_LIMIT = 29.0         # 상한가 근접 인정 (도달 기록 시작)
+UPLIMIT_EXIT_HALF_THRESHOLD = 28.0      # 29% 도달 후 이 값 하회 시 절반 매도
+UPLIMIT_EXIT_FULL_THRESHOLD = 27.0      # 27% 하회 시 전량 매도
+UPLIMIT_EXIT_STOP_LOSS_PCT = 0.03       # -3% 손절
+UPLIMIT_EXIT_CRASH_GUARD_PCT = 0.05     # 상한가 이력 있어도 -5% 이탈 시 강제 청산
+UPLIMIT_EXIT_TIMEOUT_MIN = 10.0         # 매수 후 N분 경과 시 등락률 체크
+UPLIMIT_EXIT_TIMEOUT_CTRT = 25.0        # 타임아웃 시점 이 값 미만이면 청산
+UPLIMIT_EXIT_TRAIL_STOP_PCT = 0.02      # 상한가 미도달 시 트레일링
 
 
 def uplimit_approach_buy_signal(
@@ -343,19 +340,14 @@ def uplimit_approach_buy_signal(
     now_hm: tuple[int, int],
     today_buy_count: int,
     max_daily_buys: int = 3,
-    prev_ctrt: float = 0.0,   # [260423] 직전 틱 등락률 — 28% edge-trigger 용
 ) -> tuple[bool, str, float]:
     """
     상한가 근접 매수 진입 판단. 13개 필터 AND — 하나라도 실패 시 매수 안 함.
 
-    [260423] F3 필터를 "28% 상향 돌파 순간" edge-trigger 로 변경.
-    prev_ctrt < 28.0 ≤ prdy_ctrt < 29.5 인 경우만 통과.
-    (25% 돌파 후 상승 중이어도 28% 이미 지난 종목은 재진입 안 함)
-
     Returns (should_buy, reason, strength):
       should_buy : True 면 매수 주문
       reason     : 통과/실패 사유
-      strength   : 1.0(통과) 또는 0.0(실패).
+      strength   : 1.0(통과) 또는 0.0(실패). 시드가 460K로 작아 단일 등급 운영.
     """
     # F1. 시간대 (09:30 ≤ now < 14:50)
     h, m = now_hm
@@ -368,11 +360,9 @@ def uplimit_approach_buy_signal(
     if already_holding:
         return False, "uplimit_F2_보유중", 0.0
 
-    # F3. [260423] 28% 상향 돌파 edge-trigger
-    #   - prev_ctrt: 직전 틱 등락률 (호출측에서 _last_prdy_ctrt 로 전달)
-    #   - 돌파 순간(prev<28, cur≥28)만 통과, 이미 28+ 유지 중이면 skip (중복 방지)
-    if not (prev_ctrt < UPLIMIT_EXIT_TRIGGER_CTRT <= prdy_ctrt < UPLIMIT_EXIT_UPPER_LIMIT):
-        return False, f"uplimit_F3_28%돌파아님(prev={prev_ctrt:.2f},cur={prdy_ctrt:.2f})", 0.0
+    # F3. 등락률 구간
+    if prdy_ctrt < UPLIMIT_FILTER_CTRT_MIN or prdy_ctrt >= UPLIMIT_FILTER_CTRT_MAX:
+        return False, f"uplimit_F3_구간({prdy_ctrt:.2f})", 0.0
 
     # F4. 전일 등락률 < 10% (작전주/연속급등 차단 — 백테스트 1순위)
     if prev_day_prdy_ctrt >= UPLIMIT_FILTER_PREV_CTRT_MAX:
@@ -452,13 +442,7 @@ def uplimit_approach_exit(
     now_hm: tuple[int, int],
 ) -> tuple[str, str, float]:
     """
-    @deprecated [260423] — 재설계 후 사용 안 함.
-    매수 체결 시 KIS 서버 스톱 지정가(ord_dvsn=22) 주문을 2건 발주하여
-    서버가 29%/28% 하회 감지 시 자동 매도하도록 변경됨.
-    25% 하회 시 클라이언트 측에서 _try_uplimit_market_sell() 를 호출하여
-    기존 스톱 주문 취소 + 시장가 전량 매도.
-
-    기존 단계적 Exit 판단 (호출측 호환용 유지).
+    상한가 근접 매수 포지션의 단계적 Exit 판단.
 
     Returns (action, reason, sell_ratio):
       action     : "hold" | "sell_half" | "sell_all"
@@ -502,44 +486,6 @@ def uplimit_approach_exit(
             return "sell_all", f"uplimit_트레일링-2%(고가{int(highest_since_buy):,})", 1.0
 
     return "hold", "", 0.0
-
-
-# =============================================================================
-# [260423] 신규 Exit 보조 함수
-# =============================================================================
-
-def uplimit_should_cancel_and_market_sell(
-    prdy_ctrt: float,
-    has_position: bool,
-) -> tuple[bool, str]:
-    """
-    25% 하회 감지 시 기존 스톱 지정가 주문 취소 + 시장가 전량 매도 여부 판단.
-    호출측(ws_realtime_trading.py) 은 True 반환 시:
-      1) _cancel_pending_stop_orders(code)  — ①② 스톱 주문 모두 취소
-      2) _sell_market(code, remaining_qty)  — 시장가 전량 매도
-      3) _uplimit_blacklist 에 추가하지 않음 (29% 재상회 시 재매수 허용)
-    """
-    if not has_position:
-        return False, ""
-    if prdy_ctrt < UPLIMIT_EXIT_MARKET_SELL_CTRT:
-        return True, f"uplimit_25%하회_시장가전량({prdy_ctrt:.2f}%)"
-    return False, ""
-
-
-def uplimit_should_setup_stop_orders(
-    max_prdy_ctrt: float,
-    stop_orders_placed: bool,
-) -> tuple[bool, str]:
-    """
-    상한가 근접(29.5%+) 도달 시 스톱 지정가 주문 2건 발주 여부.
-    호출측 _setup_stop_limit_orders(code, qty) 를 호출해야 함.
-    stop_orders_placed=True 면 중복 발주 방지.
-    """
-    if stop_orders_placed:
-        return False, ""
-    if max_prdy_ctrt >= UPLIMIT_EXIT_UPPER_LIMIT:
-        return True, f"uplimit_스톱지정가_발주(max={max_prdy_ctrt:.2f}%)"
-    return False, ""
 
 
 def calc_uplimit_qty(avail_cash: float, buy_price: float, market: str = "KOSPI") -> int:

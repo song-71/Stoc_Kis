@@ -2,6 +2,24 @@
 
 ---
 
+## [2026-04-23] ab9e3cc
+- **Category**: feat
+- **Title**: 상한가 근접 전략 전면 재설계 — 28% edge-trigger + 3종목 분산 + KIS 스톱 지정가 Exit
+- **Files**: `ws_realtime_trading.py`, `ws_realtime_tr_str1.py`, `ws_realtime_trading_260422.py`(백업), `ws_realtime_tr_str1_260422.py`(백업)
+- **Changes**:
+  1. **Top30 조회 주기 재구성** (`_build_top_rank_schedule`): 09:00:10~09:05:00 10초 주기 + 09:06~14:50 1분 주기. 기존 30분 주기 폐기. 15:18/15:20 종가매매 스케줄 유지.
+  2. **Top30 구독 기준 변경** (`_top_rank_loop`): "상위 N" 방식 폐기 → prdy_ctrt ≥ 25% 모든 종목 자동 편입. 미매수 구독 종목 20% 미만 하락 시 자동 해제. MAX_WSS_SUBSCRIBE 초과 시 LRU 해제 (매수/매도 pending 종목 보호). `_top_added_ts` dict 신규 추가 (LRU 관리).
+  3. **28% 상향 돌파 edge-trigger** (`uplimit_approach_buy_signal` F3): `prev_ctrt` 파라미터 추가. `prev_ctrt < 28.0 ≤ prdy_ctrt < 29.5` 인 경우만 통과. 이미 28% 이상 유지 중인 종목 중복 진입 방지.
+  4. **시드 분산 3종목** (`_try_uplimit_buy`): `UPLIMIT_DIVERSIFY_N=3`, `UPLIMIT_MAX_POSITIONS=1→3`. `_uplimit_seed_base = INIT_CASH / 3` (세션 시작 시 1회 계산). 각 매수금액 = `min(seed_base, avail_cash)`.
+  5. **KIS 서버 스톱 지정가 Exit** (`_setup_stop_limit_orders`): 29.5% 도달 시 `ord_dvsn=22` 스톱 지정가 주문 2건 발주. ①절반: CNDT=29%, UNPR=28% / ②나머지: CNDT=28%, UNPR=27%.
+  6. **25% 하회 시장가 긴급 청산** (`_try_uplimit_market_sell`): 25% 미만 감지 시 기존 스톱 주문 전부 취소 + 시장가 전량 매도. `_uplimit_blacklist` 미추가 → 29% 재상회 시 재매수 허용.
+  7. **자동 구독 해제** (`_auto_unsub_code`): 미매수 구독 종목 20% 하회 시 `_remove_code_structs` + WSS 재구성. 쿨다운 30초 (반복 해제 방지).
+  8. **`uplimit_approach_exit` @deprecated 처리**: 스톱 지정가가 단계적 청산 로직 대체. 함수 몸체 호환성 유지.
+  9. 신규 상수: `UPLIMIT_SUBSCRIBE_MIN_CTRT=25.0`, `UPLIMIT_UNSUBSCRIBE_CTRT=20.0`, `UPLIMIT_DIVERSIFY_N=3`, `UPLIMIT_REACH_UPPER_PCT=29.5`, `UPLIMIT_EXIT_TRIGGER_CTRT=28.0`, `UPLIMIT_EXIT_MARKET_SELL_CTRT=25.0`
+  10. 신규 함수: `_setup_stop_limit_orders`, `_try_uplimit_market_sell`, `_auto_unsub_code`, `uplimit_should_cancel_and_market_sell`, `uplimit_should_setup_stop_orders`
+- **Impact**: 04-23 첫 실전 운영 매수 0건 원인(30분 폴링 지연 + 구간 필터 AND 시점 지연)을 근본 해결. 장 시작 직후 10초 주기 폴링으로 급등 포착 강화. 28% 돌파 순간만 매수 시도하여 노이즈 제거. 시드 분산으로 단일 종목 집중 리스크 완화. KIS 서버 측 스톱 주문으로 연결 단절 시에도 Exit 보장.
+- **알려진 제약**: KIS 스톱 지정가(ord_dvsn=22) 실전 미검증. 재매수 무제한 → 향후 일일 누적 손실 한도 추가 필요.
+
 ## [2026-04-22] e7d8e12
 - **Category**: feat
 - **Title**: 로그 파일 운영 모드 개선 — cron fresh vs 수동재시작 append 구분

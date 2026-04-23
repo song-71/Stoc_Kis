@@ -9447,7 +9447,7 @@ def ingest_loop():
 # 종료 처리
 # =============================================================================
 def _shutdown(reason: str):
-    global _active_kws
+    global _active_kws, _a2_active_kws  # [fix] _a2_active_kws 글로벌 누락으로 shutdown 시 UnboundLocalError 발생
     if _stop_event.is_set():
         return
     _ts_now = datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S")

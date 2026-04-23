@@ -5087,6 +5087,60 @@ def _check_iscd_stat_krx(target_codes: list[str]) -> None:
         logger.warning(f"[KRX조회] iscd_stat 조회 실패: {e}")
 
 
+# [v_1] REST 500 진단용 iscd_stat 설명표 (KRX DB 기준)
+_KRX_ISCD_STAT_DESC = {
+    "00": "정상", "51": "투자유의", "52": "투자경고", "53": "투자위험예고",
+    "54": "투자위험", "55": "투자주의", "57": "관리종목", "58": "정리매매",
+    "59": "단기과열", "60": "매매거래정지", "61": "거래정지", "62": "투자주의환기종목",
+    "99": "상장폐지",
+}
+
+
+def _diagnose_price_500(code: str, name: str) -> dict:
+    """
+    REST 500 에러 3회 도달 시 종목 상태 진단.
+    KRX_code_batch 로 iscd_stat 조회 → 상태별 적절한 조치.
+
+    Returns: {
+        "iscd_stat": str | None,   # KRX 상태 코드
+        "desc": str,                # 한글 설명
+        "action": str,              # "block_30min" | "single_price" | "halt_remove" | "temp_block"
+        "reason": str,
+    }
+    """
+    result = {"iscd_stat": None, "desc": "조회실패", "action": "block_30min", "reason": "KRX 조회 실패 → 보수적 차단"}
+    try:
+        status_map = KRX_code_batch([code])
+        stat = status_map.get(code) if status_map else None
+        if stat is None:
+            result["reason"] = "KRX 응답에 종목 없음 → 상장폐지 의심, 30분 차단"
+            return result
+        result["iscd_stat"] = stat
+        result["desc"] = _KRX_ISCD_STAT_DESC.get(stat, f"미상({stat})")
+
+        if stat == "00":
+            result["action"] = "temp_block"
+            result["reason"] = "KRX상 정상 → KIS 서버 일시 장애 추정, 30분 차단 후 재시도"
+        elif stat in ("57", "59"):
+            # 30분 단일가 매매 대상
+            if code not in _single_price_codes and code not in _single_price_pending:
+                _single_price_pending[code] = stat
+            result["action"] = "single_price"
+            result["reason"] = f"{result['desc']} → 30분 단일가 매매 워크플로로 이관 (차단 없음)"
+        elif stat in ("58", "60", "61", "99"):
+            _halted_codes.add(code)
+            result["action"] = "halt_remove"
+            result["reason"] = f"{result['desc']} → 거래불가, _halted_codes 등록 + 완전 차단"
+        else:
+            # 투자유의/경고 등 — 거래는 가능하나 주의 필요
+            result["action"] = "block_30min"
+            result["reason"] = f"{result['desc']} → 보수적 30분 차단"
+        return result
+    except Exception as e:
+        result["reason"] = f"KRX 조회 예외: {e} → 보수적 30분 차단"
+        return result
+
+
 _overwrite_events: list[dict[str, str]] = []
 
 _top_client: KisClient | None = None
@@ -6805,19 +6859,53 @@ def _price_request_loop() -> None:
                             f"{ts_prefix()} [price] ★ REST 500 연속 + WSS 미수신 "
                             f"→ 거래정지 의심: {name}({code})"
                         )
-                # [v_1] 3회 이상 연속 500 → 30분 조회 차단 (로그/쿼터 낭비 방지)
-                if fc >= PRICE_BLOCK_FAIL_THRESHOLD:
-                    _price_block_until[code] = time.time() + PRICE_BLOCK_TTL_SEC
-                    if fc == PRICE_BLOCK_FAIL_THRESHOLD:  # 최초 차단 시 1회만 알림
+                # [v_1] 3회 이상 연속 500 → KRX 상태 진단 후 맞춤 조치
+                if fc == PRICE_BLOCK_FAIL_THRESHOLD:
+                    diag = _diagnose_price_500(code, name)
+                    stat, desc, action, dreason = diag["iscd_stat"], diag["desc"], diag["action"], diag["reason"]
+
+                    if action == "single_price":
+                        # 57/59 관리/단기과열 → 단일가 매매로 이관, 짧은 차단 (10분) 후 재개
+                        _price_block_until[code] = time.time() + 600
                         _notify(
-                            f"{ts_prefix()} [price_block] {name}({code}) REST 500 "
-                            f"{fc}회 연속 → {PRICE_BLOCK_TTL_SEC//60}분 조회 차단",
+                            f"{ts_prefix()} [price_diag] {name}({code}) REST 500×{fc} "
+                            f"→ KRX iscd_stat={stat}({desc}) → 단일가 매매 이관",
                             tele=True,
                         )
-                        logger.warning(
-                            f"{ts_prefix()} [price_block] {name}({code}) 차단 "
-                            f"until={datetime.fromtimestamp(_price_block_until[code], KST).strftime('%H:%M:%S')}"
+                    elif action == "halt_remove":
+                        # 정지/상폐 등 → 완전 차단 (12시간)
+                        _price_block_until[code] = time.time() + 43200
+                        _notify(
+                            f"{ts_prefix()} [price_diag] ★ {name}({code}) REST 500×{fc} "
+                            f"→ KRX iscd_stat={stat}({desc}) → 거래불가 확정, 구독 해제 권장",
+                            tele=True,
                         )
+                        logger.warning(f"{ts_prefix()} [price_diag] {dreason}")
+                    elif action == "temp_block":
+                        # KRX 정상 → KIS 서버 일시 장애 추정, 30분 차단
+                        _price_block_until[code] = time.time() + PRICE_BLOCK_TTL_SEC
+                        _notify(
+                            f"{ts_prefix()} [price_diag] {name}({code}) REST 500×{fc} "
+                            f"→ KRX 정상(00) → KIS 서버 일시 장애 추정, {PRICE_BLOCK_TTL_SEC//60}분 차단",
+                            tele=True,
+                        )
+                    else:  # block_30min (조회 실패 / 투자유의 등)
+                        _price_block_until[code] = time.time() + PRICE_BLOCK_TTL_SEC
+                        _notify(
+                            f"{ts_prefix()} [price_diag] {name}({code}) REST 500×{fc} "
+                            f"→ iscd_stat={stat}({desc}) → {PRICE_BLOCK_TTL_SEC//60}분 차단",
+                            tele=True,
+                        )
+
+                    logger.warning(
+                        f"{ts_prefix()} [price_diag] {name}({code}) stat={stat} "
+                        f"action={action} reason={dreason} "
+                        f"until={datetime.fromtimestamp(_price_block_until[code], KST).strftime('%H:%M:%S')}"
+                    )
+                elif fc > PRICE_BLOCK_FAIL_THRESHOLD:
+                    # 진단 이후 block 상태가 아니면(복구 후 재실패) 짧게 유지 차단
+                    if code not in _price_block_until or _price_block_until[code] < time.time():
+                        _price_block_until[code] = time.time() + PRICE_BLOCK_TTL_SEC
                 # _halted_codes 등록 후 → watchdog (C)에서 STALE_CHECK_HALTED_SEC(300초) 간격 적용
                 # 인증 오류일 때만 재초기화
                 err_str = str(e)

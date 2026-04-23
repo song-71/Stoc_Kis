@@ -2,6 +2,31 @@
 
 ---
 
+## [2026-04-23] 6e3619b
+- **Category**: feat
+- **Title**: Strategy B/C 신호 관찰 추가 + WSS watchdog + 종가매수 거래대금 정렬
+- **Files**: `ws_realtime_trading.py`, `ws_realtime_tr_str1.py`, `symulation/Query_str_ma_trend_simulation.py`, `symulation/Query_str_bb_expansion_simulation.py`, `symulation/Query_str_combined_simulation.py`
+- **Changes**:
+  1. **WSS 무수신 watchdog** (`scheduler_loop`): 09:30~15:20 장 시간대 + 시작 120초 유예. 90초 무수신 → 텔레그램 경고 1회. 180초 무수신 → `os._exit(2)` 강제종료 (runner 재시작 유도). `_wss_recv_alert_sent` 플래그로 중복 알림 방지.
+  2. **종목별 WSS 수신 분포 주기 로그** (`scheduler_loop`): 5분 간격, 구독 종목 활성(≤60s)/stale(>60s) 분류 출력. 내일 수신 감소 원인 진단용.
+  3. **종가매수 거래대금 정렬** (`_prepare_closing_buy_orders`): 선정 종목을 `acml_tr_pbmn` 기준 내림차순 정렬. 자금 부족 시 거래대금 큰 종목 우선 배정 (기존 차단 방식 → 우선순위 방식으로 전환). 즉시 활성.
+  4. **INDICATOR_MA_LINE에 ma10 추가**: `[3,10,50,200,300,500,2000]` — Strategy B MA trend용.
+  5. **Strategy B (MA trend) 함수 신규** (`ws_realtime_tr_str1.py`):
+     - `ma_trend_buy_signal()`: ma50>ma500 골든크로스 edge-trigger + 15~29% 구간 + 전일 <10% + 거래량 ≥100k
+     - `ma_trend_exit_signal()`: ma10<ma500 데드크로스 / 손절 -3% / 트레일 -3% / 14:55 마감
+  6. **Strategy C (BB expansion) 함수 신규** (`ws_realtime_tr_str1.py`):
+     - `bb_expansion_buy_signal()`: BB 폭 압축(min<20) → 확장(cur>24) + 하단 이탈-복귀 + 첫 양틱
+     - `bb_expansion_exit_signal()`: bb_mid 하회 절반 / bb_lower 재이탈 전량 / 손절 / 트레일 / 마감
+  7. **Strategy B/C 관찰 상태 dict 신규** (`ws_realtime_trading.py`): `_ma_trend_prev_ma50/500`, `_bb_width_history`, `_bb_lower_cross_history`, `_bb_last_bidp1` 등.
+  8. **`_check_strategy_bc_from_tick()`** 신규 함수: ingest_loop에서 매 틱 호출, 신호 발생 시 로그만 출력 (쿨다운 10초). `MA_TREND_ENABLED / BB_EXPANSION_ENABLED = False` 기본값.
+  9. **백테스트 skeleton 3종 신규**: `Query_str_ma_trend_simulation.py`, `Query_str_bb_expansion_simulation.py`, `Query_str_combined_simulation.py` — docstring + TODO 구조 + main().
+- **Impact**: 오늘(04-23) 거래 0건 원인 3가지 대응:
+  ① WSS 무수신 → watchdog으로 자동 재시작 유도
+  ② 종가매수 종목 선정 → 거래대금 우선순위로 자원 효율화
+  ③ 전략 단일화 위험 → Strategy B/C 신호 관찰 개시 (백테스트 후 실전 전환 예정)
+  Strategy B/C는 `ENABLED=False`이므로 실매매 없음. 내일 08:28 cron 기동 시 즉시 반영.
+- **알려진 제약**: Strategy B/C 백테스트 미완. 승률 55%+ & 평균수익 +0.5%+ 확인 후 True 전환 예정.
+
 ## [2026-04-23] ab9e3cc
 - **Category**: feat
 - **Title**: 상한가 근접 전략 전면 재설계 — 28% edge-trigger + 3종목 분산 + KIS 스톱 지정가 Exit

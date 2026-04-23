@@ -749,12 +749,20 @@ class KISWebSocket:
                     fields = d.split("^")
                     if ncols > 0 and len(fields) > ncols:
                         # 여러 건: 컬럼 수 단위로 잘라서 줄바꿈으로 연결
+                        # [260423] 마지막 chunk 가 ncols 미만이면 빈 문자열로 패딩 (pandas 관대 파싱 호환)
                         rows = []
                         for i in range(0, len(fields), ncols):
                             chunk = fields[i:i + ncols]
                             if len(chunk) == ncols:
                                 rows.append("^".join(chunk))
+                            elif len(chunk) > 0:
+                                padded = chunk + [""] * (ncols - len(chunk))
+                                rows.append("^".join(padded))
                         d = "\n".join(rows)
+                    elif ncols > 0 and 0 < len(fields) < ncols:
+                        # [260423] 단일 건 + 필드 부족: 빈 문자열로 패딩
+                        # (KIS 가 간헐적으로 마지막 필드를 생략하여 전송 — pandas 시절엔 NaN 자동 채워졌음)
+                        d = "^".join(fields + [""] * (ncols - len(fields)))
 
                     df = pl.read_csv(
                         StringIO(d).read().encode(), has_header=False, separator="^",

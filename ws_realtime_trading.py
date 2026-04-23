@@ -9829,6 +9829,7 @@ def _shutdown(reason: str):
     logger.warning(f"\n{'=' * 66}\n[shutdown] {reason}  @ {_ts_now}\n{'=' * 66}")
     _stop_event.set()
     _ws_rebuild_event.set()
+    t0 = time.time()  # [260423] 단계별 경과시간 측정
     # WSS 종료 (새 데이터 유입 차단)
     with _kws_lock:
         if _active_kws is not None:
@@ -9842,22 +9843,29 @@ def _shutdown(reason: str):
             except Exception:
                 pass
             _a2_active_kws = None
+    t_wss = time.time()
+    logger.info(f"[shutdown] (1/4) WSS 종료 완료 (+{t_wss-t0:.2f}s)")
     # ── 메모리 데이터 저장 (WSS 종료 후, 큐 소진 대기 → flush → snapshot) ──
     deadline = time.time() + 8.0
     try:
         while not _ingest_queue.empty() and time.time() < deadline:
             time.sleep(0.2)
-        logger.info(f"[shutdown] ingest 큐 소진 완료 (남은={_ingest_queue.qsize()}건)")
+        t_ingest = time.time()
+        logger.info(f"[shutdown] (2/4) ingest 큐 소진 완료 (남은={_ingest_queue.qsize()}건, +{t_ingest-t_wss:.2f}s)")
     except Exception as e:
         logger.warning(f"[shutdown] ingest 큐 대기 예외: {e}")
+        t_ingest = time.time()
     try:
         n_saved = _flush_part_buffer(f"shutdown_{reason}", force_full=True)
-        logger.info(f"[shutdown] part buffer flush 완료: {n_saved}행 저장")
+        t_flush = time.time()
+        logger.info(f"[shutdown] (3/4) part buffer flush 완료: {n_saved}행 저장 (+{t_flush-t_ingest:.2f}s)")
     except Exception as e:
         logger.warning(f"[shutdown] part buffer flush 실패: {e}")
+        t_flush = time.time()
     try:
         _save_indicator_snapshot()
-        logger.info("[shutdown] 지표 스냅샷 저장 완료")
+        t_snap = time.time()
+        logger.info(f"[shutdown] (4/4) 지표 스냅샷 저장 완료 (+{t_snap-t_flush:.2f}s, 총 {t_snap-t0:.2f}s)")
     except Exception as e:
         logger.warning(f"[shutdown] 지표 스냅샷 저장 실패: {e}")
     time.sleep(0.3)

@@ -10597,28 +10597,31 @@ if __name__ == "__main__":
     try:
         run_ws_forever()
     finally:
-        _shutdown("finally")
+        _shutdown("finally")  # _stop_event.is_set()면 즉시 return (중복 호출 안전)
+        # [260423] thread join 대폭 단축: 전부 daemon=True 라 main 종료 시 자동 사멸.
+        # _shutdown() 에서 이미 큐 소진 + flush + snapshot 완료됨 → 길게 기다릴 필요 없음.
+        _t_join_start = time.time()
         try:
-            # ingest 큐 소진 먼저 → 그 다음 writer flush (순서 중요: ingest→writer)
-            t_ingest.join(timeout=10.0)
-            t_writer.join(timeout=10.0)
-            t_str1_sell.join(timeout=5.0)
-            t_flags.join(timeout=3.0)
-            t_sched.join(timeout=3.0)
-            t_rest.join(timeout=3.0)
-            t_price_watch.join(timeout=3.0)
-            t_price_req.join(timeout=3.0)
-            t_top.join(timeout=3.0)
+            t_ingest.join(timeout=1.0)
+            t_writer.join(timeout=1.0)
+            t_str1_sell.join(timeout=0.5)
+            t_flags.join(timeout=0.3)
+            t_sched.join(timeout=0.3)
+            t_rest.join(timeout=0.3)
+            t_price_watch.join(timeout=0.3)
+            t_price_req.join(timeout=0.3)
+            t_top.join(timeout=0.3)
         except Exception:
             pass
-        # 종료 시 메모리 버퍼만 part로 저장 (병합은 18:00 장 종료 시에만 수행)
+        logger.info(f"[finally] thread join 완료 (+{time.time()-_t_join_start:.2f}s)")
+        # [260423] 중복 flush 제거 — _shutdown() 에서 이미 force_full=True 로 저장 완료됨.
+        # 혹시 남은 데이터가 있을 경우 대비 조건부 flush (남은 버퍼 있을 때만, 로그만)
         try:
             with _part_buffer_lock:
                 has_data = bool(_part_buffer)
             if has_data:
-                _notify(f"{ts_prefix()} 메모리 데이터 part 저장 중", tele=False)
+                # shutdown 이후 추가 도착 데이터 — 빠르게 저장
                 _flush_part_buffer("final_shutdown", force_full=True)
-                _notify(f"{ts_prefix()} part 저장 완료", tele=False)
         except Exception as e:
             logger.error(f"[finally] 최종 flush 실패: {e}")
         _flush_overwrite_log()

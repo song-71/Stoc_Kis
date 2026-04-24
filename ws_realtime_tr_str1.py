@@ -543,6 +543,113 @@ def uplimit_should_setup_stop_orders(
 
 
 # =============================================================================
+# [260424] Strategy A-v4 — 28% 5분유지 + 당일홀드 + 익일MA매도
+#   백테스트: 59일 863 trades, 승률 38.1%, 총 PnL +846%, 평균 +1.56%/거래
+#   (symulation/Query_str_uplimit_5min_hold_nextday_v2_simulation.py)
+# =============================================================================
+
+UPLIMIT_V4_SUSTAIN_MINUTES = 5       # 28% 최초 돌파 후 N분 연속 유지 확인
+UPLIMIT_V4_HARD_LOSS = 0.05          # 당일 매수가 대비 -5% 하드 손절
+UPLIMIT_V4_OVERNIGHT_CTRT = 0.295    # 14:55 에 이 값 이상이면 익일 홀드
+UPLIMIT_V4_HOLD_CLOSE_HM = (14, 55)  # 당일 홀드 전환 판정 시각
+UPLIMIT_V4_NEXTDAY_GAP_LOSS = 0.03   # 익일 09:00~09:03 중 low<=buy*(1-x) 손절
+UPLIMIT_V4_NEXTDAY_GAP_END = (9, 3)  # 익일 갭 체크 종료 시각
+UPLIMIT_V4_NEXTDAY_CLOSE_HM = (14, 55)  # 익일 마감 청산
+
+
+def check_uplimit_v4_sustain_buy(
+    prdy_ctrt: float,
+    first_28_seen_minutes_ago: float | None,
+    already_holding: bool,
+    now_hm: tuple[int, int],
+) -> tuple[bool, str]:
+    """A-v4 매수 판정 — 28% 5분 유지 확인.
+
+    입력:
+      prdy_ctrt : 현재 등락률
+      first_28_seen_minutes_ago : 28% 최초 감지 후 지난 분 (None 이면 미감지)
+      already_holding : 이미 보유 중
+      now_hm : (시, 분)
+
+    조건 (AND):
+      F1. 09:30 ≤ now ≤ 14:30 (매수 허용 시간)
+      F2. 현재 28% ≤ prdy_ctrt < 30%
+      F3. 5분 전부터 28% 유지 중 (first_28_seen_minutes_ago >= 5)
+      F4. 이미 보유 중 아님
+    """
+    if already_holding:
+        return False, "v4_보유중"
+    h, m = now_hm
+    if h < 9 or (h == 9 and m < 30):
+        return False, "v4_시간대전"
+    if h >= 15 or (h == 14 and m >= 30):
+        return False, "v4_시간대후"
+    if not (28.0 <= prdy_ctrt < 30.0):
+        return False, f"v4_구간({prdy_ctrt:.2f}%)"
+    if first_28_seen_minutes_ago is None:
+        return False, "v4_최초돌파기록없음"
+    if first_28_seen_minutes_ago < UPLIMIT_V4_SUSTAIN_MINUTES:
+        return False, f"v4_유지부족({first_28_seen_minutes_ago:.1f}<{UPLIMIT_V4_SUSTAIN_MINUTES}분)"
+    return True, (
+        f"v4_매수({prdy_ctrt:.2f}%,유지{first_28_seen_minutes_ago:.1f}분)"
+    )
+
+
+def check_uplimit_v4_overnight_hold(
+    prdy_ctrt: float,
+    now_hm: tuple[int, int],
+) -> tuple[bool, str]:
+    """14:55 에 29.5%+ 이면 익일 홀드로 전환.
+
+    Returns (should_hold, reason):
+      should_hold=True → 오늘 청산하지 말고 익일로 넘김
+      should_hold=False → 14:55 현재가로 청산
+    """
+    h, m = now_hm
+    if (h, m) < UPLIMIT_V4_HOLD_CLOSE_HM:
+        return False, ""   # 아직 14:55 전이면 판정 아님
+    if prdy_ctrt >= UPLIMIT_V4_OVERNIGHT_CTRT * 100:
+        return True, f"v4_익일홀드({prdy_ctrt:.2f}%)"
+    return False, f"v4_당일청산({prdy_ctrt:.2f}%)"
+
+
+def check_uplimit_v4_nextday_sell(
+    bidp1: float,
+    low_bar: float,
+    buy_price: float,
+    ma_fast: float,
+    ma_slow: float,
+    now_hm: tuple[int, int],
+) -> tuple[bool, str]:
+    """익일 매도 판정 (overnight 포지션).
+
+    조건 (OR):
+      D1. 09:00~09:03 중 low ≤ buy×0.97 → 갭 손절
+      D2. ma_fast < ma_slow 데드크로스
+      D3. 14:55 마감
+
+    입력:
+      bidp1, low_bar : 현재 호가1/현재 분봉 저가 (갭 손절 판정)
+      buy_price : 매수가
+      ma_fast / ma_slow : 실시간 MA (틱 기반 ma500 ≈ 1분봉 MA5 근사, ma2000 ≈ MA20 근사)
+      now_hm : 현재 (시, 분)
+    """
+    h, m = now_hm
+    # D3: 마감
+    if (h, m) >= UPLIMIT_V4_NEXTDAY_CLOSE_HM:
+        return True, "v4_익일마감"
+    # D1: 09:00~09:03 갭 손절 (분봉 저가 혹은 bidp1)
+    if (h, m) <= UPLIMIT_V4_NEXTDAY_GAP_END:
+        trigger_price = min(low_bar if low_bar > 0 else bidp1, bidp1)
+        if buy_price > 0 and trigger_price <= buy_price * (1 - UPLIMIT_V4_NEXTDAY_GAP_LOSS):
+            return True, f"v4_익일초반갭-{UPLIMIT_V4_NEXTDAY_GAP_LOSS*100:.0f}%"
+    # D2: MA 데드크로스
+    if ma_fast > 0 and ma_slow > 0 and ma_fast < ma_slow:
+        return True, f"v4_익일MA데드크로스({ma_fast:.1f}<{ma_slow:.1f})"
+    return False, ""
+
+
+# =============================================================================
 # [260423] Strategy B — MA trend-following (틱 EMA 기반)
 #   매수 F: ma50>ma500 골든크로스 순간 edge-trigger + 15~29% 구간 + 필수
 #   매도 E: ma10<ma500 데드크로스 또는 손절/트레일/마감

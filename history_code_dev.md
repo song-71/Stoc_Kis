@@ -2,6 +2,36 @@
 
 ---
 
+## [2026-04-22] 54476be
+- **Category**: feat
+- **Title**: Strategy A-v4 실전 반영 — 28% 5분유지 + 당일홀드 + 상한가 익일MA매도
+- **Files**: `ws_realtime_trading.py`, `ws_realtime_tr_str1.py`
+- **Changes**:
+  1. **백테스트 근거**: `symulation/Query_str_uplimit_5min_hold_nextday_v2_simulation.py` — 59일 863거래, 승률 38.1%, 총 PnL +846%, 평균 +1.56%/거래
+  2. **신규 전략 상수** (`ws_realtime_tr_str1.py`): `UPLIMIT_V4_SUSTAIN_MINUTES=5`, `UPLIMIT_V4_HARD_LOSS=0.05`, `UPLIMIT_V4_OVERNIGHT_CTRT=0.295`, `UPLIMIT_V4_NEXTDAY_GAP_LOSS=0.03`
+  3. **신규 전략 함수 3종** (`ws_realtime_tr_str1.py`):
+     - `check_uplimit_v4_sustain_buy()`: 09:30~14:30 구간, 28%≤prdy_ctrt<30%, 5분 유지 확인 후 매수 판정
+     - `check_uplimit_v4_overnight_hold()`: 14:55 에 29.5%+ 이면 익일 홀드 전환 판정
+     - `check_uplimit_v4_nextday_sell()`: 갭손절(-3%) / MA데드크로스(ma_fast<ma_slow) / 14:55 마감
+  4. **활성화 플래그** (`ws_realtime_trading.py`): `UPLIMIT_V4_ENABLED = True`
+  5. **상태 dict 4종 신규**: `_uplimit_v4_28pct_first_ts` (28% 최초 감지 시각), `_uplimit_v4_holdover` (익일 보유 포지션), `_uplimit_v4_daily_bought_codes` (중복매수 방지), `_uplimit_v4_last_sustain_log` (로그 쿨다운)
+  6. **신규 함수 6종** (`ws_realtime_trading.py`):
+     - `_check_uplimit_v4_from_tick()`: 매 틱 v4 메인 로직 (28% 감지·유지·리셋, 보유 관리)
+     - `_try_v4_buy()`: v4 매수 주문 (`source="v4"` 로 `_uplimit_positions` 등록)
+     - `_try_v4_market_sell()`: 당일 시장가 매도 (하드손절 / 14:55 당일청산)
+     - `_move_v4_to_holdover()`: 당일 포지션 → `_uplimit_v4_holdover` 전환
+     - `_check_v4_nextday_exit()`: 익일 overnight 포지션 매도 판정 (매 틱)
+     - `_try_v4_holdover_sell()`: 익일 시장가 매도
+  7. **분기 처리**: `_check_uplimit_conditions_from_tick()` 초입에 `UPLIMIT_V4_ENABLED=True` 면 v4만 수행, 기존 13필터 edge-trigger 건너뜀
+  8. **상태 저장/복원**: `_save_uplimit_state()`에 `v4_holdover`, `v4_daily_bought` 추가. `_restore_uplimit_state_on_startup()`에 날짜 체크 포함 복원.
+  9. **ingest_loop**: overnight 포지션 있을 때 `_check_v4_nextday_exit()` 호출 추가
+- **Impact**:
+  - 기존 uplimit_approach_buy_signal (13필터 edge-trigger)는 `UPLIMIT_V4_ENABLED=True`인 동안 비활성. 내일(04-24) 08:28 cron 기동 시 즉시 반영.
+  - 익일 홀드 포지션은 상태파일에 저장되어 재시작 후에도 복원됨
+  - 긴급 비활성: `UPLIMIT_V4_ENABLED=False` 재시작
+  - MA 데드크로스는 틱 기반 ma500(≈1분봉MA5 근사) / ma2000(≈1분봉MA20 근사) 사용. 정확한 1분봉 aggregator는 별도 작업 예정.
+- **로그 키워드**: `[v4_waiting]`, `[v4_매수]`, `[v4_익일홀드]`, `[v4_매도]`, `[v4_익일매도]`, `[v4_holdover복원]`
+
 ## [2026-04-23] 6e3619b
 - **Category**: feat
 - **Title**: Strategy B/C 신호 관찰 추가 + WSS watchdog + 종가매수 거래대금 정렬

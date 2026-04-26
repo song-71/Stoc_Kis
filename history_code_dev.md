@@ -2,6 +2,35 @@
 
 ---
 
+## [2026-04-26] c755632
+- **Category**: fix
+- **Title**: Strategy A-v5 매수 판정에 13필터 복원 — F3만 ma10 상회로 교체
+- **Files**: `ws_realtime_tr_str1.py`, `ws_realtime_trading.py`
+- **Changes**:
+  **문제**: 직전 v5 도입(4d97760) 시 13필터를 누락하고 25%+ma10 단 2조건만 적용함.
+  사용자 의도("13필터 통과 종목에 대해 ma10 상회 시 매수")가 반영되지 않은 채 커밋됨.
+
+  **ws_realtime_tr_str1.py — check_uplimit_v5_instant_buy**:
+  - 함수 파라미터 5개 → 21개로 확장 (prev_close, stck_oprc, acml_vol, day_avg_vol_per_min 등)
+  - uplimit_approach_buy_signal 의 F1~F13 전 필터 AND 조건으로 복원
+    - F3 (28% edge-trigger) 만 ma10 상회 트리거로 교체
+    - F4: 전일 등락률 < 10%, F5: 저가주(≥1000원), F6: 시가 갭 ≥ +5%
+    - F7: 누적거래량 ≥ 100K, F8: 거래량 서지(5분 ≥ 일평균×3), F9: 25% 돌파 후 60분 이내
+    - F10: 10일 변동성 ≤ 5%, F11: 매도벽 차단, F12: 체결강도 ≥ 120, F13: 외인 3일 순매도 차단
+  - 차단 사유 prefix v5_F{n}_* 으로 통일 (가시성)
+
+  **ws_realtime_trading.py — _check_uplimit_v4_from_tick 매수부**:
+  - col_map 에서 stck_oprc, acml_vol, bidp_rsqn{1~5}, askp_rsqn{1~5} 추출
+    (WSS 필드명 오타 bidp{i}_rsqn → bidp_rsqn{i} 수정 포함)
+  - prev_close, volume_power, frgn_3d, day_avg, last5m_avg, min_since_cross 수집
+  - 새 21파라미터 시그니처로 check_uplimit_v5_instant_buy 호출
+  - v5_skip 로그 종목당 10초 쿨다운 추가
+
+- **Impact**:
+  - 04-24 매수 실패 6종목 시뮬 결과: 한화갤러리아(F13 차단), 피엠티(F13 차단), CSA코스믹/한화갤러리아우(저거래 차단) ✓
+  - 고영·아스플로는 필터 통과 후 ma10 상회 시 매수 대상으로 남음
+  - v5 즉시매수가 진입 품질 기준 없이 동작하던 버그 해소
+
 ## [2026-04-26] 4d97760
 - **Category**: feat
 - **Title**: Strategy A-v5 도입 — 구독 즉시 ma10 상회 시 시장가 매수 + 저거래/상한가도달/트레일3% 차단

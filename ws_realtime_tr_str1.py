@@ -548,13 +548,19 @@ def uplimit_should_setup_stop_orders(
 #   (symulation/Query_str_uplimit_5min_hold_nextday_v2_simulation.py)
 # =============================================================================
 
-UPLIMIT_V4_SUSTAIN_MINUTES = 5       # 28% 최초 돌파 후 N분 연속 유지 확인
-UPLIMIT_V4_HARD_LOSS = 0.05          # 당일 매수가 대비 -5% 하드 손절
+UPLIMIT_V4_SUSTAIN_MINUTES = 5       # (deprecated v4) 28% 최초 돌파 후 N분 — v5 에서 미사용
+UPLIMIT_V4_HARD_LOSS = 0.05          # 당일 매수가 대비 -5% 하드 손절 (v5 도 사용)
 UPLIMIT_V4_OVERNIGHT_CTRT = 0.295    # 14:55 에 이 값 이상이면 익일 홀드
 UPLIMIT_V4_HOLD_CLOSE_HM = (14, 55)  # 당일 홀드 전환 판정 시각
 UPLIMIT_V4_NEXTDAY_GAP_LOSS = 0.03   # 익일 09:00~09:03 중 low<=buy*(1-x) 손절
 UPLIMIT_V4_NEXTDAY_GAP_END = (9, 3)  # 익일 갭 체크 종료 시각
 UPLIMIT_V4_NEXTDAY_CLOSE_HM = (14, 55)  # 익일 마감 청산
+
+# [260427] v5 신규 (기본 컷)
+UPLIMIT_V5_BUY_START_HM = (9, 30)
+UPLIMIT_V5_BUY_END_HM = (14, 30)
+UPLIMIT_V5_TRAIL_ARM_CTRT = 29.0     # max_prdy_ctrt 이 값 도달 후 트레일 활성
+UPLIMIT_V5_TRAIL_PCT = 0.03          # 트레일 하락률
 
 
 def check_uplimit_v4_sustain_buy(
@@ -646,6 +652,73 @@ def check_uplimit_v4_nextday_sell(
     # D2: MA 데드크로스
     if ma_fast > 0 and ma_slow > 0 and ma_fast < ma_slow:
         return True, f"v4_익일MA데드크로스({ma_fast:.1f}<{ma_slow:.1f})"
+    return False, ""
+
+
+# =============================================================================
+# [260427] Strategy A-v5 — 구독 즉시 (ma10 상회 첫 시점) 시장가 매수
+#   v4 (28% 5분유지) 폐지 → v5 단일 운영
+#   F1. 시간대  09:30 ≤ now ≤ 14:30
+#   F2. 등락률  25% ≤ prdy_ctrt < 30%
+#   F3. ma10   stck_prpr > ma10 (10틱 누적 후 첫 상회)
+#   F4. 상한가 미도달 (limitup_reached set 체크 — 호출측)
+#   F5. 저거래 아님 (호출측에서 _is_low_liquidity_v5 통과)
+#   F6. 보유 중 아님 / 당일 매수 이력 없음 (호출측)
+#   매수: 시장가 (ord_dvsn="01"), 시드 분산 3종목
+#   Exit: 트레일 3% (max_prdy_ctrt≥29 도달 후) > 하드 5% > 14:55 청산
+# =============================================================================
+
+def check_uplimit_v5_instant_buy(
+    prdy_ctrt: float,
+    stck_prpr: float,
+    ma10: float,
+    tick_count: int,
+    now_hm: tuple[int, int],
+) -> tuple[bool, str]:
+    """v5 매수 판정 — 구독 후 ma10 상회 첫 시점.
+
+    호출측에서 사전 체크할 항목 (이 함수에서는 안 봄):
+      - already_holding (이미 보유 중)
+      - limitup_reached (30% 도달 이력)
+      - low_liquidity (저거래)
+      - 당일 매수 이력
+      - 시드 분산 슬롯
+    """
+    h, m = now_hm
+    if (h, m) < UPLIMIT_V5_BUY_START_HM:
+        return False, "v5_시간대전"
+    if (h, m) > UPLIMIT_V5_BUY_END_HM:
+        return False, "v5_시간대후"
+    if not (25.0 <= prdy_ctrt < 30.0):
+        return False, f"v5_구간({prdy_ctrt:.2f}%)"
+    if tick_count < 10:
+        return False, f"v5_ma10미축적({tick_count}틱)"
+    if ma10 <= 0 or stck_prpr <= 0:
+        return False, "v5_가격무효"
+    if stck_prpr <= ma10:
+        return False, f"v5_ma10미상회(prpr={stck_prpr:.0f}<=ma10={ma10:.1f})"
+    return True, f"v5_매수({prdy_ctrt:.2f}%,prpr={stck_prpr:.0f}>ma10={ma10:.1f})"
+
+
+def check_uplimit_v5_trail_exit(
+    buy_price: float,
+    highest_since_buy: float,
+    max_prdy_ctrt: float,
+    cur_price: float,
+    trail_arm_ctrt: float = UPLIMIT_V5_TRAIL_ARM_CTRT,
+    trail_pct: float = UPLIMIT_V5_TRAIL_PCT,
+) -> tuple[bool, str]:
+    """v5 트레일스톱 — max_prdy_ctrt ≥ 29 도달 후 highest×(1-3%) 하회 시 매도."""
+    if max_prdy_ctrt < trail_arm_ctrt:
+        return False, ""
+    if highest_since_buy <= 0 or cur_price <= 0 or buy_price <= 0:
+        return False, ""
+    trail_level = highest_since_buy * (1 - trail_pct)
+    if cur_price <= trail_level:
+        return True, (
+            f"v5_트레일-{int(trail_pct*100)}%"
+            f"(high={highest_since_buy:.0f},cur={cur_price:.0f},max_ctrt={max_prdy_ctrt:.2f}%)"
+        )
     return False, ""
 
 
@@ -917,20 +990,11 @@ def closing_crash_filter_signal(
     if stck_hgpr > 0 and (stck_prpr / stck_hgpr) < 0.97:
         return False, f"closing_고가대비약({stck_prpr}/{stck_hgpr})", 0.0
 
-    # [260423 수정] 강제 차단 완화 — 기존 20%+ 상승 + 고가대비 97%+ 조건이 이미 엄격.
-    # 추가 필터는 "보수적 허용" 원칙: 데이터 누락(VP/외인)은 통과, 명확한 부정 신호만 차단.
-    if acml_tr_pbmn > 0 and acml_tr_pbmn < CLOSING_FILTER_TRADE_AMT_MIN:
-        # 거래대금 30억 미만만 차단 (유동성 리스크 명확)
-        return False, f"closing_거래대금부족({int(acml_tr_pbmn/1e8)}억)", 0.0
-    # VP 누락(None)은 허용 — REST 조회 실패/토큰 이슈 등에서 종가매매 전체 막는 사고 방지
-    # VP 있는데 너무 낮은 경우만 차단 (매도 우세)
-    if volume_power is not None and volume_power < CLOSING_FILTER_VP_MIN:
-        return False, f"closing_VP약({volume_power:.0f})", 0.0
-    # 외국인 3일 순매도 "명확한" 경우만 차단 (None은 허용)
-    if frgn_3d_net is not None and frgn_3d_net < 0:
-        return False, f"closing_외인매도({int(frgn_3d_net):,})", 0.0
+    # [260424 사용자 원칙] "거래대금은 차단이 아닌 우선순위 기준"
+    # → 거래대금/외인/VP 모두 차단 로직 제거. 선정된 종목은 모두 매수 대상.
+    # 자원 부족 시 거래대금 큰 순서로 우선 배정 (_prepare_closing_buy_orders 에서 정렬).
 
-    # Signal Strength (0.5 기준, 통과 임계 0.50 — 기본 조건 통과만 해도 허용)
+    # Signal Strength (참고용 점수 — 통과 판정에는 영향 없음)
     s = 0.50
     vp_label = f"VP{volume_power:.0f}" if volume_power is not None else "VP_n/a"
     detail = [vp_label]
@@ -952,9 +1016,9 @@ def closing_crash_filter_signal(
     if institution_net_today is not None and institution_net_today > 0:
         s += 0.05
 
-    if s >= CLOSING_FILTER_PASS_STRENGTH:
-        return True, f"closing_통과({','.join(detail)})/s={s:.2f}", s
-    return False, f"closing_약함({','.join(detail)})/s={s:.2f}", s
+    # [260424 사용자 원칙] 기본 컷(prdy_sign/prdy_ctrt/hgpr) 통과 시 항상 매수 대상 인정.
+    # 점수는 로그/정렬 참고용.
+    return True, f"closing_통과({','.join(detail)})/s={s:.2f}", s
 
 
 def closing_next_day_exit(

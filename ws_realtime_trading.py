@@ -9441,6 +9441,10 @@ def _check_uplimit_v4_from_tick(
     prdy_col  = col_map.get("prdy_ctrt")
     bidp1_col = col_map.get("bidp1")
     acml_col  = col_map.get("acml_tr_pbmn")
+    oprc_col  = col_map.get("stck_oprc")
+    acml_vol_col = col_map.get("acml_vol")
+    bid_sum_cols = [col_map.get(f"bidp_rsqn{i}") for i in range(1, 6)]
+    ask_sum_cols = [col_map.get(f"askp_rsqn{i}") for i in range(1, 6)]
 
     df_tmp = result.with_columns(
         pl.col(code_col).cast(pl.Utf8).str.zfill(6).alias(code_col)
@@ -9466,7 +9470,11 @@ def _check_uplimit_v4_from_tick(
             prdy_ctrt = _f(prdy_col)
             stck_prpr = _f(pr_col)
             bidp1     = _f(bidp1_col) or stck_prpr
+            stck_oprc = _f(oprc_col)
+            acml_vol  = _f(acml_vol_col)
             acml_tr_pbmn = _f(acml_col)
+            bid_sum   = sum(_f(c) for c in bid_sum_cols)
+            ask_sum   = sum(_f(c) for c in ask_sum_cols)
             if acml_tr_pbmn > 0:
                 _uplimit_v5_last_acml[code] = acml_tr_pbmn
 
@@ -9568,14 +9576,47 @@ def _check_uplimit_v4_from_tick(
             ma10 = float(ema.get(10) or 0)
             tick_count = int(_total_counts.get(code, 0))
 
+            # 13필터 데이터 수집 (기존 _try_uplimit_buy 패턴 재사용)
+            prev_close = stck_prpr / (1 + prdy_ctrt / 100.0) if prdy_ctrt > -100 and stck_prpr > 0 else 0
+            client = _top_client or _init_top_client()
+            try:
+                volume_power = _get_uplimit_volume_power(client, code)
+            except Exception:
+                volume_power = None
+            frgn_3d = _uplimit_frgn_3d.get(code)
+            day_avg = _calc_uplimit_day_avg_vol_per_min(code, acml_vol, now_dt)
+            last5m_avg = _calc_uplimit_last5m_avg_vol_per_min(code)
+            cross_ts = _uplimit_25pct_cross_ts.get(code)
+            min_since_cross = (now_dt - cross_ts).total_seconds() / 60.0 if cross_ts else None
+
             should_buy, reason = check_uplimit_v5_instant_buy(
                 prdy_ctrt=prdy_ctrt,
+                prev_close=prev_close,
+                stck_oprc=stck_oprc,
                 stck_prpr=stck_prpr,
                 ma10=ma10,
                 tick_count=tick_count,
+                acml_vol=acml_vol,
+                day_avg_vol_per_min=day_avg,
+                last_5m_avg_vol_per_min=last5m_avg,
+                min_since_25pct_cross=min_since_cross,
+                vola_10d=_uplimit_vola_10d.get(code),
+                bid_sum_top5=bid_sum,
+                ask_sum_top5=ask_sum,
+                volume_power=volume_power,
+                frgn_3d_net=frgn_3d,
+                prev_day_prdy_ctrt=_uplimit_prev_day_ctrt.get(code, 0.0),
+                already_holding=False,
                 now_hm=(h, m),
+                today_buy_count=_uplimit_today_buy_count,
+                max_daily_buys=UPLIMIT_MAX_DAILY_BUYS,
             )
             if not should_buy:
+                # 매수 시도 종목당 10초 쿨다운 skip 로그 (가시성)
+                _last_log = _uplimit_v4_last_sustain_log.get(code, 0.0)
+                if time.time() - _last_log > 10:
+                    _uplimit_v4_last_sustain_log[code] = time.time()
+                    logger.info(f"{ts_prefix()} [v5_skip] {code_name_map.get(code, code)}({code}) {reason}")
                 continue
 
             # 매수 실행 (시장가)

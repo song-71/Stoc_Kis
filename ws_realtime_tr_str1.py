@@ -670,34 +670,131 @@ def check_uplimit_v4_nextday_sell(
 
 def check_uplimit_v5_instant_buy(
     prdy_ctrt: float,
+    prev_close: float,
+    stck_oprc: float,
     stck_prpr: float,
     ma10: float,
     tick_count: int,
+    acml_vol: float,
+    day_avg_vol_per_min: float,
+    last_5m_avg_vol_per_min: float,
+    min_since_25pct_cross: float | None,
+    vola_10d: float | None,
+    bid_sum_top5: float,
+    ask_sum_top5: float,
+    volume_power: float | None,
+    frgn_3d_net: float | None,
+    prev_day_prdy_ctrt: float,
+    already_holding: bool,
     now_hm: tuple[int, int],
+    today_buy_count: int,
+    max_daily_buys: int = 3,
 ) -> tuple[bool, str]:
-    """v5 매수 판정 — 구독 후 ma10 상회 첫 시점.
+    """v5 매수 판정 — 13필터 통과 + ma10 상회 첫 시점.
 
-    호출측에서 사전 체크할 항목 (이 함수에서는 안 봄):
-      - already_holding (이미 보유 중)
-      - limitup_reached (30% 도달 이력)
-      - low_liquidity (저거래)
-      - 당일 매수 이력
-      - 시드 분산 슬롯
+    [260427] uplimit_approach_buy_signal 의 13필터 AND 그대로 적용.
+    F3 (28% edge-trigger) 만 ma10 상회 트리거로 교체.
+
+    필터:
+      F1. 시간대 09:30 ≤ now ≤ 14:30
+      F2. 보유 중 아님
+      F3*. ma10 상회 (prdy_ctrt 25%~30% + tick_count≥10 + stck_prpr>ma10)
+      F4. 전일 등락률 < 10% (작전주 차단)
+      F5. 저가주 제외 (prev_close ≥ 1000원)
+      F6. 시가 갭 ≥ +5%
+      F7. 누적 거래량 ≥ 100K
+      F8. 거래량 서지 (5분 평균 ≥ 분당 평균 × 3)
+      F9. 25% 도달 후 60분 이내
+      F10. 10일 변동성 ≤ 5%
+      F11. 매도벽 (ask < bid × 3)
+      F12. 체결강도 ≥ 120
+      F13. 외국인 3일 순매도 차단
     """
+    # F1
     h, m = now_hm
     if (h, m) < UPLIMIT_V5_BUY_START_HM:
-        return False, "v5_시간대전"
+        return False, "v5_F1_시간대전"
     if (h, m) > UPLIMIT_V5_BUY_END_HM:
-        return False, "v5_시간대후"
+        return False, "v5_F1_시간대후"
+
+    # F2
+    if already_holding:
+        return False, "v5_F2_보유중"
+
+    # F3*. ma10 상회 (28% edge-trigger 대체)
     if not (25.0 <= prdy_ctrt < 30.0):
-        return False, f"v5_구간({prdy_ctrt:.2f}%)"
+        return False, f"v5_F3_구간({prdy_ctrt:.2f}%)"
     if tick_count < 10:
-        return False, f"v5_ma10미축적({tick_count}틱)"
+        return False, f"v5_F3_ma10미축적({tick_count}틱)"
     if ma10 <= 0 or stck_prpr <= 0:
-        return False, "v5_가격무효"
+        return False, "v5_F3_가격무효"
     if stck_prpr <= ma10:
-        return False, f"v5_ma10미상회(prpr={stck_prpr:.0f}<=ma10={ma10:.1f})"
-    return True, f"v5_매수({prdy_ctrt:.2f}%,prpr={stck_prpr:.0f}>ma10={ma10:.1f})"
+        return False, f"v5_F3_ma10미상회(prpr={stck_prpr:.0f}<=ma10={ma10:.1f})"
+
+    # F4. 전일 등락률 < 10% (작전주/연속급등 차단)
+    if prev_day_prdy_ctrt >= UPLIMIT_FILTER_PREV_CTRT_MAX:
+        return False, f"v5_F4_전일급등({prev_day_prdy_ctrt:.1f}%)"
+
+    # F5. 저가주
+    if prev_close < UPLIMIT_FILTER_MIN_PRICE:
+        return False, f"v5_F5_저가주({int(prev_close)})"
+
+    # F6. 시가 갭 ≥ +5%
+    if prev_close <= 0 or stck_oprc <= 0:
+        return False, "v5_F6_가격누락"
+    gap_pct = (stck_oprc / prev_close - 1) * 100
+    if gap_pct < UPLIMIT_FILTER_GAP_MIN:
+        return False, f"v5_F6_갭부족({gap_pct:+.1f}%)"
+
+    # F7. 최소 누적 거래량
+    if acml_vol < UPLIMIT_FILTER_MIN_VOLUME:
+        return False, f"v5_F7_거래량부족({int(acml_vol):,})"
+
+    # F8. 거래량 서지
+    if day_avg_vol_per_min <= 0 or last_5m_avg_vol_per_min <= 0:
+        return False, "v5_F8_서지산출불가"
+    surge_ratio = last_5m_avg_vol_per_min / day_avg_vol_per_min
+    if surge_ratio < UPLIMIT_FILTER_VOL_SURGE_MIN:
+        return False, f"v5_F8_서지부족(x{surge_ratio:.2f})"
+
+    # F9. 25% 도달 후 60분 이내
+    if min_since_25pct_cross is None:
+        return False, "v5_F9_돌파시각누락"
+    if min_since_25pct_cross > UPLIMIT_FILTER_TIME_TO_25_MAX:
+        return False, f"v5_F9_돌파지연({min_since_25pct_cross:.0f}분)"
+
+    # F10. 변동성
+    if vola_10d is None:
+        return False, "v5_F10_변동성누락"
+    if vola_10d > UPLIMIT_FILTER_VOLA_10D_MAX:
+        return False, f"v5_F10_고변동({vola_10d:.3f})"
+
+    # F11. 매도벽
+    if bid_sum_top5 <= 0:
+        return False, "v5_F11_호가누락"
+    if ask_sum_top5 >= bid_sum_top5 * UPLIMIT_FILTER_ASK_VS_BID_MAX:
+        return False, f"v5_F11_매도벽(ask/bid={ask_sum_top5/bid_sum_top5:.2f})"
+
+    # F12. 체결강도
+    if volume_power is None:
+        return False, "v5_F12_VP누락"
+    if volume_power < UPLIMIT_FILTER_VOLUME_POWER_MIN:
+        return False, f"v5_F12_VP약({volume_power:.0f})"
+
+    # F13. 외국인 3일 순매도 차단 (None=데이터없음 통과)
+    if frgn_3d_net is not None and frgn_3d_net < 0:
+        return False, f"v5_F13_외인매도({int(frgn_3d_net):,})"
+
+    # 일일 매수 한도
+    if today_buy_count >= max_daily_buys:
+        return False, f"v5_일한도초과({today_buy_count}/{max_daily_buys})"
+
+    return True, (
+        f"v5_매수(ctrt{prdy_ctrt:.2f}%,prpr={stck_prpr:.0f}>ma10={ma10:.1f},"
+        f"갭{gap_pct:+.1f}%,서지x{surge_ratio:.1f},돌파{min_since_25pct_cross:.0f}분,"
+        f"vol{vola_10d:.3f},VP{volume_power:.0f},"
+        f"bid/ask={bid_sum_top5/max(ask_sum_top5,1):.1f})"
+    )
 
 
 def check_uplimit_v5_trail_exit(

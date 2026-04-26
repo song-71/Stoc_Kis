@@ -2,6 +2,49 @@
 
 ---
 
+## [2026-04-26] 4d97760
+- **Category**: feat
+- **Title**: Strategy A-v5 도입 — 구독 즉시 ma10 상회 시 시장가 매수 + 저거래/상한가도달/트레일3% 차단
+- **Files**: `ws_realtime_trading.py`, `ws_realtime_tr_str1.py`, `symulation/Query_Krx_code.py`, `symulation/Query_str_bb_expansion_simulation.py`, `symulation/Query_str_ma_trend_simulation.py`
+- **Changes**:
+  **v4 폐기 사유 (04-24 실전 3대 치명 버그)**:
+  1. 매수 직후 -5% 하드손절 오발동 — 당일 전체 stck_lwpr 를 post_buy_low 로 사용하는 버그
+  2. 상한가 초과 주문 실패 3,425건/48분 — 지정가 +2틱 방식이 가격제한(1.30) 초과
+  3. 04-24 매수 실패 6종목 중 5종목 이후 상한가 도달 → 5분 유지 조건 자체가 기회 손실
+
+  **v5 신규 사양 (F1~F4)**:
+  - F1: 30% 도달 종목 당일 차단 (`_uplimit_v5_limitup_reached` set)
+  - F2: max_prdy_ctrt ≥ 29% 도달 후 cur_price ≤ highest × 0.97 시 트레일 3% 청산 (`check_uplimit_v5_trail_exit`)
+  - F3: 25%~30% 구간 + tick_count ≥ 10 + stck_prpr > ma10 → 시장가 즉시 매수 (5분 유지 폐지, `check_uplimit_v5_instant_buy`)
+  - F4: 전일 거래대금 / 당일 acml < 50억 종목 차단 (`_is_low_liquidity_v5`, 한화갤러리아우 패턴 방지)
+
+  **ws_realtime_trading.py 주요 변경**:
+  - 신규 상수: `UPLIMIT_V5_ENABLED`, `UPLIMIT_V5_MIN_TICKS=10`, `UPLIMIT_V5_TRAIL_ARM_CTRT=29.0`, `UPLIMIT_V5_TRAIL_PCT=0.03`, `UPLIMIT_V5_LOW_LIQ_VALUE=50억`, 관찰밴드(20~25%), 매수밴드 상한(30%)
+  - 신규 state: `_uplimit_v5_evaluated`, `_uplimit_v5_limitup_reached`, `_uplimit_v5_observe_log`, `_uplimit_prev_day_amount`, `_uplimit_v5_last_acml`
+  - 신규 함수: `_populate_prev_day_amount(codes)` — unified parquet value 컬럼에서 전일 거래대금 적재
+  - 신규 함수: `_is_low_liquidity_v5(code, cur_acml)` — 저거래 종목 차단
+  - `_check_uplimit_v4_from_tick` 전면 재작성: 28% sustain 추적 폐지, v5 로직 통합
+  - `_try_v5_buy` 신규: ord_dvsn="01" 시장가, 가격 0, stck_prpr 기반 수량 (클램프 제거)
+  - `_try_v4_buy` → `_try_v5_buy` alias 유지
+  - `_process_uplimit_notice` 체결 시 `pos["post_buy_low"] = fill_pr` 추가 (시장가 체결가로 하드손절 기준 자동 정상화)
+
+  **ws_realtime_tr_str1.py 주요 변경**:
+  - 신규 함수: `check_uplimit_v5_instant_buy(prdy_ctrt, stck_prpr, ma10, tick_count, now_hm)` — 09:30~14:30 + 25%≤ctrt<30% + tick≥10 + stck_prpr>ma10
+  - 신규 함수: `check_uplimit_v5_trail_exit(buy_price, highest_since_buy, max_prdy_ctrt, cur_price)`
+  - `closing_crash_filter_signal` 차단 로직 제거
+
+  **시뮬레이션 파일 개선**:
+  - `Query_Krx_code.py`: CODE_TEXT 한화갤러리아우로 교체 (저거래 검증용)
+  - `Query_str_bb_expansion_simulation.py`: BB 압축/확장 백테스트 실구현 (deque, polars 로드 추가)
+  - `Query_str_ma_trend_simulation.py`: MA 추세 시뮬레이션 개선
+
+- **Impact**:
+  - Strategy A-v4 완전 폐기, v5로 전면 전환
+  - 시장가 주문으로 가격제한 초과 문제 구조적 해결
+  - 5분 유지 조건 제거로 상한가 직전 종목 즉시 포착
+  - 저거래 종목(한화갤러리아우 패턴) 사전 차단으로 유동성 리스크 제거
+  - post_buy_low 체결가 자동 정상화로 오발동 하드손절 구조적 해결
+
 ## [2026-04-22] 54476be
 - **Category**: feat
 - **Title**: Strategy A-v4 실전 반영 — 28% 5분유지 + 당일홀드 + 상한가 익일MA매도

@@ -873,44 +873,21 @@ class KISWebSocket:
             data: list | str,
             kwargs: dict = None,
     ):
-        """[260427 Phase 7] race 제거 — 메시지 build 는 lock 안 (글로벌 _base_headers_ws read),
-        await ws.send 는 lock 외부에서.
+        """[260427 multiprocessing 전환 후] KIS 공식 샘플 (examples_llm/kis_auth.py) 형태로 단순화.
 
-        기존 버그: a2 가 _base_headers_ws["approval_key"] 를 syw_2 로 swap 하는 동안
-        main path (lock 미획득) 가 동시에 _base_headers_ws 를 읽어 main connection 으로
-        syw_2 key 가 새는 race condition. main 이 syw_2 로 subscribe 하면 KIS 가
-        syw_2 점유로 인식 → a2 가 자기 connection 으로 syw_2 등록 시 ALREADY IN USE.
+        이전 버전은 multi-appkey 사용을 위한 _base_headers_ws 글로벌 swap 코드가 있었으나,
+        a2-WSS 가 자식 프로세스로 분리되면서 자식 namespace 격리로 swap 불필요.
+        race condition (main 으로 syw_2 key 누출) 자체가 발생할 수 없는 구조가 됨.
+
+        호환을 위해 self._approval_key 인자는 KISWebSocket.__init__ 에 유지하되 무시.
         """
-        k = {} if kwargs is None else kwargs
         if isinstance(data, str):
-            items = [data]
+            await self.send(ws, request, tr_type, data, kwargs)
         elif isinstance(data, list):
-            items = data
+            for d in data:
+                await self.send(ws, request, tr_type, d, kwargs)
         else:
             raise ValueError("data must be str or list")
-
-        # ── 메시지 build (lock 안에서 글로벌 _base_headers_ws read) ──
-        # main path 도 lock 획득 → a2 의 swap window 와 충돌 방지
-        msgs = []
-        for d in items:
-            with KISWebSocket._approval_key_lock:
-                if self._approval_key:
-                    saved_key = _base_headers_ws.get("approval_key")
-                    _base_headers_ws["approval_key"] = self._approval_key
-                    try:
-                        msg, columns = request(tr_type, d, **k)
-                    finally:
-                        _base_headers_ws["approval_key"] = saved_key
-                else:
-                    msg, columns = request(tr_type, d, **k)
-                add_data_map(tr_id=msg["body"]["input"]["tr_id"], columns=columns)
-            msgs.append(msg)
-
-        # ── network send (lock 외부, await 가능) ──
-        for msg in msgs:
-            logging.info("send message >> %s" % json.dumps(msg))
-            await ws.send(json.dumps(msg))
-            await asyncio.sleep(_smartSleep)
 
     @classmethod
     def subscribe(

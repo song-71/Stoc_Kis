@@ -11682,6 +11682,29 @@ def run_ws_forever():
         if should_wait and now_t < dtime(16, 0):
             _close_force_stopped = True  # 플래그 보정
             logger.info(f"{ts_prefix()} [ws] 종가 체결 수신 완료, 16:00 시간외까지 대기")
+            # [260427] wait 진입 직후 강제: 종가매수 결과 통보 + 잔고검증 (체결통보 누락 보완)
+            try:
+                _run_closing_buy_filled_notify()
+            except Exception as _ex:
+                logger.warning(f"{ts_prefix()} [wait_init] closing 결과 통보 실패: {_ex}")
+            try:
+                global _closing_balance_1531_done
+                if not _closing_balance_1531_done:
+                    _closing_balance_1531_done = True
+                    _run_closing_balance_verification("15:31_종가체결")
+                else:
+                    # 이미 실행됐어도 wait 진입 시점에 한 번 더 (강제 재검증)
+                    _run_closing_balance_verification("15:31_종가체결_재검증")
+            except Exception as _ex:
+                logger.warning(f"{ts_prefix()} [wait_init] 잔고검증 실패: {_ex}")
+            # 15:40 시간외 종가 매수까지 대기 알림 (텔레그램)
+            try:
+                _notify(
+                    f"{ts_prefix()} [wait] 종가매수 정리 완료 → 15:40 시간외 종가 매수까지 대기",
+                    tele=True,
+                )
+            except Exception:
+                pass
             # [260427] idle 구간도 1분 주기로 heartbeat 로그 (멎었는지 알 수 있도록)
             _last_hb = time.time()
             while not _stop_event.is_set():

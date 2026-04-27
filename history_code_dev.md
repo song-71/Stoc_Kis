@@ -2,6 +2,17 @@
 
 ---
 
+## [2026-04-27] a8bf83d
+- **Category**: feat
+- **Title**: v5 매수 path 진단 카운터 추가 (5분 주기 dump) — 04-27 미호출 원인 식별용
+- **Files**: `ws_realtime_trading.py`
+- **Changes**:
+  - 글로벌 `_v5_diag_counters` (20개 카운터) 추가: fn_called, kind_not_regular_real, rows_processed, code_invalid, in_holdover, in_daily_bought, in_buy_pending, in_evaluated, limitup_reached, low_liquidity, diversify_full, ctrt_below_25, ctrt_at_or_above_30, ctrt_in_observe_band, ctrt_in_buy_band, qualify_called, qualify_passed, qualify_failed, trigger_evaluated, trigger_buy_fired, in_position_path
+  - `_v5_diag_dump_if_due()` 함수: 5분 주기로 카운터 INFO 로그 출력 + 리셋, 모두 0건이면 "v5 path 미호출 가능성" 경고
+  - `_check_uplimit_v4_from_tick` 함수 진입 첫 줄에 fn_called++ 및 dump 호출, 모든 분기 차단/통과 지점에 카운터 삽입
+  - `_restore_uplimit_state_on_startup`: daily_bought 카운트 로그 추가 + 비어있지 않으면 차단 종목 리스트 INFO 출력
+- **Impact**: 다음 운영부터 5분마다 `[v5_diag]` 로그로 매수 path 진입/차단 현황 파악 가능. 0건이면 ingest_loop 분기 의심, ctrt_at_or_above_30 높으면 즉시상한가 가설 확정
+
 ## [2026-04-27] d3efec2
 - **Category**: feat
 - **Title**: 15:31 종가매수 결과 정리 + 잔고검증 + 15:40 대기 메시지 강제 실행

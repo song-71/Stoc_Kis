@@ -2,6 +2,21 @@
 
 ---
 
+## [2026-04-26] 0299cfb
+- **Category**: refactor
+- **Title**: send_multiple 의 race code 제거 — multiprocessing 전환 후 dead code cleanup
+- **Files**: `kis_auth_llm.py` (`send_multiple` 함수, line 868-913)
+- **Changes**:
+  - `send_multiple` docstring 및 본문을 KIS 공식 샘플 형태로 단순화
+  - `with KISWebSocket._approval_key_lock:` 블록 제거
+  - `if self._approval_key:` 분기 및 `_base_headers_ws` swap 로직 제거
+  - 단순 `await self.send(ws, request, tr_type, d, kwargs)` 호출로 회귀 (32줄 → 9줄)
+  - 호환을 위해 `__init__` 의 `approval_key` 인자, `_approval_key_lock` 클래스 변수, `_use_global_open_map` 속성은 보존
+- **Impact**:
+  - Phase 7 (c985f0e) build/send 분리 코드가 a2-WSS multiprocessing 전환 (a75ff0b) 이후 완전 dead code 가 됨 → 제거
+  - a2 자식 프로세스 namespace 격리로 race condition 자체가 발생할 수 없는 구조 → 방어 코드 불필요
+  - 코드 복잡도 감소, KIS 공식 패턴과 일치
+
 ## [2026-04-26] a75ff0b
 - **Category**: feat
 - **Title**: a2-WSS multiprocessing 패턴 전환 (KIS 공식 샘플 기준, race condition 근본 제거)

@@ -259,6 +259,37 @@ ORD_DVSN_BY_TIME = {
 def ts_prefix() -> str:
     return datetime.now(KST).strftime(f"[%y%m%d_%H%M%S_{LOG_ID}]")
 
+def _get_code_version() -> str:
+    """[260427] 기동 시 코드 버전 식별자 반환.
+    git 저장소 내라면 'short_hash (commit_date) [+dirty]', 아니면 'unknown'.
+    재시작 시 옛 코드 실수로 운영하는 사고 방지용.
+    """
+    try:
+        import subprocess as _sp
+        repo_dir = str(Path(__file__).resolve().parent)
+        h = _sp.run(
+            ["git", "-C", repo_dir, "rev-parse", "--short=10", "HEAD"],
+            capture_output=True, text=True, timeout=2,
+        )
+        if h.returncode != 0:
+            return "unknown"
+        sha = h.stdout.strip()
+        d = _sp.run(
+            ["git", "-C", repo_dir, "log", "-1", "--format=%ci", "HEAD"],
+            capture_output=True, text=True, timeout=2,
+        )
+        date = d.stdout.strip().split(" ")[0] if d.returncode == 0 else "?"
+        # working tree dirty 확인 (커밋 안 된 변경 있음)
+        s = _sp.run(
+            ["git", "-C", repo_dir, "status", "--porcelain", "ws_realtime_trading.py", "ws_realtime_tr_str1.py", "kis_auth_llm.py"],
+            capture_output=True, text=True, timeout=2,
+        )
+        dirty = " +dirty" if (s.returncode == 0 and s.stdout.strip()) else ""
+        return f"{sha} ({date}){dirty}"
+    except Exception:
+        return "unknown"
+
+
 def _notify(msg: str, tele: bool = False) -> None:
     logger.info(msg)
     sys.stdout.write("\r\033[2K" + msg + "\n")
@@ -11498,12 +11529,14 @@ def run_ws_forever():
 # main
 # =============================================================================
 if __name__ == "__main__":
+    # [260427] 기동 시 코드 버전 표시 — 옛 코드로 실수 운영 방지
+    _CODE_VERSION = _get_code_version()
     if is_holiday():
-        msg = f"{ts_prefix()} {PROGRAM_NAME} => 오늘은 휴일이므로 프로그램을 종료합니다."
+        msg = f"{ts_prefix()} {PROGRAM_NAME} [v={_CODE_VERSION}] => 오늘은 휴일이므로 프로그램을 종료합니다."
         _notify(msg, tele=True)
         sys.exit(0)
     else:
-        msg = f"{ts_prefix()} {PROGRAM_NAME} => 오늘은 개장일이므로 프로그램을 시작합니다."
+        msg = f"{ts_prefix()} {PROGRAM_NAME} [v={_CODE_VERSION}] => 오늘은 개장일이므로 프로그램을 시작합니다."
         _notify(msg, tele=True)
     logger.info(f"[save_mode] {SAVE_MODE}")
     logger.info(f"[part] flush {PART_FLUSH_THRESHOLD}행 시 {PART_FLUSH_SAVE}행 저장/{PART_FLUSH_SEC}s -> parts/ -> 18:00 merge")

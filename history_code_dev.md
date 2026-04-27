@@ -2,6 +2,21 @@
 
 ---
 
+## [2026-04-26] f83e903
+- **Category**: fix
+- **Title**: a2-WSS appkey 를 syw_2 → main 으로 변경 (syw_2 KIS 점유 우회)
+- **Files**: `ws_realtime_trading.py` (`_get_a2_approval_key`, line ~11038)
+- **Changes**:
+  - `_get_a2_approval_key()` 함수에서 계정 키 소스를 `syw_2` → `main` 으로 변경
+  - docstring 에 변경 사유 및 배경 명시 ([260427])
+  - 에러 메시지 "syw_2 appkey/appsecret/base_url 누락" → "main appkey/appsecret/base_url 누락"
+- **Impact**:
+  - syw_2 appkey 가 KIS 서버에 ALREADY IN USE 로 영구 점유된 상태(110건+) 우회 시도
+  - KIS 1 appkey=1 세션 정책상 main WSS 와 충돌 가능성 있음 — 거부 시 H0STMKO0 자체 비활성 후속 검토 필요
+  - 사용자 직접 지시 ("a1 으로 옮겨봐")
+
+---
+
 ## [2026-04-26] c985f0e
 - **Category**: fix
 - **Title**: send_multiple race condition 수정 — main 으로 syw_2 key 누출 방지 (a2-WSS ALREADY IN USE 근본 원인)

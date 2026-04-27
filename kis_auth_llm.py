@@ -935,13 +935,18 @@ class KISWebSocket:
         fut = asyncio.run_coroutine_threadsafe(coro, self._loop)
         return fut.result()
 
-    def close(self):
+    def close(self, timeout: float = 2.0):
+        """[260427] close frame 전송 완료까지 동기 대기.
+        timeout 초과 시 강제 리턴 (asyncio 루프 사망 방어).
+        timeout=2.0 → KIS 서버가 close frame 받아 appkey 즉시 해제 → 재시작 시 ALREADY IN USE 방지.
+        """
         self._close_requested = True
         if self._ws is not None and self._loop is not None:
             try:
-                asyncio.run_coroutine_threadsafe(self._ws.close(), self._loop)
+                fut = asyncio.run_coroutine_threadsafe(self._ws.close(), self._loop)
+                fut.result(timeout=timeout)
             except Exception:
                 pass
 
-    def shutdown(self):
-        self.close()
+    def shutdown(self, timeout: float = 2.0):
+        self.close(timeout=timeout)

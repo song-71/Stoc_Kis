@@ -11658,5 +11658,14 @@ if __name__ == "__main__":
                 logger.info(f"[ledger] CSV 변환 완료: {_yearly_pq.with_suffix('.csv')}")
         except Exception as e:
             logger.error(f"[ledger] CSV 변환 실패: {e}")
-        _notify(f"{ts_prefix()} {PROGRAM_NAME} 종료", tele=True)
+        # [260427] telegram 비동기화 — Telegram API 응답 지연이 shutdown 흐름을 막지 않음
+        try:
+            threading.Thread(
+                target=_notify,
+                args=(f"{ts_prefix()} {PROGRAM_NAME} 종료",),
+                kwargs={"tele": True},
+                daemon=True,
+            ).start()
+        except Exception:
+            pass
         logger.info("=== WSS END ===")

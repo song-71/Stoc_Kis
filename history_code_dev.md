@@ -2,6 +2,21 @@
 
 ---
 
+## [2026-04-26] d015a87
+- **Category**: feat
+- **Title**: 외인/기관 매매현황 DB 스크립트 3종 (파일럿/1년 backfill/일일 cron) 추가
+- **Files**: `symulation/investor_db_pilot.py`, `symulation/fetch_investor_history.py`, `symulation/fetch_investor_daily.py`
+- **Changes**:
+  - KIS 공식 `investor-trade-by-stock-daily` API 채택 (TR_ID `FHPTJ04160001`): 일자 지정 가능, 30 영업일/페이지
+  - `investor_db_pilot.py` (Step 1): 1종목 호출로 응답 schema, 1페이지 일수, tr_cont 동작, 비용 추정 검증. 단독 실행 (`python3 investor_db_pilot.py`)
+  - `fetch_investor_history.py` (Step 2): 전종목 (KRX_code.csv group=ST) 9개 입력일자로 1년치 backfill. `--limit N` 시범 모드, `--code XXX` 단일 종목 모드. 27 컬럼 (외인/기관/개인 + 기관 세부5종 + OHLCV + symbol/name). 출력: `data/investor_data/kis_investor_unified_parquet_DB.parquet`. 기존 parquet 자동 merge (date+symbol dedup)
+  - `fetch_investor_daily.py` (Step 3): 매일 1회 cron 용 — 오늘 영업일 1행/종목만 수집. 2500종목 × 1 호출 = 약 2.5분. cron 등록 명령 docstring 명시
+  - 파일럿 검증: 005930 단일 종목 240행/240일자 성공. 100종목 시범 25,260행/271일자/2.2분. 전체 2500종목 약 55분 추정
+  - output schema 검증: 외인 (수량+금액), 기관 (수량+금액+세부5종), 개인, OHLCV. 동화약품(000020) prdy_ctrt/frgn_ntby_qty/orgn_ntby_qty/prsn_ntby_qty 정상
+- **Impact**:
+  - 백테스트 + v5 F13 (외인 양수 매수 정책) 사후 검증을 위한 종목별 일별 외인/기관 매매 데이터 영속 DB 기반 마련
+  - Step 4 백테스트 join 은 별도 task. 전체 2500종목 backfill 및 cron 등록은 사용자 승인 후 실행 예정
+
 ## [2026-04-27] a8bf83d
 - **Category**: feat
 - **Title**: v5 매수 path 진단 카운터 추가 (5분 주기 dump) — 04-27 미호출 원인 식별용

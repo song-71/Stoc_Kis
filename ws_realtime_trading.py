@@ -2331,6 +2331,8 @@ _uplimit_v5_last_acml: dict[str, float] = {}        # code → 직전 수신 acm
 _uplimit_v5_qualified_ts: dict[str, datetime] = {}  # code → 12필터 통과 시각 (10분 만료)
 _uplimit_v5_last_bidp1: dict[str, float] = {}       # code → 직전 틱 bidp1 (BB 반등 판정)
 _uplimit_v5_lower_breached: set[str] = set()        # qualified 이후 bb_lower 이탈 이력
+# [260427] Phase 5: 외인 데이터 lazy fetch 시도 이력 (종목당 1회만 시도)
+_uplimit_frgn_3d_fetch_attempted: set[str] = set()
 
 # [260423] Strategy B (MA trend) 신호 관찰 상태
 _ma_trend_prev_ma50: dict[str, float] = {}    # code → 직전 틱 ma50 (골든크로스 edge 판정)
@@ -6067,6 +6069,9 @@ def _precache_uplimit_signals() -> None:
     if _uplimit_precache_done:
         return
     try:
+        # [260427] Phase 5: 당일 외인 캐시 parquet → 메모리 적재 (있다면)
+        _load_frgn_3d_cache_today()
+
         target_codes: set[str] = set()
         with _lock:
             target_codes.update(c.zfill(6) for c in codes)
@@ -6137,12 +6142,20 @@ def _precache_uplimit_signals() -> None:
         except Exception as _ee:
             logger.warning(f"{ts_prefix()} [v5_저거래캐시_초기] 실패: {_ee}")
 
+        # [260427] Phase 5: 외인 캐시 parquet 저장 (precache 결과 누적분 모두)
+        try:
+            saved = _save_frgn_3d_cache_today()
+            if saved > 0:
+                logger.info(f"{ts_prefix()} [v5_frgn_save] {saved}종목 → 당일 parquet 저장")
+        except Exception as _es:
+            logger.warning(f"{ts_prefix()} [v5_frgn_save] 실패: {_es}")
+
         logger.info(
             f"{ts_prefix()} [uplimit_precache] 완료: "
             f"vola_10d={len(_uplimit_vola_10d)}, "
             f"prev_ctrt={len(_uplimit_prev_day_ctrt)}, "
             f"prev_amount={len(_uplimit_prev_day_amount)}, "
-            f"frgn_3d={fetched}"
+            f"frgn_3d={len(_uplimit_frgn_3d)}"
         )
         _uplimit_precache_done = True
     except Exception as e:
@@ -6209,6 +6222,12 @@ def _precache_uplimit_for_new_codes(new_codes: list[str]) -> None:
                 time.sleep(0.05)
             except Exception:
                 pass
+        # [260427] Phase 5: 신규 fetch 결과 즉시 parquet 갱신
+        if frgn_fetched > 0:
+            try:
+                _save_frgn_3d_cache_today()
+            except Exception:
+                pass
     except Exception:
         pass
 
@@ -6220,6 +6239,86 @@ def _precache_uplimit_for_new_codes(new_codes: list[str]) -> None:
 
     # [260427] v5 저거래 판별: 전일 거래대금 캐시 (unified parquet)
     _populate_prev_day_amount(target)
+
+
+def _frgn_3d_cache_path() -> "Path":
+    """외인 3일 순매수 캐시 일별 parquet 경로."""
+    today = datetime.now(KST).strftime("%y%m%d")
+    cache_dir = SCRIPT_DIR / "data" / "frgn_cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    return cache_dir / f"{today}.parquet"
+
+
+def _load_frgn_3d_cache_today() -> int:
+    """당일 외인 3일 순매수 parquet → _uplimit_frgn_3d 적재.
+    Returns: 로드된 종목 수.
+    """
+    try:
+        path = _frgn_3d_cache_path()
+        if not path.exists():
+            return 0
+        df = pd.read_parquet(str(path))
+        if df.empty or "code" not in df.columns or "frgn_3d_net" not in df.columns:
+            return 0
+        df["code"] = df["code"].astype(str).str.zfill(6)
+        df["frgn_3d_net"] = pd.to_numeric(df["frgn_3d_net"], errors="coerce")
+        loaded = 0
+        for c, v in zip(df["code"], df["frgn_3d_net"]):
+            if pd.notna(v):
+                _uplimit_frgn_3d[c] = float(v)
+                loaded += 1
+        logger.info(f"{ts_prefix()} [v5_frgn_load] {path.name} → {loaded}종목 메모리 적재")
+        return loaded
+    except Exception as e:
+        logger.warning(f"{ts_prefix()} [v5_frgn_load] 실패: {e}")
+        return 0
+
+
+def _save_frgn_3d_cache_today() -> int:
+    """_uplimit_frgn_3d → 당일 외인 parquet 저장 (덮어쓰기).
+    Returns: 저장된 종목 수.
+    """
+    try:
+        if not _uplimit_frgn_3d:
+            return 0
+        path = _frgn_3d_cache_path()
+        now_iso = datetime.now(KST).strftime("%Y-%m-%dT%H:%M:%S")
+        rows = [
+            {"code": c, "frgn_3d_net": float(v), "fetched_ts": now_iso}
+            for c, v in _uplimit_frgn_3d.items()
+        ]
+        df = pd.DataFrame(rows)
+        df.to_parquet(str(path), index=False)
+        return len(rows)
+    except Exception as e:
+        logger.warning(f"{ts_prefix()} [v5_frgn_save] 실패: {e}")
+        return 0
+
+
+def _lazy_fetch_frgn_3d(code: str) -> float | None:
+    """v5 매수 판정 시 캐시 miss 종목에 대해 외인 데이터 동기 fetch.
+    종목당 1회만 시도 (_uplimit_frgn_3d_fetch_attempted 으로 추적).
+    성공 시 메모리 캐시 + parquet 동시 갱신.
+    """
+    if code in _uplimit_frgn_3d:
+        return _uplimit_frgn_3d[code]
+    if code in _uplimit_frgn_3d_fetch_attempted:
+        return None  # 이미 시도해서 실패함
+    _uplimit_frgn_3d_fetch_attempted.add(code)
+    try:
+        client = _top_client or _init_top_client()
+        v = fetch_frgn_3day_net(client, code)
+        if v is not None:
+            _uplimit_frgn_3d[code] = v
+            try:
+                _save_frgn_3d_cache_today()
+            except Exception:
+                pass
+            logger.info(f"{ts_prefix()} [v5_frgn_lazy] {code} → {int(v):,} (캐시 miss → 동기 fetch)")
+            return v
+    except Exception as e:
+        logger.debug(f"[v5_frgn_lazy] {code} fetch 실패: {e}")
+    return None
 
 
 def _populate_prev_day_amount(codes: list[str]) -> None:
@@ -9608,7 +9707,10 @@ def _check_uplimit_v4_from_tick(
                     volume_power = _get_uplimit_volume_power(client, code)
                 except Exception:
                     volume_power = None
+                # [260427] Phase 5: 외인 데이터 캐시 miss 시 lazy fetch (종목당 1회)
                 frgn_3d = _uplimit_frgn_3d.get(code)
+                if frgn_3d is None:
+                    frgn_3d = _lazy_fetch_frgn_3d(code)
                 day_avg = _calc_uplimit_day_avg_vol_per_min(code, acml_vol, now_dt)
                 last5m_avg = _calc_uplimit_last5m_avg_vol_per_min(code)
                 cross_ts = _uplimit_25pct_cross_ts.get(code)

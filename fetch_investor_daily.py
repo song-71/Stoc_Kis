@@ -7,11 +7,11 @@ unified parquet 에 append (기존 행 dedup).
 비용: 2500종목 × 1 호출 = ~2.5분 (rate limit 18 RPS + sleep 0.06)
 
 사용법:
-  python3 symulation/fetch_investor_daily.py            # 오늘 데이터 수집
-  python3 symulation/fetch_investor_daily.py --date 20260424   # 특정 일자 강제 수집
+  python3 fetch_investor_daily.py                       # 오늘 데이터 수집
+  python3 fetch_investor_daily.py --date 20260424       # 특정 일자 강제 수집
 
 cron 등록 (예시):
-  30 16 * * 1-5 cd /home/ubuntu/Stoc_Kis && /home/ubuntu/Stoc_Kis/venv/bin/python symulation/fetch_investor_daily.py >> /home/ubuntu/Stoc_Kis/out/logs/investor_daily.log 2>&1
+  30 16 * * 1-5 /home/ubuntu/Stoc_Kis/venv/bin/python /home/ubuntu/Stoc_Kis/fetch_investor_daily.py >> /home/ubuntu/Stoc_Kis/out/logs/investor_daily.log 2>&1
 """
 import argparse
 import json
@@ -24,7 +24,8 @@ from pathlib import Path
 import pandas as pd
 import requests
 
-SCRIPT_DIR = Path(__file__).resolve().parent.parent
+# [260427] 프로젝트 루트로 이동됨 → parent 1단계만 (이전: symulation/ → parent.parent)
+SCRIPT_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = SCRIPT_DIR / "config.json"
 KRX_CODE_PATH = SCRIPT_DIR / "data" / "admin" / "symbol_master" / "KRX_code.csv"
 OUTPUT_PATH = SCRIPT_DIR / "data" / "investor_data" / "kis_investor_unified_parquet_DB.parquet"
@@ -187,6 +188,14 @@ def main():
             print(f"  기존 parquet merge 실패 (덮어쓰기): {e}")
 
     df = df.sort_values(["stck_bsop_date", "symbol"]).reset_index(drop=True)
+
+    # [260427] 해당 일자 순매수 순위 컬럼 추가 (frgn/orgn/prsn/frgn_orgn_rank)
+    try:
+        from compute_investor_ranks import compute_ranks_for_dates
+        df = compute_ranks_for_dates(df, dates=[target_date])
+    except Exception as e:
+        print(f"  [ranks] 계산 실패 (rank 없이 저장): {e}")
+
     df.to_parquet(OUTPUT_PATH, index=False)
     elapsed = time.time() - t0
     today_n = (df["stck_bsop_date"] == target_date).sum()

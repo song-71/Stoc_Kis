@@ -11682,9 +11682,20 @@ def run_ws_forever():
         if should_wait and now_t < dtime(16, 0):
             _close_force_stopped = True  # 플래그 보정
             logger.info(f"{ts_prefix()} [ws] 종가 체결 수신 완료, 16:00 시간외까지 대기")
+            # [260427] idle 구간도 1분 주기로 heartbeat 로그 (멎었는지 알 수 있도록)
+            _last_hb = time.time()
             while not _stop_event.is_set():
-                if datetime.now(KST).time() >= dtime(16, 0):
+                _now = datetime.now(KST)
+                if _now.time() >= dtime(16, 0):
                     break
+                if time.time() - _last_hb >= 60.0:
+                    _remain_sec = (dtime(16, 0).hour * 3600 + dtime(16, 0).minute * 60) \
+                                  - (_now.hour * 3600 + _now.minute * 60 + _now.second)
+                    _remain_min = max(0, _remain_sec) // 60
+                    logger.info(
+                        f"{ts_prefix()} [ws] idle 중 — 16:00 시간외까지 {_remain_min}분 남음"
+                    )
+                    _last_hb = time.time()
                 time.sleep(1.0)
             logger.info(f"{ts_prefix()} [ws] 16:00 도달 → 시간외 단일가 연결 시작")
         else:

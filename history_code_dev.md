@@ -2,6 +2,19 @@
 
 ---
 
+## [2026-04-27] 1a3b112
+- **Category**: fix
+- **Title**: WSS close frame 동기 전송 + shutdown telegram 비동기화 (a2-WSS ALREADY IN USE 방지)
+- **Files**: `kis_auth_llm.py`, `ws_realtime_trading.py`
+- **Changes**:
+  - `KISWebSocket.close(timeout=2.0)`: `fut.result(timeout)` 으로 close frame 전송 완료까지 동기 대기. `shutdown()` 도 동일 인자 전달. 기존 `kws.close()` 인자 없는 호출 완전 호환.
+  - `ws_realtime_trading.py` finally 블록: `_notify(종료)` 를 `daemon=True` 스레드로 wrap → Telegram API 지연이 shutdown 흐름을 차단하지 않음. logger/파일 기록은 thread 안에서 즉시 수행되어 로그 손실 없음.
+- **Impact**:
+  - 근본 원인(04-27 11:19 사고): `asyncio.run_coroutine_threadsafe(ws.close())` 결과 대기 없이 즉시 리턴 → SystemExit 으로 asyncio 루프 종료 → KIS 서버 close frame 미수신 → 60~120초 appkey 점유 → 신규 a2-WSS 4회 "ALREADY IN USE" + H0STMKO0 구독 실패.
+  - 수정 후: shutdown 시 close frame 정상 전송(최대 2초) → KIS 즉시 appkey 해제 → 재시작 직후 H0STMKO0 첫 구독 성공 → restart 갭 30초 이내 해소, SIGKILL 미발동.
+
+---
+
 ## [2026-04-26] a410692
 - **Category**: refactor
 - **Title**: v5 외인 일괄 fetch 제거 — Top30 신규/lazy fetch 만으로 충분

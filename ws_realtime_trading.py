@@ -6123,18 +6123,9 @@ def _precache_uplimit_signals() -> None:
         except Exception as e:
             logger.warning(f"{ts_prefix()} [uplimit_precache] 일봉 기반 변동성 계산 실패: {e}")
 
-        # 외국인 3일 순매수 — REST 일괄 (rate limit 고려)
-        client = _top_client or _init_top_client()
-        fetched = 0
-        for code in list(target_codes)[:40]:  # 과도한 호출 방지
-            try:
-                v = fetch_frgn_3day_net(client, code)
-                if v is not None:
-                    _uplimit_frgn_3d[code] = v
-                    fetched += 1
-                time.sleep(0.05)
-            except Exception:
-                pass
+        # [260427] 외인 일괄 fetch 제거 — v5 는 25%+ 도달 종목에만 외인 필터 적용.
+        # 보유/전일 후보 등 일반 구독 종목은 어차피 F2(보유) 또는 25% 미만으로 차단.
+        # 외인 데이터는 (a) parquet load (b) Top30 신규 추가 시 fetch (c) lazy fetch 로 충분.
 
         # [260427] v5 저거래 판별 캐시 — 전일 거래대금 일괄 적재
         try:

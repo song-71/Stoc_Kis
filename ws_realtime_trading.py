@@ -4031,6 +4031,12 @@ _a2_kws_lock = threading.RLock()
 _a2_active_kws = None
 _a2_subscribed: dict[str, set[str]] = {}
 _a2_approval_key: str = ""
+# [260427] ALREADY IN USE 감지 시각 — 장기 backoff 트리거용
+_a2_last_already_in_use_ts: float = 0.0
+# [260427] a2-WSS 첫 connect 전 점유 정리 대기 (워밍업): 옛 프로세스 잔존 점유 timeout 확보
+A2_WSS_INITIAL_WARMUP_SEC: float = 30.0
+# [260427] ALREADY IN USE 감지 시 reconnect backoff (KIS 자연 timeout 활용)
+A2_WSS_BACKOFF_ALREADY_IN_USE_SEC: float = 90.0
 
 
 def _trigger_ws_rebuild():
@@ -11095,6 +11101,17 @@ def run_ws_a2_forever():
         _notify(f"{ts_prefix()} [a2-WSS] 시작 실패: {e}", tele=True)
         return
 
+    # [260427] A: 워밍업 sleep — 옛 프로세스 잔존 점유 KIS timeout 확보
+    if A2_WSS_INITIAL_WARMUP_SEC > 0:
+        logger.info(
+            f"{ts_prefix()} [a2-WSS] 워밍업 sleep {A2_WSS_INITIAL_WARMUP_SEC:.0f}s "
+            f"(이전 점유 KIS timeout 대기) — main WSS 는 영향 없음"
+        )
+        for _ in range(int(A2_WSS_INITIAL_WARMUP_SEC * 10)):
+            if _stop_event.is_set():
+                return
+            time.sleep(0.1)
+
     while not _stop_event.is_set():
         attempt += 1
         kws = None
@@ -11116,6 +11133,7 @@ def run_ws_a2_forever():
                 _a2_subscribed.clear()
 
             def _on_system_a2(rsp):
+                global _a2_last_already_in_use_ts
                 if rsp.isOk and rsp.tr_msg and "SUCCESS" in rsp.tr_msg:
                     return
                 if rsp.tr_msg:
@@ -11124,6 +11142,9 @@ def run_ws_a2_forever():
                         logger.debug(f"{ts_prefix()} [a2-WSS][system] {msg}")
                     else:
                         logger.warning(f"{ts_prefix()} [a2-WSS][system] tr_id={rsp.tr_id} msg={msg}")
+                        # [260427] ALREADY IN USE 감지 → 장기 backoff 트리거
+                        if "ALREADY IN USE" in msg:
+                            _a2_last_already_in_use_ts = time.time()
 
             kws.on_system = _on_system_a2
 
@@ -11200,9 +11221,22 @@ def run_ws_a2_forever():
         if _stop_event.is_set():
             break
 
-        wait = min(backoff * (2 ** min(attempt - 1, 5)), 60)
-        logger.info(f"{ts_prefix()} [a2-WSS] reconnect in {wait}s...")
-        time.sleep(wait)
+        # [260427] B: 직전 30초 내 ALREADY IN USE 감지 시 → 90초 대기 (KIS 자연 timeout 활용)
+        elapsed_already = time.time() - _a2_last_already_in_use_ts
+        if elapsed_already < 30.0:
+            wait = A2_WSS_BACKOFF_ALREADY_IN_USE_SEC
+            logger.info(
+                f"{ts_prefix()} [a2-WSS] ALREADY IN USE 감지 → "
+                f"long backoff {wait:.0f}s (KIS appkey timeout 대기)"
+            )
+        else:
+            wait = min(backoff * (2 ** min(attempt - 1, 5)), 60)
+            logger.info(f"{ts_prefix()} [a2-WSS] reconnect in {wait}s...")
+        # 단계적 sleep (stop event 빠른 응답)
+        for _ in range(int(wait * 10)):
+            if _stop_event.is_set():
+                break
+            time.sleep(0.1)
 
     logger.info(f"{ts_prefix()} [a2-WSS] stopped")
 

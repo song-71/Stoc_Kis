@@ -2,6 +2,21 @@
 
 ---
 
+## [2026-04-26] a410692
+- **Category**: refactor
+- **Title**: v5 외인 일괄 fetch 제거 — Top30 신규/lazy fetch 만으로 충분
+- **Files**: `ws_realtime_trading.py`
+- **Changes**:
+  `_precache_uplimit_signals` 내 `target_codes[:40]` 외인 REST 일괄 fetch 블록 삭제.
+  v5 F13 외인 필터는 25%+ 도달 종목에만 적용되므로 보유/전일 closing_buy 후보 등 일반 구독 종목의 사전 fetch 는 대부분 무의미.
+  보유 종목은 F2(이미 보유)로 차단되고, 전일 후보도 대부분 25% 미만.
+  자리에 사유 주석(`[260427]`) 추가.
+
+- **Impact**:
+  - 장 시작 직후 REST 호출 ~40회 절감 (약 2초 단축)
+  - 외인 quota 낭비 제거
+  - 외인 데이터 공급 경로: (a) 재시작 시 parquet load, (b) Top30 신규 25%+ 도달 시 사이클당 10개 fetch, (c) 매수 판정 시 lazy fetch — 세 경로로 충분
+
 ## [2026-04-26] 9c70ab4
 - **Category**: feat
 - **Title**: v5 F13 외인 캐시 영속화 + lazy fetch (재시작 안전성)

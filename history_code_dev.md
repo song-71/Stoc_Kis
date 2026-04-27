@@ -2,6 +2,21 @@
 
 ---
 
+## [2026-04-27] 24f747b
+- **Category**: feat
+- **Title**: 기동 시 git commit 버전 표시 — 옛 코드 운영 사고 방지
+- **Files**: `ws_realtime_trading.py`
+- **Changes**:
+  - `_get_code_version()` 함수 신규 추가: `git rev-parse --short=10 HEAD` 로 commit hash, `git log -1 --format=%ci` 로 커밋 날짜, `git status --porcelain` 으로 핵심 파일(ws_realtime_trading.py, ws_realtime_tr_str1.py, kis_auth_llm.py) dirty 여부 확인. 서브프로세스 timeout 2초, 실패 시 "unknown" 반환.
+  - 출력 형식: `"7a949d212d (2026-04-27)"` 또는 미커밋 변경 존재 시 `"+dirty"` 접미.
+  - `__main__` 진입점에서 `_CODE_VERSION` 산출 후 휴일/개장일 양쪽 시작 메시지에 `[v=...]` 삽입, 텔레그램(tele=True)으로도 발송.
+- **Impact**:
+  - 동기: 04-27 운영 중 재시작 후 사용자가 옛 프로세스(Phase 6 미적용)로 착각하게 해 잘못된 분석 제공. 버전 명시가 있었으면 즉시 식별 가능했음.
+  - 매 기동마다 로그/텔레그램에 commit hash 기록 → 운영 중 버전 원격 확인 가능.
+  - `+dirty` 표시 시 미커밋 변경 있음을 경고하여 실수 예방.
+
+---
+
 ## [2026-04-27] 1a3b112
 - **Category**: fix
 - **Title**: WSS close frame 동기 전송 + shutdown telegram 비동기화 (a2-WSS ALREADY IN USE 방지)

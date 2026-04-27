@@ -2,6 +2,23 @@
 
 ---
 
+## [2026-04-26] ecc4333
+- **Category**: feat
+- **Title**: 외인/기관/개인 일자별 순매수 순위 컬럼 + fetch_investor_daily.py 루트 이동
+- **Files**: `compute_investor_ranks.py` (신규), `fetch_investor_daily.py` (symulation/ → 루트 이동)
+- **Changes**:
+  1. **compute_investor_ranks.py 신규** — `data/investor_data/kis_investor_unified_parquet_DB.parquet` 의 일자별 4종 rank 컬럼 산출
+     - `frgn_rank` (외인 순매수 수량), `orgn_rank` (기관), `prsn_rank` (개인), `frgn_orgn_rank` (외인+기관 합산)
+     - 1=최대 순매수, method='min', ascending=False, na_option='bottom'
+     - CLI: `python3 compute_investor_ranks.py` (전 일자) / `--date 20260427` (단일)
+     - 모듈 import: `from compute_investor_ranks import compute_ranks_for_dates`
+  2. **fetch_investor_daily.py 루트 이동** — `symulation/` → 프로젝트 루트 (daily fetch 류 스크립트 일관성)
+     - SCRIPT_DIR: `parent.parent` → `parent`
+     - docstring 사용법/cron 경로 갱신
+  3. **fetch_investor_daily.py 통합** — parquet 저장 직전 `compute_ranks_for_dates()` 호출, try/except로 rank 실패 시에도 데이터 저장 보장
+  4. **271일 backfill 완료** — 전 일자 일괄 처리, parquet shape (715,740, 31) 확인
+- **Impact**: 시뮬레이션/분석 시 일자별 외인·기관·개인 순매수 순위를 직접 join 없이 parquet에서 바로 필터링 가능
+
 ## [2026-04-26] d015a87
 - **Category**: feat
 - **Title**: 외인/기관 매매현황 DB 스크립트 3종 (파일럿/1년 backfill/일일 cron) 추가

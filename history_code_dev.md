@@ -2,6 +2,38 @@
 
 ---
 
+## [2026-04-26] 9c70ab4
+- **Category**: feat
+- **Title**: v5 F13 외인 캐시 영속화 + lazy fetch (재시작 안전성)
+- **Files**: `ws_realtime_trading.py`
+- **Changes**:
+  **문제 배경**: v5 F13 강화 (외인 양수만 매수) 이후 재시작 시 `_uplimit_frgn_3d` 메모리 휘발 → 재시작 직후 모든 종목 `v5_F13_외인데이터없음` 차단.
+  사전 캐시 40종목 한도 + 장중 추가 사이클당 10종목 한도로 Top30 변화 빠를 때 누락 문제도 겸 해결.
+
+  **신규 전역 set**:
+  - `_uplimit_frgn_3d_fetch_attempted` — 종목당 lazy fetch 1회 시도 보장 추적
+
+  **신규 헬퍼 함수**:
+  - `_frgn_3d_cache_path()` — `data/frgn_cache/YYMMDD.parquet` 경로 반환 + 디렉토리 생성
+  - `_load_frgn_3d_cache_today()` — 당일 parquet → `_uplimit_frgn_3d` 메모리 적재 (재시작 시)
+  - `_save_frgn_3d_cache_today()` — `_uplimit_frgn_3d` → parquet 덮어쓰기 저장
+  - `_lazy_fetch_frgn_3d(code)` — 캐시 miss 시 동기 fetch (200~500ms) + parquet 갱신
+
+  **호출 지점**:
+  - `_precache_uplimit_signals` 시작부: `_load_frgn_3d_cache_today()` (당일 기존 데이터 복원)
+  - `_precache_uplimit_signals` 종료부: `_save_frgn_3d_cache_today()` (precache 결과 누적 저장)
+  - `_precache_uplimit_for_new_codes` fetch 후: `_save_frgn_3d_cache_today()` (신규 종목 즉시 저장)
+  - `_check_uplimit_v4_from_tick` qualify 단계: 캐시 miss 시 `_lazy_fetch_frgn_3d(code)` 호출
+
+  **parquet 사양**: 컬럼 `code`(str 6자리) / `frgn_3d_net`(float) / `fetched_ts`(ISO str), YYMMDD 파일명으로 당일 데이터만 적재
+
+  **로그 키워드**: `[v5_frgn_load]` (parquet→메모리) / `[v5_frgn_save]` (메모리→parquet) / `[v5_frgn_lazy]` (캐시 miss 동기 fetch)
+
+- **Impact**:
+  - 재시작 후 즉시 외인 데이터 복원 → F13 차단 없이 매수 판정 재개
+  - lazy fetch 종목당 1회 보장 → TPS 영향 미미
+  - parquet 손상 시 빈 dict 진행 후 precache 가 다시 채움 (무중단)
+
 ## [2026-04-26] 1c91397
 - **Category**: feat
 - **Title**: v5 종목 선정/매수 트리거 분리 + 5필터 완화 + BB 반등 트리거

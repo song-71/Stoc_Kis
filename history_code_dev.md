@@ -2,6 +2,24 @@
 
 ---
 
+## [2026-04-26] a75ff0b
+- **Category**: feat
+- **Title**: a2-WSS multiprocessing 패턴 전환 (KIS 공식 샘플 기준, race condition 근본 제거)
+- **Files**: `ws_a2_subprocess.py` (신규, ~200줄), `ws_realtime_trading.py` (수정)
+- **Changes**:
+  - `ws_a2_subprocess.py` 신규 생성: `multiprocessing.Process` target, `data_queue` (a2→main), `cmd_queue` (main→a2) IPC, `cmd_loop` 별도 thread로 동적 sub/unsub 지원
+  - syw_2 계정 정보 자체 로드 후 `ka.auth_ws()` 로 approval_key 발급 → 자식 프로세스 namespace 내 `_base_headers_ws` 격리 사용
+  - `ws_realtime_trading.py`: 신규 globals (`_a2_proc`, `_a2_data_queue`, `_a2_cmd_queue`, `_a2_alive`), 신규 함수 (`_a2_cmd_send`, `_a2_data_router_loop`, `_start_a2_subprocess`, `_stop_a2_subprocess`)
+  - `run_ws_a2_forever`: thread 패턴 폐기 → 자식 프로세스 spawn + alive 모니터 loop 로 변경, 이전 코드는 `run_ws_a2_forever_LEGACY` 로 보존
+  - `_a2_mkstatus_sub_add/remove`, `_vi_exp_sub_switch/restore`: a2 send 부분을 `_a2_cmd_send()` 호출로 변경
+  - `_shutdown`: `_stop_a2_subprocess()` 호출 추가
+  - `kis_auth_llm.py` 의 legacy fallback 코드(`_approval_key_lock`, `_base_headers_ws` swap)는 검증 후 cleanup 예정
+- **Impact**:
+  - 04-22 thread 패턴의 `_base_headers_ws` 글로벌 swap race condition 근본 제거
+  - 04-23~04-27 누적된 ALREADY IN USE 오류(23건/270건/110+건)의 원인 해소
+  - main appkey / syw_2 appkey 가 OS 프로세스 단위로 완전 격리 → KIS 1 appkey=1 세션 정책 정상 대응
+  - 멀티계좌 확장성 확보 (향후 a3/a4 동일 패턴으로 추가 가능)
+
 ## [2026-04-26] f83e903
 - **Category**: fix
 - **Title**: a2-WSS appkey 를 syw_2 → main 으로 변경 (syw_2 KIS 점유 우회)

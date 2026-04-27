@@ -2,6 +2,23 @@
 
 ---
 
+## [2026-04-27] d3efec2
+- **Category**: feat
+- **Title**: 15:31 종가매수 결과 정리 + 잔고검증 + 15:40 대기 메시지 강제 실행
+- **Files**: `ws_realtime_trading.py` (run_ws_forever() wait loop 진입부, line ~11682)
+- **Changes**:
+  - wait loop 진입 직후(`종가 체결 수신 완료` 로그 다음) 강제 실행 블록 추가
+  - `_run_closing_buy_filled_notify()` 호출 — 종가매수 체결 결과 통보 (체결통보 매칭 정보 정리)
+  - `_closing_balance_1531_done` 플래그 확인 후 미실행 시 `"15:31_종가체결"`, 이미 실행된 경우 `"15:31_종가체결_재검증"` 라벨로 `_run_closing_balance_verification()` 호출
+  - `_notify("[wait] 종가매수 정리 완료 → 15:40 시간외 종가 매수까지 대기", tele=True)` 텔레그램 알림
+  - 각 블록 try/except 처리로 실패 시 warning 로그만 남기고 계속 진행
+- **Impact**:
+  - 배경: 04-27 운영 사고 — SK증권우 3주 실체결됐으나 시스템 로그에 `15:31_종가체결` 흔적 0건 (main monitor 분기 미도달로 잔고검증 미실행)
+  - main monitor 분기 누락이 있어도 wait 진입 시점에 무조건 실행 보장
+  - 사용자가 텔레그램 + 콘솔 양쪽으로 종가매수 결과 + 실잔고 확인 가능
+  - `"15:40 시간외 매수까지 대기 중"` 명시 → idle 정상/멎음 즉시 분간 가능
+  - 미해결: H0STCNI0 체결통보 수신 정상에도 SK증권우 3주 체결 미감지 정확한 원인 — 별도 진단 필요
+
 ## [2026-04-26] eeeed9f
 - **Category**: feat
 - **Title**: 15:30~16:00 idle 구간 1분 주기 heartbeat 로그 추가

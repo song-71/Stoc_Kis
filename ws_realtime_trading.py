@@ -4035,6 +4035,51 @@ _a2_last_already_in_use_ts: float = 0.0
 A2_WSS_INITIAL_WARMUP_SEC: float = 30.0
 A2_WSS_BACKOFF_ALREADY_IN_USE_SEC: float = 90.0
 
+# [260427] v5 진단 카운터 (5분 주기 INFO 로그) — 매수가 안 일어난 원인 추적
+_v5_diag_counters: dict[str, int] = {
+    "fn_called": 0,             # _check_uplimit_v4_from_tick 함수 호출 횟수
+    "kind_not_regular_real": 0, # 첫 분기 return
+    "rows_processed": 0,        # 종목 단위 처리 횟수
+    "code_invalid": 0,          # code 유효성 fail
+    "in_holdover": 0,           # _uplimit_v4_holdover 차단
+    "in_daily_bought": 0,       # _uplimit_v4_daily_bought_codes 차단
+    "in_buy_pending": 0,        # _uplimit_buy_pending 차단
+    "in_evaluated": 0,          # _uplimit_v5_evaluated 차단
+    "limitup_reached": 0,       # 30% 도달 이력 차단
+    "low_liquidity": 0,         # 저거래 차단
+    "diversify_full": 0,        # 시드 슬롯 가득 참
+    "ctrt_below_25": 0,         # prdy_ctrt < 25%
+    "ctrt_at_or_above_30": 0,   # prdy_ctrt >= 30% (limitup_reached 추가 직전)
+    "ctrt_in_observe_band": 0,  # 20~25% 관찰 구간
+    "ctrt_in_buy_band": 0,      # 25~30% 매수 구간 진입
+    "qualify_called": 0,        # 12필터 호출
+    "qualify_passed": 0,        # 12필터 통과
+    "qualify_failed": 0,        # 12필터 차단
+    "trigger_evaluated": 0,     # 매수 트리거 평가
+    "trigger_buy_fired": 0,     # 매수 트리거 발동
+    "in_position_path": 0,      # 보유 포지션 path 진입
+}
+_v5_diag_last_dump_ts: float = 0.0
+_V5_DIAG_DUMP_INTERVAL_SEC: float = 300.0   # 5분 주기 dump
+
+
+def _v5_diag_dump_if_due() -> None:
+    """5분 주기로 진단 카운터를 INFO 로그로 출력 + 리셋."""
+    global _v5_diag_last_dump_ts
+    now_ts = time.time()
+    if now_ts - _v5_diag_last_dump_ts < _V5_DIAG_DUMP_INTERVAL_SEC:
+        return
+    _v5_diag_last_dump_ts = now_ts
+    parts = [f"{k}={v}" for k, v in _v5_diag_counters.items() if v > 0]
+    if not parts:
+        logger.info(f"{ts_prefix()} [v5_diag] (5분 누적) 호출/처리 모두 0건 — v5 path 미호출 가능성")
+    else:
+        logger.info(f"{ts_prefix()} [v5_diag] (5분 누적) {' | '.join(parts)}")
+    # 카운터 리셋
+    for k in _v5_diag_counters:
+        _v5_diag_counters[k] = 0
+
+
 # [260427] a2 multiprocessing 패턴 (KIS 공식 multi_processing_sample_ws.py 패턴)
 _a2_proc = None                              # multiprocessing.Process
 _a2_data_queue = None                        # mp.Queue (a2 → main)
@@ -6090,8 +6135,15 @@ def _restore_uplimit_state_on_startup() -> None:
         logger.info(
             f"{ts_prefix()} [uplimit] 상태 복원: positions={len(_uplimit_positions)}, "
             f"buy_pending={len(_uplimit_buy_pending)}, today_buy_count={_uplimit_today_buy_count}, "
-            f"v4_holdover={len(_uplimit_v4_holdover)}"
+            f"v4_holdover={len(_uplimit_v4_holdover)}, "
+            f"daily_bought={len(_uplimit_v4_daily_bought_codes)}"
         )
+        # [260427] v5 진단: startup 시 차단 후보 종목 명시
+        if _uplimit_v4_daily_bought_codes:
+            logger.info(
+                f"{ts_prefix()} [v5_diag][startup] daily_bought 차단 종목: "
+                f"{sorted(_uplimit_v4_daily_bought_codes)}"
+            )
         if _uplimit_v4_holdover:
             for c, h in _uplimit_v4_holdover.items():
                 logger.info(
@@ -9594,7 +9646,10 @@ def _check_uplimit_v4_from_tick(
     kind: str,
 ) -> None:
     """v5 매수/Exit 로직 (함수명은 호환 위해 v4 유지)."""
+    _v5_diag_counters["fn_called"] += 1
+    _v5_diag_dump_if_due()
     if kind != "regular_real":
+        _v5_diag_counters["kind_not_regular_real"] += 1
         return
 
     pr_col    = col_map.get("stck_prpr")
@@ -9614,8 +9669,10 @@ def _check_uplimit_v4_from_tick(
 
     for df_code in df_tmp.partition_by(code_col, maintain_order=True):
         try:
+            _v5_diag_counters["rows_processed"] += 1
             code = str(df_code[code_col][0])
             if not code or code in ("None", "000000"):
+                _v5_diag_counters["code_invalid"] += 1
                 continue
             row = df_code.row(-1, named=True)
 
@@ -9640,10 +9697,12 @@ def _check_uplimit_v4_from_tick(
 
             # ── 상한가(≥30%) 도달 이력 기록 ─────────────────────────────
             if prdy_ctrt >= UPLIMIT_V5_BUY_BAND_HIGH:
+                _v5_diag_counters["ctrt_at_or_above_30"] += 1
                 _uplimit_v5_limitup_reached.add(code)
 
             # ── 보유 포지션 관리 (source=v5; v4 호환 유지) ────────────────
             if code in _uplimit_positions and _uplimit_positions[code].get("source") in ("v5", "v4"):
+                _v5_diag_counters["in_position_path"] += 1
                 pos = _uplimit_positions[code]
                 if bidp1 > pos.get("highest_since_buy", 0):
                     pos["highest_since_buy"] = bidp1
@@ -9687,15 +9746,21 @@ def _check_uplimit_v4_from_tick(
 
             # ── 매수 후보 사전 컷 ──────────────────────────────────────────
             if code in _uplimit_v4_holdover:
+                _v5_diag_counters["in_holdover"] += 1
                 continue
             if code in _uplimit_v4_daily_bought_codes:
+                _v5_diag_counters["in_daily_bought"] += 1
                 continue
             if code in _uplimit_buy_pending:
+                _v5_diag_counters["in_buy_pending"] += 1
                 continue
             if code in _uplimit_v5_evaluated:
+                _v5_diag_counters["in_evaluated"] += 1
                 continue   # 당일 1회 평가만 (구독 후 첫 ma10 상회 시점)
 
             # ── 20%~25% 관찰 구간: 1회만 로그 기록 (매수 안 함) ────────────
+            if (UPLIMIT_V5_OBSERVE_BAND_LOW <= prdy_ctrt < UPLIMIT_V5_OBSERVE_BAND_HIGH):
+                _v5_diag_counters["ctrt_in_observe_band"] += 1
             if (UPLIMIT_V5_OBSERVE_BAND_LOW <= prdy_ctrt < UPLIMIT_V5_OBSERVE_BAND_HIGH
                 and code not in _uplimit_v5_observe_log):
                 _uplimit_v5_observe_log.add(code)
@@ -9707,15 +9772,20 @@ def _check_uplimit_v4_from_tick(
 
             # ── 매수 판정: 25%~30% 구간만 ───────────────────────────────
             if not (UPLIMIT_V5_OBSERVE_BAND_HIGH <= prdy_ctrt < UPLIMIT_V5_BUY_BAND_HIGH):
+                if prdy_ctrt < UPLIMIT_V5_OBSERVE_BAND_HIGH:
+                    _v5_diag_counters["ctrt_below_25"] += 1
                 continue
+            _v5_diag_counters["ctrt_in_buy_band"] += 1
 
             # 상한가 도달 이력 차단
             if code in _uplimit_v5_limitup_reached:
+                _v5_diag_counters["limitup_reached"] += 1
                 continue
 
             # 저거래 차단
             is_low, low_reason = _is_low_liquidity_v5(code, _uplimit_v5_last_acml.get(code, 0.0))
             if is_low:
+                _v5_diag_counters["low_liquidity"] += 1
                 _uplimit_v5_evaluated.add(code)   # 1회 기록 (재평가 방지)
                 logger.info(
                     f"{ts_prefix()} [v5_skip_저거래] "
@@ -9729,10 +9799,12 @@ def _check_uplimit_v4_from_tick(
                 if p.get("source") in ("v5", "v4") and not p.get("sold", False)
             ) + len(_uplimit_buy_pending)
             if active_n >= UPLIMIT_DIVERSIFY_N:
+                _v5_diag_counters["diversify_full"] += 1
                 continue
 
             # ── 1단계: 12필터 qualify (아직 통과 안 한 종목만) ──────────────
             if code not in _uplimit_v5_qualified_ts:
+                _v5_diag_counters["qualify_called"] += 1
                 # 12필터 데이터 수집
                 prev_close = stck_prpr / (1 + prdy_ctrt / 100.0) if prdy_ctrt > -100 and stck_prpr > 0 else 0
                 client = _top_client or _init_top_client()
@@ -9769,6 +9841,7 @@ def _check_uplimit_v4_from_tick(
                     max_daily_buys=UPLIMIT_MAX_DAILY_BUYS,
                 )
                 if not qualified:
+                    _v5_diag_counters["qualify_failed"] += 1
                     # skip 로그 종목당 10초 쿨다운
                     _last_log = _uplimit_v4_last_sustain_log.get(code, 0.0)
                     if time.time() - _last_log > 10:
@@ -9776,6 +9849,7 @@ def _check_uplimit_v4_from_tick(
                         logger.info(f"{ts_prefix()} [v5_skip] {code_name_map.get(code, code)}({code}) {q_reason}")
                     continue
                 # 12필터 통과 → qualified 등록
+                _v5_diag_counters["qualify_passed"] += 1
                 _uplimit_v5_qualified_ts[code] = now_dt
                 logger.info(
                     f"{ts_prefix()} [v5_qualify] {code_name_map.get(code, code)}({code}) "
@@ -9786,6 +9860,7 @@ def _check_uplimit_v4_from_tick(
                 continue
 
             # ── 2단계: 매수 트리거 (qualified 종목만) ──────────────────────
+            _v5_diag_counters["trigger_evaluated"] += 1
             qualified_ts = _uplimit_v5_qualified_ts[code]
             qualified_min = (now_dt - qualified_ts).total_seconds() / 60.0
 
@@ -9825,6 +9900,7 @@ def _check_uplimit_v4_from_tick(
                 continue
 
             # 매수 실행 (시장가)
+            _v5_diag_counters["trigger_buy_fired"] += 1
             _uplimit_v5_evaluated.add(code)
             try:
                 _try_v5_buy(code, prdy_ctrt, stck_prpr, now_dt, t_reason)

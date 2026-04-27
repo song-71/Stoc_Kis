@@ -2,6 +2,20 @@
 
 ---
 
+## [2026-04-26] eeeed9f
+- **Category**: feat
+- **Title**: 15:30~16:00 idle 구간 1분 주기 heartbeat 로그 추가
+- **Files**: `ws_realtime_trading.py` (run_ws_forever() wait loop, line ~11682)
+- **Changes**:
+  - wait loop 진입 전 `_last_hb = time.time()` 타이머 초기화
+  - 루프 내 `time.time() - _last_hb >= 60.0` 체크 → 매 1분마다 heartbeat 로그 출력
+  - 로그 형식: `[ws] idle 중 — 16:00 시간외까지 N분 남음`
+  - 기존 진입 로그(`종가 체결 수신 완료, 16:00 시간외까지 대기`) / 종료 로그(`16:00 도달 → 시간외 단일가 연결 시작`) 유지
+- **Impact**:
+  - 사용자 원칙 "모든 상황 변화는 반드시 로그로 남겨야 한다" 적용
+  - 기존 04-01 이후 동일 코드: 30분간 로그 없음 → 멎음/정상 idle 구분 불가 문제 해소
+  - 15:30~16:00 구간에 최대 30개 heartbeat 로그 생성 → idle 정상 작동 확인 가능
+
 ## [2026-04-26] 0299cfb
 - **Category**: refactor
 - **Title**: send_multiple 의 race code 제거 — multiprocessing 전환 후 dead code cleanup

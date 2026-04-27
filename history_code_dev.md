@@ -2,6 +2,46 @@
 
 ---
 
+## [2026-04-26] 1c91397
+- **Category**: feat
+- **Title**: v5 종목 선정/매수 트리거 분리 + 5필터 완화 + BB 반등 트리거
+- **Files**: `ws_realtime_tr_str1.py`, `ws_realtime_trading.py`
+- **Changes**:
+  **설계 변경 배경**: 기존 13필터 단일 판정 구조에서 "종목 선정(12필터) + 매수 트리거(ma10/BB)" 2단계로 분리.
+  종목 선정 후 일시 하락 구간에서 BB 하단 반등 시 저점 매수 가능하도록 설계.
+
+  **신규 함수**:
+  - `check_uplimit_v5_qualify(...)` — 12필터 AND (F1, F2, F4-F13). F3 제거. qualified 상태 반환
+  - `check_uplimit_v5_buy_trigger(...)` — ma10 상회 OR BB 하단 반등 트리거 판정
+  - `_get_bb_lower_v5(code)` — 현재 캐시(_bb_sum/_bb_sq_sum/_price_buf) 기준 bb_lower 계산
+
+  **5필터 완화** (일평균 5~10종목 통과 목표):
+  | 필터 | 이전 | 신규 |
+  |---|---|---|
+  | F6 시가갭 | ≥5% | ≥2% |
+  | F8 거래량서지 | ≥3배 | ≥2배 |
+  | F10 10일변동성 | ≤0.05 | ≤0.08 |
+  | F11 매도벽 | ask < bid×3 | ask < bid×5 |
+  | F12 체결강도 | ≥120 | ≥100 |
+
+  **매수 트리거 2종**:
+  - ma10 분기: tick_count≥10 + stck_prpr>ma10
+  - BB 반등 분기: breach_flag + prev_bidp1>bb_lower + bidp1>bb_lower + bidp1>prev_bidp1
+
+  **10분 만료**: UPLIMIT_V5_QUALIFY_EXPIRY_MIN=10, qualified 후 10분 초과 시 트리거 비활성 (1회 로그)
+
+  **신규 상태변수** (ws_realtime_trading.py):
+  - `_uplimit_v5_qualified_ts: dict[str, datetime]` — 12필터 통과 시각
+  - `_uplimit_v5_last_bidp1: dict[str, float]` — 직전 틱 bidp1 (BB 반등 prev 기준)
+  - `_uplimit_v5_lower_breached: set[str]` — qualified 이후 bb_lower 이탈 이력
+
+  **호환 처리**: `check_uplimit_v5_instant_buy` → qualify wrapper로 alias 유지
+
+- **Impact**:
+  - 종목 선정 후 매수 타이밍을 ma10 OR BB 저점 반등 중 빠른 것으로 포착 가능
+  - 5필터 완화로 일평균 통과 종목 수 증가 (1~2종목 → 5~10종목 기대)
+  - 10분 만료로 늦은 진입 차단 — 진입 품질/리스크 관리 균형
+
 ## [2026-04-26] 1e56bf3
 - **Category**: fix
 - **Title**: v5 F13 강화 — 외국인 수급 양수 종목만 매수 (None=차단)

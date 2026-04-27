@@ -781,9 +781,12 @@ def check_uplimit_v5_instant_buy(
     if volume_power < UPLIMIT_FILTER_VOLUME_POWER_MIN:
         return False, f"v5_F12_VP약({volume_power:.0f})"
 
-    # F13. 외국인 3일 순매도 차단 (None=데이터없음 통과)
-    if frgn_3d_net is not None and frgn_3d_net < 0:
-        return False, f"v5_F13_외인매도({int(frgn_3d_net):,})"
+    # F13. 외국인 3일 순매수 양수만 매수 (수급 들어오는 종목만)
+    #   - frgn_3d_net > 0 통과, ≤ 0 또는 데이터없음 차단
+    if frgn_3d_net is None:
+        return False, "v5_F13_외인데이터없음"
+    if frgn_3d_net <= 0:
+        return False, f"v5_F13_외인수급없음({int(frgn_3d_net):,})"
 
     # 일일 매수 한도
     if today_buy_count >= max_daily_buys:

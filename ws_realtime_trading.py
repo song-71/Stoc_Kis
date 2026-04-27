@@ -4026,17 +4026,24 @@ _ws_rebuild_event = threading.Event()
 _kws_lock = threading.RLock()
 _active_kws = None
 
-# ── a2 (syw_2) 전용 WSS 전역 변수 ──
+# ── a2 (syw_2) 전용 WSS 전역 변수 (legacy thread 패턴 — Phase 2 이후 미사용) ──
 _a2_kws_lock = threading.RLock()
 _a2_active_kws = None
 _a2_subscribed: dict[str, set[str]] = {}
 _a2_approval_key: str = ""
-# [260427] ALREADY IN USE 감지 시각 — 장기 backoff 트리거용
 _a2_last_already_in_use_ts: float = 0.0
-# [260427] a2-WSS 첫 connect 전 점유 정리 대기 (워밍업): 옛 프로세스 잔존 점유 timeout 확보
 A2_WSS_INITIAL_WARMUP_SEC: float = 30.0
-# [260427] ALREADY IN USE 감지 시 reconnect backoff (KIS 자연 timeout 활용)
 A2_WSS_BACKOFF_ALREADY_IN_USE_SEC: float = 90.0
+
+# [260427] a2 multiprocessing 패턴 (KIS 공식 multi_processing_sample_ws.py 패턴)
+_a2_proc = None                              # multiprocessing.Process
+_a2_data_queue = None                        # mp.Queue (a2 → main)
+_a2_cmd_queue = None                         # mp.Queue (main → a2)
+_a2_alive: bool = False                      # 자식 프로세스 살아있는지
+_a2_subscribed_local: dict[str, set[str]] = {  # main side mirror of subscribed
+    "market_status_krx": set(),
+    "exp_ccnl_krx": set(),
+}
 
 
 def _trigger_ws_rebuild():
@@ -5720,33 +5727,32 @@ def _vi_exp_sub_switch(code: str) -> None:
                 logger.info(f"{ts_prefix()} [VI전환] {name}({code}) a1 실시간 해제 완료")
             except Exception as e:
                 logger.warning(f"{ts_prefix()} [VI전환] {name}({code}) a1 실시간 해제 실패: {e}")
-    # a2: 예상체결가 구독
-    with _a2_kws_lock:
-        if _a2_active_kws is not None:
-            try:
-                _a2_active_kws.send_request(request=exp_ccnl_krx, tr_type="1", data=[code])  # noqa: F405
-                existing = _a2_subscribed.get("exp_ccnl_krx", set())
-                _a2_subscribed["exp_ccnl_krx"] = existing | {code}
-                logger.info(f"{ts_prefix()} [VI전환] {name}({code}) a2 예상체결 구독 완료")
-            except Exception as e:
-                logger.warning(f"{ts_prefix()} [VI전환] {name}({code}) a2 예상체결 구독 실패: {e}")
-                # fallback: a1에서 예상체결 구독
-                with _kws_lock:
-                    if _active_kws is not None:
-                        try:
-                            _send_subscribe(_active_kws, exp_ccnl_krx, [code], "1")  # noqa: F405
-                            logger.info(f"{ts_prefix()} [VI전환] {name}({code}) a1 fallback 예상체결 구독")
-                        except Exception:
-                            pass
-        else:
-            # a2 미연결 → a1에서 예상체결 구독 (기존 방식 fallback)
+    # [260427 multiprocessing] a2: 예상체결가 구독 → cmd_queue
+    if _a2_alive:
+        try:
+            _a2_cmd_send("sub", "H0STANC0", [code])
+            cur = _a2_subscribed_local.get("exp_ccnl_krx", set())
+            _a2_subscribed_local["exp_ccnl_krx"] = cur | {code}
+            logger.info(f"{ts_prefix()} [VI전환] {name}({code}) a2 예상체결 구독 명령 송신")
+        except Exception as e:
+            logger.warning(f"{ts_prefix()} [VI전환] {name}({code}) a2 cmd 실패: {e}")
+            # fallback: a1
             with _kws_lock:
                 if _active_kws is not None:
                     try:
                         _send_subscribe(_active_kws, exp_ccnl_krx, [code], "1")  # noqa: F405
-                        logger.info(f"{ts_prefix()} [VI전환] {name}({code}) a1 fallback 예상체결 구독 (a2 미연결)")
-                    except Exception as e:
-                        logger.warning(f"{ts_prefix()} [VI전환] {name}({code}) a1 fallback 실패: {e}")
+                        logger.info(f"{ts_prefix()} [VI전환] {name}({code}) a1 fallback")
+                    except Exception:
+                        pass
+    else:
+        # a2 미가동 → a1 fallback
+        with _kws_lock:
+            if _active_kws is not None:
+                try:
+                    _send_subscribe(_active_kws, exp_ccnl_krx, [code], "1")  # noqa: F405
+                    logger.info(f"{ts_prefix()} [VI전환] {name}({code}) a1 fallback (a2 미가동)")
+                except Exception as e:
+                    logger.warning(f"{ts_prefix()} [VI전환] {name}({code}) a1 fallback 실패: {e}")
     # H0STMKO0: a2에서 동적 추가 (이미 전 종목 구독 중이므로 대부분 불필요하나 안전장치)
     try:
         _a2_mkstatus_sub_add({code})
@@ -5760,16 +5766,15 @@ def _vi_exp_sub_restore(code: str) -> None:
     _vi_active_codes.discard(code)
     _vi_exp_last_notify.pop(code, None)
     name = code_name_map.get(code, code)
-    # a2: 예상체결가 해제
-    with _a2_kws_lock:
-        if _a2_active_kws is not None:
-            try:
-                _a2_active_kws.send_request(request=exp_ccnl_krx, tr_type="2", data=[code])  # noqa: F405
-                existing = _a2_subscribed.get("exp_ccnl_krx", set())
-                _a2_subscribed["exp_ccnl_krx"] = existing - {code}
-                logger.info(f"{ts_prefix()} [VI복구] {name}({code}) a2 예상체결 해제 완료")
-            except Exception as e:
-                logger.warning(f"{ts_prefix()} [VI복구] {name}({code}) a2 예상체결 해제 실패: {e}")
+    # [260427 multiprocessing] a2: 예상체결가 해제 → cmd_queue
+    if _a2_alive:
+        try:
+            _a2_cmd_send("unsub", "H0STANC0", [code])
+            cur = _a2_subscribed_local.get("exp_ccnl_krx", set())
+            _a2_subscribed_local["exp_ccnl_krx"] = cur - {code}
+            logger.info(f"{ts_prefix()} [VI복구] {name}({code}) a2 예상체결 해제 명령 송신")
+        except Exception as e:
+            logger.warning(f"{ts_prefix()} [VI복구] {name}({code}) a2 cmd 실패: {e}")
     # a1: 실시간체결가 복구 (+ a1 fallback 예상체결 해제도 시도)
     with _kws_lock:
         if _active_kws is not None:
@@ -10867,7 +10872,12 @@ def _shutdown(reason: str):
         if _active_kws is not None:
             _request_ws_close(_active_kws)
             _active_kws = None  # 다른 스레드의 추가 send 방지
-    # a2 WSS 종료
+    # [260427] a2 자식 프로세스 정리 (multiprocessing 패턴)
+    try:
+        _stop_a2_subprocess(timeout=3.0)
+    except Exception as _ae:
+        logger.warning(f"[shutdown] a2 subprocess 정리 실패: {_ae}")
+    # legacy a2 thread 모드 fallback (사용 안 함, 보존)
     with _a2_kws_lock:
         if _a2_active_kws is not None:
             try:
@@ -11089,8 +11099,135 @@ def _on_result_a2(ws, tr_id, result, data_info):
             logger.warning(f"{ts_prefix()} [a2-WSS] ingest 실패: {e}")
 
 
+# =============================================================================
+# [260427] a2 multiprocessing IPC — KIS 공식 패턴
+# =============================================================================
+def _a2_cmd_send(cmd: str, tr_id: str = "", codes=None) -> None:
+    """a2 자식 프로세스로 명령 송신 (sub/unsub/stop)."""
+    global _a2_cmd_queue
+    if _a2_cmd_queue is None:
+        return
+    try:
+        msg = {"cmd": cmd}
+        if tr_id:
+            msg["tr_id"] = tr_id
+        if codes is not None:
+            msg["codes"] = list(codes)
+        _a2_cmd_queue.put_nowait(msg)
+    except Exception as e:
+        logger.warning(f"{ts_prefix()} [a2-mp] cmd_queue.put 실패: {e}")
+
+
+def _a2_data_router_loop():
+    """a2 자식 프로세스 → main: data_queue 수신 → DataFrame 복원 → 기존 처리 라우팅."""
+    global _a2_data_queue
+    while not _stop_event.is_set():
+        if _a2_data_queue is None:
+            time.sleep(0.5)
+            continue
+        try:
+            msg = _a2_data_queue.get(timeout=1.0)
+        except Exception:
+            continue
+        try:
+            tr_id = str(msg.get("tr_id", ""))
+            rows = msg.get("rows") or []
+            recv_ts = msg.get("recv_ts") or datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S.%f")
+            if not rows:
+                continue
+            try:
+                df = pl.DataFrame(rows)
+            except Exception as _de:
+                logger.debug(f"[a2-mp] DataFrame 복원 실패: {_de}")
+                continue
+            if tr_id == "H0STMKO0":
+                try:
+                    _on_market_status_krx(df)
+                except Exception as e:
+                    logger.warning(f"{ts_prefix()} [a2-mp] _on_market_status_krx 실패: {e}")
+                continue
+            # H0STANC0 (예상체결가) → ingest_queue
+            if tr_id in KNOWN_TRID_MAP or tr_id in TRID_TO_KIND:
+                kind = TRID_TO_KIND.get(tr_id)
+                is_real = TRID_TO_IS_REAL.get(tr_id)
+                if kind is None and tr_id in KNOWN_TRID_MAP:
+                    kind, is_real = KNOWN_TRID_MAP[tr_id]
+                    TRID_TO_KIND[tr_id] = kind
+                    TRID_TO_IS_REAL[tr_id] = is_real
+                try:
+                    _ingest_queue.put((df, tr_id, kind, is_real, recv_ts))
+                except Exception as e:
+                    logger.warning(f"{ts_prefix()} [a2-mp] ingest_queue.put 실패: {e}")
+        except Exception as e:
+            logger.warning(f"{ts_prefix()} [a2-mp] router 예외: {e}")
+
+
+def _start_a2_subprocess():
+    """a2 자식 프로세스 spawn (KIS 공식 multiprocessing 패턴)."""
+    import multiprocessing as mp
+    global _a2_proc, _a2_data_queue, _a2_cmd_queue, _a2_alive
+    if _a2_proc is not None and _a2_proc.is_alive():
+        logger.info(f"{ts_prefix()} [a2-mp] 이미 실행 중 (pid={_a2_proc.pid})")
+        return
+    try:
+        from ws_a2_subprocess import run_a2_subprocess
+        _a2_data_queue = mp.Queue(maxsize=10000)
+        _a2_cmd_queue = mp.Queue(maxsize=1000)
+        cfg_path = str(SCRIPT_DIR / "config.json")
+        _a2_proc = mp.Process(
+            target=run_a2_subprocess,
+            args=(cfg_path, _a2_data_queue, _a2_cmd_queue),
+            name="a2-subprocess",
+            daemon=False,   # daemon=False → 메인 종료 시 명시 join 필요
+        )
+        _a2_proc.start()
+        _a2_alive = True
+        logger.info(f"{ts_prefix()} [a2-mp] 자식 프로세스 시작 pid={_a2_proc.pid}")
+        # data_queue 라우터 thread
+        threading.Thread(target=_a2_data_router_loop, daemon=True, name="a2-data-router").start()
+    except Exception as e:
+        logger.error(f"{ts_prefix()} [a2-mp] 시작 실패: {e}")
+        _a2_alive = False
+
+
+def _stop_a2_subprocess(timeout: float = 5.0):
+    """a2 자식 프로세스 graceful 종료."""
+    global _a2_proc, _a2_alive
+    if _a2_proc is None:
+        return
+    try:
+        _a2_alive = False
+        _a2_cmd_send("stop")
+        _a2_proc.join(timeout=timeout)
+        if _a2_proc.is_alive():
+            logger.warning(f"{ts_prefix()} [a2-mp] join timeout — terminate")
+            _a2_proc.terminate()
+            _a2_proc.join(timeout=2.0)
+        logger.info(f"{ts_prefix()} [a2-mp] 자식 프로세스 종료 완료")
+    except Exception as e:
+        logger.warning(f"{ts_prefix()} [a2-mp] 종료 실패: {e}")
+    finally:
+        _a2_proc = None
+
+
 def run_ws_a2_forever():
-    """a2 전용 WSS: H0STMKO0(전 종목) + VI 예상체결가 구독. 데몬 스레드로 실행."""
+    """[260427 multiprocessing 전환] thread 패턴 폐기 → 자식 프로세스 spawn.
+    호환을 위해 함수명 유지. 메인의 t_a2_wss thread 가 이 함수를 호출하면
+    여기서 자식 프로세스 띄우고 자체는 router 가 끝까지 살아있도록 sleep loop.
+    """
+    _start_a2_subprocess()
+    # 자식 프로세스가 살아있는 한 이 thread 도 alive (호환용 sleep loop)
+    while not _stop_event.is_set():
+        time.sleep(5.0)
+        if _a2_proc is not None and not _a2_proc.is_alive():
+            logger.warning(f"{ts_prefix()} [a2-mp] 자식 프로세스 종료 감지 — 재시작 시도")
+            _start_a2_subprocess()
+    logger.info(f"{ts_prefix()} [a2-mp] 부모 monitor thread 종료")
+
+
+# 아래는 legacy thread 패턴 코드 (미사용, 보존만) ────────────────────────────────
+def run_ws_a2_forever_LEGACY():
+    """[deprecated] 옛 thread 패턴. _base_headers_ws swap race 로 인해 폐기됨."""
     global _a2_active_kws, _a2_approval_key
     backoff = 2
     attempt = 0
@@ -11245,43 +11382,37 @@ def run_ws_a2_forever():
 
 
 def _a2_mkstatus_sub_add(codes_to_add: set[str]) -> None:
-    """a2 WSS에서 H0STMKO0 구독 추가."""
-    new_codes = codes_to_add - _a2_subscribed.get("market_status_krx", set())
+    """[260427 multiprocessing] H0STMKO0 구독 추가 → cmd_queue 로 자식 프로세스에 명령."""
+    cur = _a2_subscribed_local.get("market_status_krx", set())
+    new_codes = set(codes_to_add) - cur
     if not new_codes:
         return
-    with _a2_kws_lock:
-        if _a2_active_kws is not None:
-            try:
-                for i in range(0, len(list(new_codes)), MAX_CODES_PER_SESSION):
-                    batch = list(new_codes)[i:i + MAX_CODES_PER_SESSION]
-                    _a2_active_kws.send_request(request=market_status_krx, tr_type="1", data=batch)  # noqa: F405
-                existing = _a2_subscribed.get("market_status_krx", set())
-                _a2_subscribed["market_status_krx"] = existing | new_codes
-                _mkstatus_sub_codes.update(new_codes)
-                names = [f"{code_name_map.get(c, c)}({c})" for c in new_codes]
-                logger.info(f"{ts_prefix()} [a2-WSS][H0STMKO0] 구독 추가: {', '.join(names)}")
-            except Exception as e:
-                logger.warning(f"{ts_prefix()} [a2-WSS][H0STMKO0] 구독 실패: {e}")
+    if not _a2_alive:
+        return
+    for i in range(0, len(list(new_codes)), MAX_CODES_PER_SESSION):
+        batch = list(new_codes)[i:i + MAX_CODES_PER_SESSION]
+        _a2_cmd_send("sub", "H0STMKO0", batch)
+    _a2_subscribed_local["market_status_krx"] = cur | new_codes
+    _mkstatus_sub_codes.update(new_codes)
+    names = [f"{code_name_map.get(c, c)}({c})" for c in new_codes]
+    logger.info(f"{ts_prefix()} [a2-mp][H0STMKO0] 구독 추가: {', '.join(names)}")
 
 
 def _a2_mkstatus_sub_remove(codes_to_remove: set[str]) -> None:
-    """a2 WSS에서 H0STMKO0 구독 해제."""
-    existing = _a2_subscribed.get("market_status_krx", set())
-    active = codes_to_remove & existing
+    """[260427 multiprocessing] H0STMKO0 구독 해제 → cmd_queue."""
+    cur = _a2_subscribed_local.get("market_status_krx", set())
+    active = set(codes_to_remove) & cur
     if not active:
         return
-    with _a2_kws_lock:
-        if _a2_active_kws is not None:
-            try:
-                for i in range(0, len(list(active)), MAX_CODES_PER_SESSION):
-                    batch = list(active)[i:i + MAX_CODES_PER_SESSION]
-                    _a2_active_kws.send_request(request=market_status_krx, tr_type="2", data=batch)  # noqa: F405
-                _a2_subscribed["market_status_krx"] = existing - active
-                _mkstatus_sub_codes -= active
-                names = [f"{code_name_map.get(c, c)}({c})" for c in active]
-                logger.info(f"{ts_prefix()} [a2-WSS][H0STMKO0] 구독 해제: {', '.join(names)}")
-            except Exception as e:
-                logger.warning(f"{ts_prefix()} [a2-WSS][H0STMKO0] 해제 실패: {e}")
+    if not _a2_alive:
+        return
+    for i in range(0, len(list(active)), MAX_CODES_PER_SESSION):
+        batch = list(active)[i:i + MAX_CODES_PER_SESSION]
+        _a2_cmd_send("unsub", "H0STMKO0", batch)
+    _a2_subscribed_local["market_status_krx"] = cur - active
+    _mkstatus_sub_codes -= active
+    names = [f"{code_name_map.get(c, c)}({c})" for c in active]
+    logger.info(f"{ts_prefix()} [a2-mp][H0STMKO0] 구독 해제: {', '.join(names)}")
 
 
 def _desired_subscription_map(now: datetime) -> dict:

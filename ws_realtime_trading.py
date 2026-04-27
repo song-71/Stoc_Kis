@@ -11036,14 +11036,17 @@ def _apply_subscriptions(kws, desired: dict, force: bool = False) -> None:
 # a2 (syw_2) 듀얼 WSS — H0STMKO0 장운영정보 + VI 예상체결가 전담
 # =============================================================================
 def _get_a2_approval_key() -> str:
-    """syw_2 계정의 approval_key를 직접 발급받아 반환."""
+    """[260427] a2-WSS 도 main 계정 appkey 사용으로 전환.
+    이전: syw_2 계정 → KIS 서버에서 ALREADY IN USE 영영 풀리지 않는 문제 (110건+).
+    변경: main 계정 → KIS 가 1 appkey=1 세션 정책이지만 시도. 거부되면 H0STMKO0 자체 비활성 검토.
+    """
     cfg = load_config(str(SCRIPT_DIR / "config.json"))
-    acct = cfg.get("accounts", {}).get("syw_2", {})
+    acct = cfg.get("accounts", {}).get("main", {})
     appkey = acct.get("appkey", "")
     appsecret = acct.get("appsecret", "")
     base_url = cfg.get("base_url", "")
     if not appkey or not appsecret or not base_url:
-        raise ValueError("[a2-WSS] syw_2 appkey/appsecret/base_url 누락")
+        raise ValueError("[a2-WSS] main appkey/appsecret/base_url 누락")
     p = {
         "grant_type": "client_credentials",
         "appkey": appkey,

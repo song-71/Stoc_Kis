@@ -2,6 +2,24 @@
 
 ---
 
+## [2026-04-26] c985f0e
+- **Category**: fix
+- **Title**: send_multiple race condition 수정 — main 으로 syw_2 key 누출 방지 (a2-WSS ALREADY IN USE 근본 원인)
+- **Files**: `kis_auth_llm.py` (line 868~897 → 868~911)
+- **Changes**:
+  - 기존 버그: a2 path 만 `_approval_key_lock` 획득, main path 는 lock 미획득 상태로 `_base_headers_ws` 직접 read.
+    a2 가 `_base_headers_ws["approval_key"] = syw_2_key` swap 후 `await` 시 yield 하면, main 이 동시에
+    `syw_2_key` 를 읽어 main connection 으로 KIS 에 전송 → KIS 가 syw_2 appkey 를 main 세션이 점유한 것으로 인식.
+    이후 a2 가 자기 connection 에서 syw_2 등록 시도 시 ALREADY IN USE 반환 (04-23~04-27 110건).
+  - 수정: 모든 path (a2 + main) 가 `_approval_key_lock` 안에서 `request()` 호출 (메시지 build).
+    `await ws.send()` 는 lock 외부에서 실행 → asyncio yield 시 lock 미보유로 deadlock 방지.
+  - `add_data_map` 도 lock 블록 안으로 이동 (글로벌 dict 일관성 보호).
+  - 시그니처/반환값 변경 없음 → 모든 호출자 영향 없음.
+- **Impact**:
+  - main 이 자기 main_appkey 로만 subscribe (syw_2 key 누출 경로 완전 차단).
+  - a2 가 syw_2_appkey 로 정상 subscribe → ALREADY IN USE 110건 → 0건 예상 (재시작 후 검증 필요).
+  - Phase 6 워밍업 sleep + Phase 6-B long backoff 는 옛 KIS 점유 자연 timeout 까지 보조.
+
 ## [2026-04-26] 5647452
 - **Category**: feat
 - **Title**: a2-WSS 워밍업 sleep + ALREADY IN USE long backoff (점유 자연 회복 강화)

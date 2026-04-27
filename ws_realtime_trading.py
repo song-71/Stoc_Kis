@@ -425,6 +425,10 @@ from ws_realtime_tr_str1 import (  # noqa: E402  (상한가 근접 매수 + 종�
     # [260427] Strategy A-v5 (구독 즉시 ma10 상회 시 시장가 매수)
     check_uplimit_v5_instant_buy,
     check_uplimit_v5_trail_exit,
+    # [260427] v5 분리: 12필터 qualify + 트리거 (ma10 OR BB 반등)
+    check_uplimit_v5_qualify,
+    check_uplimit_v5_buy_trigger,
+    UPLIMIT_V5_QUALIFY_EXPIRY_MIN,
 )
 from kis_signal_apis import (  # noqa: E402
     fetch_volume_power, fetch_frgn_3day_net,
@@ -2323,6 +2327,10 @@ _uplimit_v5_limitup_reached: set[str] = set()       # 30% 도달 이력 — 매�
 _uplimit_v5_observe_log: set[str] = set()           # 20~25% 관찰 로그 1회 기록 종목
 _uplimit_prev_day_amount: dict[str, float] = {}     # code → 전일 거래대금 (저거래 판별)
 _uplimit_v5_last_acml: dict[str, float] = {}        # code → 직전 수신 acml_tr_pbmn (저거래 fallback)
+# [260427] v5 종목 선정/트리거 분리 (12필터 통과 후 ma10/BB 반등 트리거 대기)
+_uplimit_v5_qualified_ts: dict[str, datetime] = {}  # code → 12필터 통과 시각 (10분 만료)
+_uplimit_v5_last_bidp1: dict[str, float] = {}       # code → 직전 틱 bidp1 (BB 반등 판정)
+_uplimit_v5_lower_breached: set[str] = set()        # qualified 이후 bb_lower 이탈 이력
 
 # [260423] Strategy B (MA trend) 신호 관찰 상태
 _ma_trend_prev_ma50: dict[str, float] = {}    # code → 직전 틱 ma50 (골든크로스 edge 판정)
@@ -6236,6 +6244,26 @@ def _populate_prev_day_amount(codes: list[str]) -> None:
         logger.warning(f"{ts_prefix()} [v5_저거래캐시] 실패: {e}")
 
 
+def _get_bb_lower_v5(code: str) -> float | None:
+    """v5 BB 반등 트리거용 — 현재 캐시 기준 bb_lower 반환.
+    BB 미형성 (price_buf 길이 < 200) 또는 캐시 미초기화 시 None.
+    _calc_indicators 가 매 틱 _bb_sum/_bb_sq_sum 갱신하므로 직전 틱 기준값.
+    """
+    import math as _math
+    buf = _price_buf.get(code)
+    if buf is None or len(buf) < INDICATOR_BB_PERIOD:
+        return None
+    s = _bb_sum.get(code)
+    sq = _bb_sq_sum.get(code)
+    if s is None or sq is None:
+        return None
+    n = INDICATOR_BB_PERIOD
+    mean = s / n
+    var = max(0.0, sq / n - mean * mean)
+    std = _math.sqrt(var)
+    return mean - INDICATOR_BB_K * std
+
+
 def _is_low_liquidity_v5(code: str, cur_acml_tr_pbmn: float = 0.0) -> tuple[bool, str]:
     """v5 저거래 판별.
     - 전일 거래대금(`_uplimit_prev_day_amount[code]`) 이 있으면 그것 기준
@@ -9571,58 +9599,100 @@ def _check_uplimit_v4_from_tick(
             if active_n >= UPLIMIT_DIVERSIFY_N:
                 continue
 
-            # ma10 상회 첫 시점 — _ema_state 에서 ma10 가져오기, 누적 틱은 _total_counts
+            # ── 1단계: 12필터 qualify (아직 통과 안 한 종목만) ──────────────
+            if code not in _uplimit_v5_qualified_ts:
+                # 12필터 데이터 수집
+                prev_close = stck_prpr / (1 + prdy_ctrt / 100.0) if prdy_ctrt > -100 and stck_prpr > 0 else 0
+                client = _top_client or _init_top_client()
+                try:
+                    volume_power = _get_uplimit_volume_power(client, code)
+                except Exception:
+                    volume_power = None
+                frgn_3d = _uplimit_frgn_3d.get(code)
+                day_avg = _calc_uplimit_day_avg_vol_per_min(code, acml_vol, now_dt)
+                last5m_avg = _calc_uplimit_last5m_avg_vol_per_min(code)
+                cross_ts = _uplimit_25pct_cross_ts.get(code)
+                min_since_cross = (now_dt - cross_ts).total_seconds() / 60.0 if cross_ts else None
+
+                qualified, q_reason = check_uplimit_v5_qualify(
+                    prdy_ctrt=prdy_ctrt,
+                    prev_close=prev_close,
+                    stck_oprc=stck_oprc,
+                    acml_vol=acml_vol,
+                    day_avg_vol_per_min=day_avg,
+                    last_5m_avg_vol_per_min=last5m_avg,
+                    min_since_25pct_cross=min_since_cross,
+                    vola_10d=_uplimit_vola_10d.get(code),
+                    bid_sum_top5=bid_sum,
+                    ask_sum_top5=ask_sum,
+                    volume_power=volume_power,
+                    frgn_3d_net=frgn_3d,
+                    prev_day_prdy_ctrt=_uplimit_prev_day_ctrt.get(code, 0.0),
+                    already_holding=False,
+                    now_hm=(h, m),
+                    today_buy_count=_uplimit_today_buy_count,
+                    max_daily_buys=UPLIMIT_MAX_DAILY_BUYS,
+                )
+                if not qualified:
+                    # skip 로그 종목당 10초 쿨다운
+                    _last_log = _uplimit_v4_last_sustain_log.get(code, 0.0)
+                    if time.time() - _last_log > 10:
+                        _uplimit_v4_last_sustain_log[code] = time.time()
+                        logger.info(f"{ts_prefix()} [v5_skip] {code_name_map.get(code, code)}({code}) {q_reason}")
+                    continue
+                # 12필터 통과 → qualified 등록
+                _uplimit_v5_qualified_ts[code] = now_dt
+                logger.info(
+                    f"{ts_prefix()} [v5_qualify] {code_name_map.get(code, code)}({code}) "
+                    f"{q_reason} → 10분 내 매수 트리거 대기"
+                )
+                # 첫 qualify 직후엔 트리거 평가는 다음 틱부터 (last_bidp1 누적 후)
+                _uplimit_v5_last_bidp1[code] = bidp1
+                continue
+
+            # ── 2단계: 매수 트리거 (qualified 종목만) ──────────────────────
+            qualified_ts = _uplimit_v5_qualified_ts[code]
+            qualified_min = (now_dt - qualified_ts).total_seconds() / 60.0
+
             ema = _ema_state.get(code) or {}
             ma10 = float(ema.get(10) or 0)
             tick_count = int(_total_counts.get(code, 0))
+            bb_lower = _get_bb_lower_v5(code)
+            prev_bidp1 = _uplimit_v5_last_bidp1.get(code, bidp1)
 
-            # 13필터 데이터 수집 (기존 _try_uplimit_buy 패턴 재사용)
-            prev_close = stck_prpr / (1 + prdy_ctrt / 100.0) if prdy_ctrt > -100 and stck_prpr > 0 else 0
-            client = _top_client or _init_top_client()
-            try:
-                volume_power = _get_uplimit_volume_power(client, code)
-            except Exception:
-                volume_power = None
-            frgn_3d = _uplimit_frgn_3d.get(code)
-            day_avg = _calc_uplimit_day_avg_vol_per_min(code, acml_vol, now_dt)
-            last5m_avg = _calc_uplimit_last5m_avg_vol_per_min(code)
-            cross_ts = _uplimit_25pct_cross_ts.get(code)
-            min_since_cross = (now_dt - cross_ts).total_seconds() / 60.0 if cross_ts else None
+            # bb_lower 이탈 이력 추적 (qualified 이후 어느 시점이라도 발생하면 set 추가)
+            if bb_lower is not None and bidp1 > 0 and bidp1 < bb_lower:
+                _uplimit_v5_lower_breached.add(code)
+            breach_flag = code in _uplimit_v5_lower_breached
 
-            should_buy, reason = check_uplimit_v5_instant_buy(
-                prdy_ctrt=prdy_ctrt,
-                prev_close=prev_close,
-                stck_oprc=stck_oprc,
+            should_buy, t_reason = check_uplimit_v5_buy_trigger(
                 stck_prpr=stck_prpr,
+                bidp1=bidp1,
+                prev_bidp1=prev_bidp1,
                 ma10=ma10,
+                bb_lower=bb_lower,
+                breach_flag=breach_flag,
                 tick_count=tick_count,
-                acml_vol=acml_vol,
-                day_avg_vol_per_min=day_avg,
-                last_5m_avg_vol_per_min=last5m_avg,
-                min_since_25pct_cross=min_since_cross,
-                vola_10d=_uplimit_vola_10d.get(code),
-                bid_sum_top5=bid_sum,
-                ask_sum_top5=ask_sum,
-                volume_power=volume_power,
-                frgn_3d_net=frgn_3d,
-                prev_day_prdy_ctrt=_uplimit_prev_day_ctrt.get(code, 0.0),
-                already_holding=False,
-                now_hm=(h, m),
-                today_buy_count=_uplimit_today_buy_count,
-                max_daily_buys=UPLIMIT_MAX_DAILY_BUYS,
+                qualified_min_ago=qualified_min,
             )
+
+            # bidp1 history 업데이트 (다음 틱 prev 로 사용)
+            _uplimit_v5_last_bidp1[code] = bidp1
+
             if not should_buy:
-                # 매수 시도 종목당 10초 쿨다운 skip 로그 (가시성)
-                _last_log = _uplimit_v4_last_sustain_log.get(code, 0.0)
-                if time.time() - _last_log > 10:
-                    _uplimit_v4_last_sustain_log[code] = time.time()
-                    logger.info(f"{ts_prefix()} [v5_skip] {code_name_map.get(code, code)}({code}) {reason}")
+                if t_reason:
+                    # 만료 등 명시 사유만 1회 로그
+                    if not hasattr(_check_uplimit_v4_from_tick, "_v5_expire_log"):
+                        _check_uplimit_v4_from_tick._v5_expire_log = set()
+                    if code not in _check_uplimit_v4_from_tick._v5_expire_log:
+                        _check_uplimit_v4_from_tick._v5_expire_log.add(code)
+                        logger.info(f"{ts_prefix()} [v5_skip] {code_name_map.get(code, code)}({code}) {t_reason}")
                 continue
 
             # 매수 실행 (시장가)
             _uplimit_v5_evaluated.add(code)
             try:
-                _try_v5_buy(code, prdy_ctrt, stck_prpr, now_dt, reason)
+                _try_v5_buy(code, prdy_ctrt, stck_prpr, now_dt, t_reason)
             except Exception as _eb:
                 logger.warning(f"{ts_prefix()} [v5_buy] {code} 실패: {_eb}")
         except Exception as _e:

@@ -2,6 +2,23 @@
 
 ---
 
+## [2026-04-26] 5647452
+- **Category**: feat
+- **Title**: a2-WSS 워밍업 sleep + ALREADY IN USE long backoff (점유 자연 회복 강화)
+- **Files**: `ws_realtime_trading.py`
+- **Changes**:
+  - 모듈 전역 `_a2_last_already_in_use_ts: float = 0.0` 추가 — ALREADY IN USE 감지 시각 기록용.
+  - 상수 `A2_WSS_INITIAL_WARMUP_SEC = 30.0`, `A2_WSS_BACKOFF_ALREADY_IN_USE_SEC = 90.0` 추가.
+  - (A) `run_ws_a2_forever` 메인 루프 진입 전 30초 워밍업 sleep: 옛 프로세스 잔존 점유 KIS timeout 확보. `_stop_event` 0.1초 단위 분할 대기로 즉시 종료 응답 보장. main WSS(체결가) 는 별도 스레드라 영향 없음.
+  - (B) `_on_system_a2` 콜백에서 "ALREADY IN USE" 메시지 감지 시 `_a2_last_already_in_use_ts = time.time()` 기록. reconnect 직전 30초 이내 감지 여부로 분기: 발생이면 90초 long backoff, 미발생이면 기존 지수 backoff(2~60초). 두 경우 모두 `_stop_event` 0.1초 단위 분할 sleep.
+  - 모니터링 키워드: `[a2-WSS] 워밍업 sleep 30s`, `[a2-WSS] ALREADY IN USE 감지 → long backoff 90s`, 정상 회복 시 `[a2-WSS] H0STMKO0 구독 완료: N종목`.
+- **Impact**:
+  - 배경: Phase 6 (close frame 동기 전송) 는 미래 재시작을 보호하지만, 옛 코드(04-27 pid 677384) 가 close frame 없이 죽으면서 KIS 서버에 syw_2 appkey 점유 잔존 → KIS 자연 timeout 까지 ALREADY IN USE 반복.
+  - 시작 시 30초 워밍업으로 잔존 점유 자동 정리 시간 확보.
+  - ALREADY IN USE 감지 시 짧은 backoff 폭주/로그 스팸 방지 + 90초 한 번 대기 후 KIS 자연 회복. v5 매수/매도 및 main WSS 체결가 흐름 영향 없음.
+
+---
+
 ## [2026-04-27] 24f747b
 - **Category**: feat
 - **Title**: 기동 시 git commit 버전 표시 — 옛 코드 운영 사고 방지

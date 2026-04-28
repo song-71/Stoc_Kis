@@ -2,6 +2,17 @@
 
 ---
 
+## [2026-04-27] a578ba0
+- **Category**: fix
+- **Title**: stale 프로세스 누적 방지를 위한 cron wrapper 스크립트 2종 추가
+- **Files**: `scripts/cron_start_log_monitor.sh`, `scripts/cron_start_vi_status.sh`
+- **Changes**:
+  1. `cron_start_log_monitor.sh`: ws_log_monitor.py 기동 전 기존 인스턴스 SIGTERM → 5초 대기 → SIGKILL fallback 후 nohup 새 인스턴스 시작
+  2. `cron_start_vi_status.sh`: Daily_inquire_vi_status.py 동일 패턴 적용
+  3. 인라인 cron에서 pkill 사용 시 cron sh 자체가 TARGET 패턴에 매칭되어 SIGKILL 위험 → wrapper 스크립트 분리로 자기참조 문제 해결
+  4. crontab 변경(git 외부, 백업: `out/crontab_backup_260428.txt`): 23:20/23:58 두 줄을 각 wrapper 스크립트 경로로 교체
+- **Impact**: ws_log_monitor.py의 tail -F 블로킹 버그(440-450라인)로 11일치 14개 stale 프로세스 누적된 문제 재발 방지. 매일 cron 기동 시 이전 인스턴스를 안전하게 정리 후 새 인스턴스 시작
+
 ## [2026-04-27] 8808542
 - **Category**: fix
 - **Title**: 부모 WSS reconnect storm 진단·방지 패치 (260428)

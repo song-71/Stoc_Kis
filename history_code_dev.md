@@ -2,6 +2,15 @@
 
 ---
 
+## [2026-04-27] f6a9a2d
+- **Category**: fix
+- **Title**: WSS 재시작 시 ALREADY IN USE storm 본질 원인 제거
+- **Files**: `kis_auth_llm.py`, `ws_realtime_trading.py`
+- **Changes**:
+  1. **Fix 1 — `KISWebSocket.close` timeout 2s → 10s** (`kis_auth_llm.py`): shutdown 시 `[shutdown] (1/4) WSS 종료 완료 (+2.00s)` 로그가 정확히 2초임을 포착 → `fut.result(timeout=2.0)` timeout exception 강제종료 확인. `except Exception: pass` 로 silent 처리되어 close frame 미완료 → KIS 가 abnormal close 인식 → appkey 해제 지연(정상=즉시, abnormal=30초~수분) → 재시작 시 ALREADY IN USE storm. timeout 10s 로 상향하고 성공/실패 시 `logging.info` / `logging.warning` 으로 가시화.
+  2. **Fix 2 — `_request_ws_close` 에 명시적 UNSUBSCRIBE 선행** (`ws_realtime_trading.py`): close frame 만으로는 KIS 측 구독 정리가 늦을 수 있음. `_subscribed` 의 모든 active 구독에 `tr_type="2"` UNSUBSCRIBE 송신 후 0.5s dwell 후 close. 부모 main(`_active_kws`) 만 대상, a2 자식은 자체 cmd_queue stop 으로 처리.
+- **Impact**: 직전 commit 들(max_retries=10, long backoff, dwell 안전망)은 storm 발생 후 차단 보험. 이 commit 은 storm 자체를 발생시키지 않는 본질 fix. 검증: 다음 재시작 시 `[ws] close frame 송신 완료 (XXms)` 로그 출력, ALREADY IN USE 미발생이면 정상.
+
 ## [2026-04-27] 44a5525
 - **Category**: fix
 - **Title**: 8808542 storm 패치 follow-up — UnboundLocalError 및 dwell 임계 보정

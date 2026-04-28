@@ -26,6 +26,19 @@
     15:20~15:30: ccnl_krx + exp_ccnl_krx
     15:59~18:00: overtime_exp_ccnl_krx + overtime_ccnl_krx
 
+     KIS API 검토                                                                                                                                                                         
+                                                         
+  ┌───────────────┬──────────────────────────────┬────────────────────────────────────────────────┬─────────┐                                                                    
+  │     TR_ID     │           endpoint           │                        데이터                   │ 적합도   │
+  ├───────────────┼──────────────────────────────┼────────────────────────────────────────────────┼─────────┤                                                                    
+  │ FHKST01010900 │ inquire-investor             │ 종목별 일별 외인/기관 매매 추이 (수량+금액, 약 30일) │ ⭐ 최적  │
+  ├───────────────┼──────────────────────────────┼────────────────────────────────────────────────┼─────────┤
+  │ FHPST01710000 │ 외인 순매수 상위 종목 (랭킹) │ 일자별 상위 N개만                                    │ 부분     │                                                                    
+  ├───────────────┼──────────────────────────────┼────────────────────────────────────────────────┼─────────┤                                                                    
+  │ FHKST03010100 │ 외인기간별 매매 추이         │ 종목별 분기별/장기                                   │ 보조    │                                                                    
+  └───────────────┴──────────────────────────────┴────────────────────────────────────────────────┴─────────┘ 
+
+
 => 현재 지정된 목록과 초기 및 30분 간격 top30리스트로 5개씩 추가한 목록에 대해 최대 41개 범위내에서 구독 지속
 => 이 부분까지 잘 작동됨(지정된 목록 + 30분 단위 top30의 5개 종목 추가, 매일 자동화 잘 됨.)
   * 다만 매일 기본 종목 목록은 수기로 수정해야 함.
@@ -75,6 +88,12 @@ STR1_SELL_ENABLED = True
 VI_TRADE_MODE = "off"
 # 상한가 스톱 연속 이탈 확인 틱 수 (서버 스톱지정가 대신 클라이언트에서 N틱 연속 확인 후 매도)
 STOP_LIMIT_CONFIRM_TICKS = 30
+# 매수가 손절 N틱 연속 이탈 확인 (단일 틱 fake 가격 차단). 임계 회복 시 카운터 리셋.
+LOSS_CONFIRM_TICKS = 30
+# 09:00:00 ~ 09:00:00+OPENING_GRACE_SEC 사이는 손절 임계를 OPENING_GRACE_LOSS_PCT 로 강화
+# (우선주 등 thin liquidity 첫 틱 1주 체결로 인한 fake 손절 방지).
+OPENING_GRACE_SEC = 30
+OPENING_GRACE_LOSS_PCT = 0.07
 
 # ─────────────────────────────────────────────────────────────────────────────
 # [v_1 신규] 상한가 근접 매수 전략 (문서: docs/01. up_limit_buy_str_260420.md)
@@ -1471,6 +1490,7 @@ def _load_str1_sell_state_on_startup(balance_map: dict[str, dict] | None = None)
                     "buy_price": buy_price, "highest": 0.0,
                     "name": name, "opening_call_auction_ordered": False,
                     "balance_qty": qty,
+                    "loss_below_count": 0,
                 }
                 added_for_sell.append(code)
         if added_for_sell:
@@ -1548,6 +1568,7 @@ def _load_str1_sell_state_on_startup(balance_map: dict[str, dict] | None = None)
                 "name":               name,
                 "opening_call_auction_ordered":  False,
                 "balance_qty":        actual_qty,   # 잔고조회 원본 수량 (기록용)
+                "loss_below_count":   0,             # 매수가 손절 N틱 연속 이탈 카운터
             }
             added_for_sell.append(code)
 
@@ -1573,6 +1594,7 @@ def _load_str1_sell_state_on_startup(balance_map: dict[str, dict] | None = None)
                     "buy_price": buy_price, "highest": 0.0,
                     "name": name, "opening_call_auction_ordered": False,
                     "balance_qty": qty,
+                    "loss_below_count": 0,
                 }
                 added_for_sell.append(code)
                 logger.info(f"[str1_sell] 잔고 보충 등록: {name}({code}) qty={qty} buy_price={buy_price}")
@@ -2481,6 +2503,7 @@ def _on_ccnl_notice_filled(df, recv_ts: str) -> None:
                             "buy_price": fill_pr, "name": name_fill,
                             "opening_call_auction_ordered": False, "balance_qty": qty,
                             "source": _buy_fill_reason,
+                            "loss_below_count": 0,
                         }
                         _need_sub = True
                         logger.info(f"{ts_prefix()} [체결통보] _str1_sell_state 자동등록: {name_fill}({code}) buy={fill_pr:,.0f} qty={qty}")
@@ -5987,6 +6010,7 @@ def _try_vi_buy(code: str, name: str, antc_prce: float, stck_prpr: float) -> Non
                 "buy_price": buy_price, "name": name,
                 "opening_call_auction_ordered": False, "balance_qty": qty,
                 "source": "vi",
+                "loss_below_count": 0,
             }
         _ensure_code_structs([code])
         with _lock:
@@ -9465,11 +9489,53 @@ def _check_str1_sell_conditions(
                         if "데드크로스" in reason:
                             _ema_sell_cond[code] = True     # 매도 성공까지 유지용
                         _enqueue_str1_sell(code, reason, bidp1)
-                    elif _buy_p > 0 and bidp1 > 0 and bidp1 < _buy_p * 0.97:
-                        loss_pct = (bidp1 / _buy_p - 1) * 100
-                        _enqueue_str1_sell(code, f"매수가손절({loss_pct:.2f}%,매수={int(_buy_p):,})", bidp1)
+                    elif _buy_p > 0 and bidp1 > 0:
+                        # ── 매수가 손절 가드 (단일 틱 fake 차단) ──
+                        # 09:00:00 ~ 09:00:00+OPENING_GRACE_SEC: 임계 강화 (-7%, 우선주 첫 틱 1주 보호)
+                        # 그 외: 기존 -3% 임계
+                        # 두 경우 모두 LOSS_CONFIRM_TICKS 연속 이탈 시에만 매도 발동.
+                        # 임계 위로 회복하면 카운터 리셋.
+                        _now_kst_t = datetime.now(KST).time()
+                        in_opening_grace = (
+                            dtime(9, 0, 0) <= _now_kst_t < dtime(9, 0, OPENING_GRACE_SEC)
+                        )
+                        loss_threshold_pct = OPENING_GRACE_LOSS_PCT if in_opening_grace else 0.03
+                        loss_threshold_price = _buy_p * (1 - loss_threshold_pct)
+                        if bidp1 < loss_threshold_price:
+                            with _str1_sell_state_lock:
+                                _prev_cnt = _str1_sell_state.get(code, {}).get("loss_below_count", 0)
+                                _new_cnt = _prev_cnt + 1
+                                if code in _str1_sell_state:
+                                    _str1_sell_state[code]["loss_below_count"] = _new_cnt
+                            if _new_cnt >= LOSS_CONFIRM_TICKS:
+                                loss_pct = (bidp1 / _buy_p - 1) * 100
+                                _grace_tag = ",grace" if in_opening_grace else ""
+                                _enqueue_str1_sell(
+                                    code,
+                                    f"매수가손절({loss_pct:.2f}%,매수={int(_buy_p):,},{_new_cnt}틱{_grace_tag})",
+                                    bidp1,
+                                )
+                            else:
+                                logger.debug(
+                                    f"{ts_prefix()} [매수가손절_보류] {code} bidp1={bidp1:,} "
+                                    f"< 임계{loss_threshold_pct*100:.0f}%={int(loss_threshold_price):,} "
+                                    f"({_new_cnt}/{LOSS_CONFIRM_TICKS}틱"
+                                    f"{',grace' if in_opening_grace else ''})"
+                                )
+                            # loss-pending 중에는 ema 데드크로스 재시도도 보류 (원본 elif 체인의 'loss 우선' 의미 유지)
+                        else:
+                            # 임계 위로 회복 → 카운터 리셋 후, ema 데드크로스 재시도 평가
+                            with _str1_sell_state_lock:
+                                if (
+                                    code in _str1_sell_state
+                                    and _str1_sell_state[code].get("loss_below_count", 0) > 0
+                                ):
+                                    _str1_sell_state[code]["loss_below_count"] = 0
+                            if _ema_sell_cond.get(code, False):
+                                # 데드크로스 재시도는 전일종가 위일 때만
+                                _enqueue_str1_sell(code, "str1_Up_trend_ma500_ma2000_데드크로스", bidp1)
                     elif _ema_sell_cond.get(code, False):
-                        # 데드크로스 재시도는 전일종가 위일 때만
+                        # 데드크로스 재시도는 전일종가 위일 때만 (buy_price/bidp1 미확보 fallback)
                         _enqueue_str1_sell(code, "str1_Up_trend_ma500_ma2000_데드크로스", bidp1)
 
             # ── 정규장 실시간 체결 시 모니터링 캐시 갱신 (stale 방지) ──

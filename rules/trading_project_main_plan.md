@@ -73,6 +73,10 @@ _Source: `ws_realtime_trading.py` 운영 흐름 + 사용자 의도_
 - **VI 감지**: `FHPST01390000` REST 폴링 기반 전체 시장 VI 감지 (`_vi_poll_check`)
 - **매수 조건**: `ws_realtime_tr_str1.vi_buy_strategy` (VI 해제 직후 실시간체결가 기준)
 - **매도 조건**: `check_vi_sell` — TP/SL/VI재발동/종가 조건 조합
+- **매수가 손절 가드** (`ws_realtime_trading.py` `_check_str1_conditions_and_sell`):
+  - `LOSS_CONFIRM_TICKS=30` 틱 연속 이탈 시에만 매도 발동 (단일 틱 fake 가격 차단)
+  - `OPENING_GRACE_SEC=30` 초간(09:00:00~09:00:30) 임계 강화: -3% → `OPENING_GRACE_LOSS_PCT=-7%` (우선주 등 thin liquidity 첫 틱 보호 — 260428 SK증권우 사례)
+  - 임계 위 회복 시 카운터 자동 리셋. loss-pending 동안엔 데드크로스 재시도도 보류 (loss 우선)
 - **이상 판정**:
   - `매[수도]주문.*실패` → **CRITICAL**
   - `Traceback` → **CRITICAL**

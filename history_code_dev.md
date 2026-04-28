@@ -2,6 +2,39 @@
 
 ---
 
+## [2026-04-28] bff4039
+- **Category**: cleanup
+- **Title**: kis_auth_llm.py — a2 흔적 (approval_key 파라미터 + _use_global_open_map) 제거
+- **Files**: `kis_auth_llm.py`
+- **Changes**:
+  1. `KISWebSocket.__init__` 시그니처에서 `approval_key` 파라미터 제거: a2-WSS가 main과 다른 approval_key를 쓰기 위해 도입했던 파라미터로, 선행 commit(a2 제거)으로 사용처 0건
+  2. `_use_global_open_map` 분기 단순화: `if _use_global_open_map: init_map = open_map` 분기 → `init_map = open_map` 직접 할당
+  3. `send_multiple` docstring의 multiprocessing/multi-appkey 흔적 일괄 정리
+- **Impact**: a2 제거 완전 마무리. dead code 0건. `KISWebSocket` 생성자 시그니처 단순화.
+
+## [2026-04-28] 76323d8
+- **Category**: revert
+- **Title**: a2 자식 WSS 제거 + 단일 main 41슬롯 시간대별 분산 운영 복원
+- **Files**: `ws_realtime_trading.py` (대규모 수정), `ws_a2_subprocess.py` (삭제)
+- **Changes**:
+  1. **배경**: 2026-04-27 도입한 a2 multiprocessing 패턴(KIS 공식 multi_processing_sample_ws.py 기반)이 ALREADY IN USE storm을 유발, 2026-04-28 운영 정지까지 이어짐
+  2. **사용자 결정**: 단일 main 계좌 WSS 한 세션 41슬롯 시간대별 분산 운영으로 복원
+  3. **삭제 내용 (392라인)**:
+     - a2 전역 변수 4종: `_a2_kws_lock`, `_a2_active_kws`, `_a2_subscribed`, `_a2_approval_key`, `_a2_last_already_in_use_ts`
+     - a2 multiprocessing 전역 변수 6종: `_a2_proc`, `_a2_data_queue`, `_a2_cmd_queue`, `_a2_alive`, `_a2_subscribed_local`
+     - a2 전용 함수 9개: `_get_a2_approval_key`, `_a2_cmd_send`, `_a2_data_router_loop`, `_start_a2_subprocess`, `_stop_a2_subprocess`, `run_ws_a2_forever`, `run_ws_a2_forever_LEGACY`, `_a2_mkstatus_sub_add`, `_a2_mkstatus_sub_remove`
+     - `_shutdown`의 a2 정리부 (`_stop_a2_subprocess` 호출, `_a2_active_kws` 잔재)
+     - `t_a2_wss = threading.Thread(...)` + start 두 줄
+  4. **_vi_exp_sub_switch / _vi_exp_sub_restore**: a2 분기 제거, a1 fallback을 본 경로로 승격 → 단일 `_active_kws`에서 ccnl↔exp swap 직접 수행
+  5. **H0STMKO0(장운영정보)**: main 직접 구독 + `H0STMKO0_MAX_SLOTS=5` hard cap 도입 (보유→VI→기타 우선순위). 이유: 최악의 경우 5슬롯 점유 시에도 데이터 슬롯 ≥35 확보
+  6. **슬롯 회계 보정**: `run_ws_forever`의 슬롯 회계에 `mkstatus_slots = len(_mkstatus_sub_codes)` 포함, `_top_rank_loop` available_slots 계산에서 `_mkstatus_sub_codes` 차감
+  7. **ws_a2_subprocess.py 삭제**: a2 entry point 파일 통째 제거
+- **Impact**:
+  - 핵심 운영 흐름 보존: 08:50 예상체결가 → 09:00 실시간체결가 → VI 시 ccnl↔exp 1:1 swap → 15:21 예상체결가 → 15:30 실시간체결가 → 16:00 overtime
+  - `_desired_subscription_map` 시간대별 시뮬 9개 케이스 모두 plan 표와 일치 확인
+  - a2 multiprocessing으로 인한 ALREADY IN USE storm 재발 가능성 제거
+  - syntax OK, module import OK, NameError 0건, a2 잔존 attribute 0건 검증 완료
+
 ## [2026-04-27] f6a9a2d
 - **Category**: fix
 - **Title**: WSS 재시작 시 ALREADY IN USE storm 본질 원인 제거

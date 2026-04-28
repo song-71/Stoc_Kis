@@ -59,12 +59,16 @@ def run_a2_subprocess(config_path: str, data_queue, cmd_queue):
 
     try:
         # ── 1) syw_2 정보 로드 + ka._cfg override ──
+        # V2 config 구조: users.<default_user>.accounts.syw_2 (nested)
         with open(config_path, "r", encoding="utf-8") as f:
             cfg = json.load(f)
-        syw2 = cfg.get("accounts", {}).get("syw_2", {})
-        if not syw2:
+        from kis_utils import get_account_config, get_user_config  # noqa: E402
+        syw2 = get_account_config(cfg, "syw_2")
+        if not syw2 or not syw2.get("appkey"):
             logger.error("config.json 에 syw_2 계정 누락 — a2 subprocess 종료")
             return
+        # htsid 는 user 레벨에 있으므로 별도로 조회
+        user_cfg = get_user_config(cfg)
 
         # ka 모듈을 자식 프로세스에서 import (부모와 격리된 namespace)
         import kis_auth_llm as ka  # noqa: E402
@@ -74,8 +78,8 @@ def run_a2_subprocess(config_path: str, data_queue, cmd_queue):
         ka._cfg["my_app"] = syw2.get("appkey", "")
         ka._cfg["my_sec"] = syw2.get("appsecret", "")
         ka._cfg["my_acct"] = syw2.get("cano", "")
-        ka._cfg["my_prod"] = syw2.get("acnt_prdt_cd", "01")
-        ka._cfg["my_htsid"] = syw2.get("htsid", "")
+        ka._cfg["my_prod"] = syw2.get("acnt_prdt_cd") or "01"
+        ka._cfg["my_htsid"] = syw2.get("htsid") or user_cfg.get("htsid", "")
 
         # syw_2 approval_key 발급
         ka.auth_ws(svr="prod")

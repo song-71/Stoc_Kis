@@ -936,18 +936,27 @@ class KISWebSocket:
         fut = asyncio.run_coroutine_threadsafe(coro, self._loop)
         return fut.result()
 
-    def close(self, timeout: float = 2.0):
+    def close(self, timeout: float = 10.0):
         """[260427] close frame 전송 완료까지 동기 대기.
         timeout 초과 시 강제 리턴 (asyncio 루프 사망 방어).
-        timeout=2.0 → KIS 서버가 close frame 받아 appkey 즉시 해제 → 재시작 시 ALREADY IN USE 방지.
+        [260428] timeout 2.0s → 10.0s 상향 — 2초로는 close frame 송신 미완료되어 KIS 가
+        abnormal close 로 인식 → appkey 해제 지연 → 재시작 시 ALREADY IN USE storm 발생.
+        timeout 만료 시점을 logger 에 노출하여 진짜 close 정상 여부 가시화.
         """
+        import time as _time
         self._close_requested = True
         if self._ws is not None and self._loop is not None:
+            t0 = _time.time()
             try:
                 fut = asyncio.run_coroutine_threadsafe(self._ws.close(), self._loop)
                 fut.result(timeout=timeout)
-            except Exception:
-                pass
+                logging.info(f"[ws] close frame 송신 완료 ({(_time.time()-t0)*1000:.0f}ms)")
+            except Exception as e:
+                logging.warning(
+                    f"[ws] close frame 송신 timeout/실패 ({(_time.time()-t0)*1000:.0f}ms, "
+                    f"timeout={timeout}s): {type(e).__name__}: {e} "
+                    f"→ KIS 가 abnormal close 로 인식할 수 있음"
+                )
 
-    def shutdown(self, timeout: float = 2.0):
+    def shutdown(self, timeout: float = 10.0):
         self.close(timeout=timeout)

@@ -11071,6 +11071,32 @@ signal.signal(signal.SIGINT, _handle_signal)
 signal.signal(signal.SIGTERM, _handle_signal)
 
 def _request_ws_close(kws) -> None:
+    # [260428] close frame 송신 전 active 구독 명시적 UNSUBSCRIBE 송신 → KIS 가 즉시 정리
+    # → 재시작 시 ALREADY IN USE storm 차단. (이전: close 만 호출 → KIS 측 정리 지연)
+    # 부모 main 의 _subscribed 만 대상 (a2 자식은 자체 cmd_queue 의 stop 으로 정리됨).
+    if kws is _active_kws:
+        try:
+            _name_to_req = {
+                "ccnl_krx": ccnl_krx,                  # noqa: F405
+                "exp_ccnl_krx": exp_ccnl_krx,          # noqa: F405
+                "ccnl_notice": ccnl_notice,            # noqa: F405
+                "overtime_ccnl_krx": overtime_ccnl_krx,        # noqa: F405
+                "overtime_exp_ccnl_krx": overtime_exp_ccnl_krx,# noqa: F405
+            }
+            for _name, _codes in list(_subscribed.items()):
+                _req = _name_to_req.get(_name)
+                if not _req or not _codes:
+                    continue
+                try:
+                    _send_subscribe(kws, _req, list(_codes), "2")  # tr_type=2 → UNSUBSCRIBE
+                except Exception as _e:
+                    logger.debug(f"{ts_prefix()} [shutdown] UNSUBSCRIBE 실패 ({_name}): {_e}")
+            # KIS 가 UNSUBSCRIBE 처리할 시간 (close frame 전 짧은 dwell)
+            time.sleep(0.5)
+        except Exception as _e:
+            logger.debug(f"{ts_prefix()} [shutdown] UNSUBSCRIBE 단계 skip: {_e}")
+
+    # close frame 송신 (KISWebSocket.close default timeout=10.0)
     for attr in ("close", "shutdown"):
         try:
             fn = getattr(kws, attr, None)

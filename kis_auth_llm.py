@@ -695,14 +695,12 @@ class KISWebSocket:
     _approval_key_lock = threading.Lock()
 
     # init
-    def __init__(self, api_url: str, max_retries: int = 1, approval_key: str | None = None):
+    def __init__(self, api_url: str, max_retries: int = 1):
         self.api_url = api_url
         self.max_retries = max_retries  # 기본 1: 내부 재시도 없이 즉시 반환 → 외부 run_ws_forever가 최신 구독으로 재연결
         self._ws = None
         self._loop = None
         self._close_requested = False
-        self._approval_key = approval_key
-        self._use_global_open_map = (approval_key is None)
 
     # private
     async def __subscriber(self, ws: websockets.ClientConnection):
@@ -822,7 +820,7 @@ class KISWebSocket:
         url = f"{env.my_url_ws}{self.api_url}"
         self._loop = asyncio.get_running_loop()
 
-        init_map = open_map if self._use_global_open_map else {}
+        init_map = open_map
 
         while self.retry_count < self.max_retries:
             try:
@@ -881,14 +879,7 @@ class KISWebSocket:
             data: list | str,
             kwargs: dict = None,
     ):
-        """[260427 multiprocessing 전환 후] KIS 공식 샘플 (examples_llm/kis_auth.py) 형태로 단순화.
-
-        이전 버전은 multi-appkey 사용을 위한 _base_headers_ws 글로벌 swap 코드가 있었으나,
-        a2-WSS 가 자식 프로세스로 분리되면서 자식 namespace 격리로 swap 불필요.
-        race condition (main 으로 syw_2 key 누출) 자체가 발생할 수 없는 구조가 됨.
-
-        호환을 위해 self._approval_key 인자는 KISWebSocket.__init__ 에 유지하되 무시.
-        """
+        """KIS 공식 샘플 형태 — list 종목을 개별 send 로 분해 전송."""
         if isinstance(data, str):
             await self.send(ws, request, tr_type, data, kwargs)
         elif isinstance(data, list):

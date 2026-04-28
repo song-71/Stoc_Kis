@@ -2,6 +2,15 @@
 
 ---
 
+## [2026-04-27] 44a5525
+- **Category**: fix
+- **Title**: 8808542 storm 패치 follow-up — UnboundLocalError 및 dwell 임계 보정
+- **Files**: `ws_realtime_trading.py`
+- **Changes**:
+  1. **Fix 1 — UnboundLocalError** (`run_ws_forever`, line 11635): `_main_last_already_in_use_ts` 를 함수 본체에서 read/write 하면서 `global` 선언이 누락 → Python 이 local 변수로 인식 → 첫 read 시 UnboundLocalError → traceback → runner 자동 재시작 → 루프 반복. `global _close_force_stopped, _main_last_already_in_use_ts` 로 수정.
+  2. **Fix 2 — dwell 임계 5s → 15s** (line 11821 부근): `max_retries=10` + retry 1초 sleep 환경에서 storm 패턴 dwell 상한이 약 10~12초. 실측 dwell 10.16s 가 5초 임계를 통과하지 못해 안전망 미작동. 임계를 15s 로 완화 (정상 connect 는 분~시간 단위이므로 false trigger 위험 없음). 주석·경고 로그 메시지도 갱신.
+- **Impact**: UnboundLocalError 재발 0건 (12:34 이후). dwell=10.16s < 15s → long backoff 90s 진입 로그 확인. Storm self-feeding loop 차단 (분당 ~1회 시도로 감소).
+
 ## [2026-04-27] a578ba0
 - **Category**: fix
 - **Title**: stale 프로세스 누적 방지를 위한 cron wrapper 스크립트 2종 추가

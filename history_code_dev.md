@@ -2,6 +2,38 @@
 
 ---
 
+## [2026-04-27] ed5e342
+- **Category**: feat
+- **Title**: 매수가 손절 단일-틱 fake 가격 보호 (SK증권우 260428 사례)
+- **Files**: `ws_realtime_trading.py`, `rules/trading_project_main_plan.md`
+- **Changes**:
+  1. **신규 상수 3개** (line 92, 95, 96):
+     - `LOSS_CONFIRM_TICKS = 30` — 매수가 손절 N틱 연속 이탈 확인
+     - `OPENING_GRACE_SEC = 30` — 09:00:00~09:00:30 grace period
+     - `OPENING_GRACE_LOSS_PCT = 0.07` — grace 구간 임계 -7%
+  2. **`_str1_sell_state` 초기화 5곳에 `loss_below_count: 0` 필드 추가** (line 1490, 1568, 1594, 2503, 6010)
+  3. **매수가 손절 분기 교체** (`_check_str1_sell_conditions` line 9489):
+     - 단일 `elif bidp1 < _buy_p * 0.97` → grace 임계 분기 + N틱 누적 카운터 + 회복 시 자동 리셋 패턴
+     - 09:00:00~09:00:30 grace 구간: 임계 -3% → -7% (우선주/thin liquidity 첫 틱 1주 fake 가격 보호)
+     - `LOSS_CONFIRM_TICKS` 미달 시 debug 로그만 기록, 달성 시 매도 발동 (기존 `STOP_LIMIT_CONFIRM_TICKS` 패턴 차용)
+     - loss-pending 중 데드크로스 재시도 보류 (loss 우선 의미 유지)
+     - buy_p/bidp1 미확보 시 ema fallback 분기 보존
+  4. **`rules/trading_project_main_plan.md`**: 09:00~15:20 섹션에 매수가 손절 가드 항목 추가 (3개 상수 설명 + SK증권우 사례 언급)
+- **Impact**:
+  - 우선주 등 thin liquidity 종목의 09:00 첫 틱 1주 fake 가격으로 즉시 손절되는 버그 해소
+  - SK증권우 검증: 첫 틱 14,280 > grace 임계 13,922 → 신규 로직에서 카운터 미증가, 손절 미발동. 이후 +25% 회복 포착 가능
+
+## [2026-04-27] f4ee6bf
+- **Category**: fix
+- **Title**: ws_a2_subprocess V2 config nested 구조 대응 (syw_2 계정 로드 버그)
+- **Files**: `ws_a2_subprocess.py`
+- **Changes**:
+  - `cfg["accounts"]["syw_2"]` flat path 참조 → `get_account_config(cfg, "syw_2")` 로 교체
+    (V2 config 구조: `users.<default_user>.accounts.syw_2` nested)
+  - `htsid`는 user 레벨 fallback: `syw2.get("htsid") or user_cfg.get("htsid", "")`
+  - `acnt_prdt_cd`도 `or "01"` fallback 명시
+- **Impact**: flat path 참조 오류로 syw_2 계정 로드 실패 → a2 자식 프로세스 무한 재시작되던 버그 해소
+
 ## [2026-04-26] ecc4333
 - **Category**: feat
 - **Title**: 외인/기관/개인 일자별 순매수 순위 컬럼 + fetch_investor_daily.py 루트 이동

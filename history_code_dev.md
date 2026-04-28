@@ -2,6 +2,27 @@
 
 ---
 
+## [2026-04-27] 8808542
+- **Category**: fix
+- **Title**: 부모 WSS reconnect storm 진단·방지 패치 (260428)
+- **Files**: `kis_auth_llm.py`, `ws_realtime_trading.py`
+- **Changes**:
+  1. **`kis_auth_llm.py` line 842** — 연결 예외 로그 `logging.debug` → `logging.warning` 승격, `e.code` / `e.reason` 노출
+     (1,975건 storm 이 DEBUG 레벨에 묻혀 close 사유가 전혀 안 보이던 가시화 fix)
+  2. **`kis_auth_llm.py` line 829** — `ping_interval=None` → `ping_interval=20, ping_timeout=10` (합리적 default 유지)
+  3. **`ws_realtime_trading.py` line 11757** — `KISWebSocket(api_url="", max_retries=10)` (기존 1회 → 10회)
+     (첫 close 즉시 외부 reconnect 폭주하던 근본 원인 완화)
+  4. **`ws_realtime_trading.py` line 4062~** — `_main_last_already_in_use_ts` 전역 변수 + `MAIN_WSS_BACKOFF_ALREADY_IN_USE_SEC=90.0` 신설 (a2 와 동일 패턴)
+  5. **`_on_system` 콜백** — KIS 시스템 메시지 `ALREADY IN USE` 감지 시 `_main_last_already_in_use_ts` 기록
+  6. **`run_ws_forever` reconnect 분기** — 직전 30초 내 ALREADY IN USE 감지 시 backoff 90초로 강제 (기존 2초). storm self-feeding loop 차단
+  7. **`kws.start` dwell 측정** — 5초 미만 종료 시 `_main_last_already_in_use_ts` 강제 설정 (`_on_system` 콜백이 못 잡는 케이스 대비)
+  8. **`SKIP_CCNI0_ON_INIT=1` env toggle** (line 11709, `_ccnl_notice_sub_add`) — H0STCNI0 init 구독 및 종목별 sub_add 우회. default off, 진단 전용.
+- **Impact**:
+  - WSS storm 의 close 사유가 WARNING 레벨로 즉시 가시화됨
+  - max_retries=10 + long backoff 90s 조합으로 ALREADY IN USE self-feeding loop 차단
+  - main appkey 가 외부(KIS HTS/모바일)에서 점유된 상태에서 재접속 폭주 방지
+  - SKIP_CCNI0_ON_INIT 환경변수로 H0STCNI0 충돌 가설 현장 검증 가능
+
 ## [2026-04-27] ed5e342
 - **Category**: feat
 - **Title**: 매수가 손절 단일-틱 fake 가격 보호 (SK증권우 260428 사례)

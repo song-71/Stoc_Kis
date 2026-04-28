@@ -11632,7 +11632,7 @@ def _desired_subscription_map(now: datetime) -> dict:
     return {}
 
 def run_ws_forever():
-    global _close_force_stopped
+    global _close_force_stopped, _main_last_already_in_use_ts
     backoff = 2
     attempt = 0
 
@@ -11816,13 +11816,15 @@ def run_ws_forever():
 
             _kws_dwell = time.time() - _kws_start_ts
             logger.info(f"{ts_prefix()} [ws] kws.start returned (mode={mode.name}, dwell={_kws_dwell:.1f}s)")
-            # [260428] 5초 미만 종료는 ALREADY IN USE 또는 즉시 거부 의심 → storm 차단
-            # (_on_system 콜백이 ALREADY IN USE 메시지를 못 잡는 경우 대비)
-            if _kws_dwell < 5.0 and (time.time() - _main_last_already_in_use_ts) >= 30.0:
+            # [260428] kws.start 의 dwell 이 짧으면 storm 추정 → long backoff 트리거
+            # max_retries=10 + 각 retry 1초 sleep = 약 10~12초가 storm 패턴의 상한
+            # 정상 connect 는 분~시간 단위 dwell 이므로 15초 임계로 충분히 안전
+            # (_on_system 콜백이 ALREADY IN USE / InvalidMessage 메시지를 못 잡는 경우 대비)
+            if _kws_dwell < 15.0 and (time.time() - _main_last_already_in_use_ts) >= 30.0:
                 _main_last_already_in_use_ts = time.time()
                 logger.warning(
-                    f"{ts_prefix()} [ws] kws.start dwell={_kws_dwell:.2f}s < 5s "
-                    f"→ ALREADY IN USE 추정 (long backoff 트리거)"
+                    f"{ts_prefix()} [ws] kws.start dwell={_kws_dwell:.2f}s < 15s "
+                    f"→ KIS 거부 추정 (long backoff 트리거)"
                 )
 
         except SystemExit:

@@ -2295,6 +2295,10 @@ def _ccnl_notice_sub_add(code: str) -> None:
     """주문 발생 시 H0STCNI0 체결통보 구독 등록. tr_key는 htsid(종목코드 아님)."""
     if code in _ccnl_notice_sub_codes:
         return
+    # [260428] SKIP_CCNI0_ON_INIT=1 일 때는 종목별 sub_add 도 건너뜀 (storm 재발 방지)
+    if os.environ.get("SKIP_CCNI0_ON_INIT") == "1":
+        logger.info(f"{ts_prefix()} [체결통보] H0STCNI0 sub_add SKIP ({code}, env toggle)")
+        return
     htsid = _get_ccnl_notice_tr_key()
     if not htsid:
         logger.warning(f"{ts_prefix()} [체결통보] htsid 미설정 → H0STCNI0 구독 불가: {code}")
@@ -4057,6 +4061,11 @@ _a2_approval_key: str = ""
 _a2_last_already_in_use_ts: float = 0.0
 A2_WSS_INITIAL_WARMUP_SEC: float = 30.0
 A2_WSS_BACKOFF_ALREADY_IN_USE_SEC: float = 90.0
+
+# [260428] 부모 WSS 도 동일 보호 — main appkey ALREADY IN USE 시 long backoff
+# (storm self-feeding loop 차단)
+_main_last_already_in_use_ts: float = 0.0
+MAIN_WSS_BACKOFF_ALREADY_IN_USE_SEC: float = 90.0
 
 # [260427] v5 진단 카운터 (5분 주기 INFO 로그) — 매수가 안 일어난 원인 추적
 _v5_diag_counters: dict[str, int] = {
@@ -11700,7 +11709,14 @@ def run_ws_forever():
             # H0STCNI0 체결통보: 다른 구독보다 먼저 등록 (슬롯 우선 확보)
             now_t = datetime.now(KST).time()
             acc_key = _get_ccnl_notice_tr_key()
-            if acc_key:
+            # [260428 진단용 toggle] H0STCNI0 + main approval_key 충돌 의심 검증
+            # SKIP_CCNI0_ON_INIT=1 이면 init 구독 건너뜀 (storm 사라지면 확정)
+            if os.environ.get("SKIP_CCNI0_ON_INIT") == "1":
+                logger.warning(
+                    f"{ts_prefix()} [체결통보] H0STCNI0 init 구독 SKIP "
+                    f"(SKIP_CCNI0_ON_INIT=1, 진단용 — 매수/매도 체결 알림 못 받음)"
+                )
+            elif acc_key:
                 ka.KISWebSocket.subscribe(ccnl_notice, [acc_key])  # noqa: F405
                 _subscribed["ccnl_notice"] = {acc_key}
                 logger.info(f"{ts_prefix()} [체결통보] H0STCNI0 구독 요청: tr_key={acc_key!r}")
@@ -11754,12 +11770,13 @@ def run_ws_forever():
             # (open_map에 최신 codes가 이미 반영되었으므로 이전 이벤트는 무효)
             _ws_rebuild_event.clear()
 
-            kws = ka.KISWebSocket(api_url="")
+            kws = ka.KISWebSocket(api_url="", max_retries=10)
             with _kws_lock:
                 global _active_kws
                 _active_kws = kws
 
             def _on_system(rsp):
+                global _main_last_already_in_use_ts
                 if rsp.isOk and rsp.tr_msg and "SUCCESS" in rsp.tr_msg:
                     if getattr(rsp, "tr_id", "") == "H0STCNI0" and attempt == 2:
                         _notify(f"{ts_prefix()} [체결통보] 재접속 완료", tele=True)
@@ -11784,6 +11801,9 @@ def run_ws_forever():
                         logger.warning(
                             f"{ts_prefix()} [ws][system] tr_id={rsp.tr_id} tr_key={rsp.tr_key} msg={msg}"
                         )
+                        # [260428] ALREADY IN USE 감지 → 장기 backoff 트리거 (a2 와 동일 패턴)
+                        if "ALREADY IN USE" in msg:
+                            _main_last_already_in_use_ts = time.time()
 
             kws.on_system = _on_system
 
@@ -11791,9 +11811,19 @@ def run_ws_forever():
             update_time_flags()
 
             logger.info(f"{ts_prefix()} [ws] start on_result (parquet={FINAL_PARQUET_PATH.name})")
+            _kws_start_ts = time.time()
             kws.start(on_result=on_result)
 
-            logger.info(f"{ts_prefix()} [ws] kws.start returned (mode={mode.name})")
+            _kws_dwell = time.time() - _kws_start_ts
+            logger.info(f"{ts_prefix()} [ws] kws.start returned (mode={mode.name}, dwell={_kws_dwell:.1f}s)")
+            # [260428] 5초 미만 종료는 ALREADY IN USE 또는 즉시 거부 의심 → storm 차단
+            # (_on_system 콜백이 ALREADY IN USE 메시지를 못 잡는 경우 대비)
+            if _kws_dwell < 5.0 and (time.time() - _main_last_already_in_use_ts) >= 30.0:
+                _main_last_already_in_use_ts = time.time()
+                logger.warning(
+                    f"{ts_prefix()} [ws] kws.start dwell={_kws_dwell:.2f}s < 5s "
+                    f"→ ALREADY IN USE 추정 (long backoff 트리거)"
+                )
 
         except SystemExit:
             break
@@ -11864,8 +11894,22 @@ def run_ws_forever():
                 time.sleep(1.0)
             logger.info(f"{ts_prefix()} [ws] 16:00 도달 → 시간외 단일가 연결 시작")
         else:
-            logger.info(f"{ts_prefix()} [ws] reconnect in {backoff}s...")
-            time.sleep(backoff)
+            # [260428] 직전 30초 내 ALREADY IN USE 감지 시 → long backoff (KIS 자연 timeout 대기)
+            elapsed_already = time.time() - _main_last_already_in_use_ts
+            if elapsed_already < 30.0:
+                wait = MAIN_WSS_BACKOFF_ALREADY_IN_USE_SEC
+                logger.warning(
+                    f"{ts_prefix()} [ws] ALREADY IN USE 감지 → "
+                    f"long backoff {wait:.0f}s (KIS appkey timeout 대기, storm 차단)"
+                )
+            else:
+                wait = backoff
+                logger.info(f"{ts_prefix()} [ws] reconnect in {wait}s...")
+            # 단계적 sleep (stop event 빠른 응답)
+            for _ in range(int(wait * 10)):
+                if _stop_event.is_set():
+                    break
+                time.sleep(0.1)
 
     logger.info(f"{ts_prefix()} [ws] stopped")
 

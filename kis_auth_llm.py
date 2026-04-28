@@ -826,7 +826,8 @@ class KISWebSocket:
 
         while self.retry_count < self.max_retries:
             try:
-                async with websockets.connect(url, ping_interval=None) as ws:
+                # [260428] ping_interval=None → 20s 로 활성화 (KIS idle timeout 가설 검증)
+                async with websockets.connect(url, ping_interval=20, ping_timeout=10) as ws:
                     self._ws = ws
                     # request subscribe
                     for name, obj in init_map.items():
@@ -839,7 +840,14 @@ class KISWebSocket:
                         self.__subscriber(ws),
                     )
             except Exception as e:
-                logging.debug(f"[ws] connection exception: {e}")
+                # close code/reason 까지 노출 (260428 reconnect storm 진단용)
+                _code = getattr(e, "code", None)
+                _reason = getattr(e, "reason", None)
+                logging.warning(
+                    f"[ws] connection exception: {type(e).__name__}: {e}"
+                    f"{f' code={_code}' if _code is not None else ''}"
+                    f"{f' reason={_reason!r}' if _reason else ''}"
+                )
                 self.retry_count += 1
                 await asyncio.sleep(1)
             finally:

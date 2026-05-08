@@ -535,12 +535,14 @@ def pad_text(text: str, width: int, align: str = "left") -> str:
 
 
 def print_table(rows: list[dict], columns: list[str], align: dict[str, str],
-                max_rows: int | None = None, no_print: bool = False) -> str:
+                max_rows: int | None = None, no_print: bool = False,
+                header_sep: bool = True) -> str:
     """
     한글 폭 보정 정렬 테이블 출력 + 문자열 반환.
       max_rows=None : 전체 행 출력
       max_rows=20   : 앞 10행 + ... + 뒤 10행 (중간 생략)
       no_print=True : stdout 출력 없이 문자열만 반환
+      header_sep=False : 헤더와 데이터 사이 ─ 구분선 생략
     """
     if not rows:
         return ""
@@ -565,7 +567,8 @@ def print_table(rows: list[dict], columns: list[str], align: dict[str, str],
     lines: list[str] = []
     header = "  ".join(pad_text(col, widths[col], align.get(col, "left")) for col in columns)
     lines.append(header)
-    lines.append("  ".join("─" * widths[col] for col in columns))
+    if header_sep:
+        lines.append("  ".join("─" * widths[col] for col in columns))
     # 행 출력
     for srow in show_rows:
         if srow is None:

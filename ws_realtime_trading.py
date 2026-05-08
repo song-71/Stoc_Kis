@@ -968,26 +968,33 @@ def _run_open_buy_order_cancel_on_startup() -> None:
         logger.warning(f"{ts_prefix()} [미체결취소] 실패: {e}")
 
 
-def _tele_balance_summary(title: str, now_str: str, dnca: float, ord_cash: float,
-                          tot_eval: float, eval_pfls: float, valid_rows: list[dict]) -> None:
-    """텔레그램 전용 잔고 요약 전송 (stdout 출력 없음)."""
-    tele_lines = [
-        f"[{title} {now_str}]",
-        f"출금가능 {dnca:,.0f}  주문가능 {ord_cash:,.0f}",
-        f"총평가 {tot_eval:,.0f}  평가손익 {eval_pfls:+,.0f}",
-    ]
-    if valid_rows:
-        tele_lines.append(f"보유 {len(valid_rows)}종목:")
-        for r in valid_rows:
-            code = str(r.get("pdno", "")).strip().zfill(6)
-            _tnm = str(r.get("hts_kor_isnm", "") or "").strip()
-            if not _tnm or _tnm == code:
-                _tnm = code_name_map.get(code, code)
-            psbl = int(float(str(r.get("ord_psbl_qty", 0) or 0).replace(",", "") or 0))
-            hldg = int(float(str(r.get("hldg_qty", 0) or 0).replace(",", "") or 0))
-            pchs = float(str(r.get("pchs_avg_pric", 0) or 0).replace(",", "") or 0)
-            rt   = float(str(r.get("evlu_pfls_rt", 0) or 0).replace(",", "") or 0)
-            tele_lines.append(f"  {_tnm}({code}) 보유={hldg} 매도가능={psbl} 매입단가={pchs:,.0f} 수익={rt:+.2f}%")
+def _tele_balance_summary(title: str, now_str: str,
+                          per_account: list[dict]) -> None:
+    """텔레그램 전용 잔고 요약 전송 (stdout 출력 없음).
+
+    per_account 항목: {"alias", "cano", "dnca", "ord_cash",
+                       "tot_eval", "eval_pfls", "valid_rows"}
+    """
+    tele_lines = [f"[{title} {now_str}]"]
+    for acc in per_account:
+        tele_lines.append(f"◆ [{acc['alias']} ({acc['cano']})]")
+        tele_lines.append(f"출금가능 {acc['dnca']:,.0f}  주문가능 {acc['ord_cash']:,.0f}")
+        tele_lines.append(f"총평가 {acc['tot_eval']:,.0f}  평가손익 {acc['eval_pfls']:+,.0f}")
+        valid_rows = acc.get("valid_rows") or []
+        if valid_rows:
+            tele_lines.append(f"<보유종목 {len(valid_rows)}건>")
+            for r in valid_rows:
+                code = str(r.get("pdno", "")).strip().zfill(6)
+                _tnm = str(r.get("hts_kor_isnm", "") or "").strip()
+                if not _tnm or _tnm == code:
+                    _tnm = code_name_map.get(code, code)
+                psbl = int(float(str(r.get("ord_psbl_qty", 0) or 0).replace(",", "") or 0))
+                hldg = int(float(str(r.get("hldg_qty", 0) or 0).replace(",", "") or 0))
+                pchs = float(str(r.get("pchs_avg_pric", 0) or 0).replace(",", "") or 0)
+                rt   = float(str(r.get("evlu_pfls_rt", 0) or 0).replace(",", "") or 0)
+                tele_lines.append(f"  {_tnm}({code}) 보유={hldg} 매도가능={psbl} 매입단가={pchs:,.0f} 수익={rt:+.2f}%")
+        else:
+            tele_lines.append("<보유종목 없음>")
     if tmsg is not None:
         try:
             tmsg("\n".join(tele_lines), "-t")
@@ -996,13 +1003,14 @@ def _tele_balance_summary(title: str, now_str: str, dnca: float, ord_cash: float
 
 
 def _query_and_print_balance(label: str, *, trade_only: bool = True,
-                              tele_label: str | None = None) -> dict[str, dict]:
+                              tele_label: str | None = None) -> dict[str, dict] | None:
     """
     REST API(TTTC8434R) 잔고조회 → 상세 테이블 출력 → hold_map 반환.
 
-    반환: {종목코드(6자리): {"qty": 매도가능수량, "buy_price": 매입평균가}}
+    반환:
+      - dict: 조회 성공 (보유종목 없으면 빈 dict, 있으면 {종목코드: {qty, buy_price}})
+      - None: 조회 실패 (예외/설정누락)
     tele_label: 텔레그램 전송 시 사용할 라벨. None이면 전송 안 함.
-    실패 시 빈 dict 반환.
     """
     global _code_account_map
     try:
@@ -1013,12 +1021,12 @@ def _query_and_print_balance(label: str, *, trade_only: bool = True,
             acnt = str(cfg.get("acnt_prdt_cd", "01")).strip() or "01"
             if not cano:
                 logger.warning(f"{ts_prefix()} [{label}] config에 cano 없음")
-                return {}
+                return None
             accounts = [{"account_id": "main", "alias": "a1", "cano": cano, "acnt_prdt_cd": acnt}]
 
-        hold_rows: list[dict] = []
-        seen_codes: set[str] = set()
-        summary: dict = {}
+        # 계좌별 데이터 수집
+        per_account: list[dict] = []
+        hold_map: dict[str, dict] = {}
         for acct in accounts:
             cano = acct["cano"]
             acnt = acct.get("acnt_prdt_cd", "01") or "01"
@@ -1028,111 +1036,135 @@ def _query_and_print_balance(label: str, *, trade_only: bool = True,
             except Exception as e:
                 logger.warning(f"{ts_prefix()} [{label}] {alias}({cano}) 클라이언트 초기화 실패: {e}")
                 continue
+            acct_summary: dict = {}
+            acct_rows: list[dict] = []
+            seen_codes_local: set[str] = set()
             ctx_fk, ctx_nk = "", ""
             for _ in range(10):
                 out1, out2, ctx_fk, ctx_nk = _get_balance_page(client, cano, acnt, "TTTC8434R", ctx_fk, ctx_nk)
-                if not summary:
-                    summary = out2 if isinstance(out2, dict) else (out2[0] if isinstance(out2, list) and out2 else {})
+                if not acct_summary:
+                    acct_summary = out2 if isinstance(out2, dict) else (out2[0] if isinstance(out2, list) and out2 else {})
                 rows = out1 if isinstance(out1, list) else ([out1] if isinstance(out1, dict) else [])
                 if not rows:
                     break
                 for row in rows:
                     c = str(row.get("pdno", "")).strip().zfill(6)
-                    if c and c != "000000" and c not in seen_codes:
-                        seen_codes.add(c)
+                    if c and c != "000000" and c not in seen_codes_local:
+                        seen_codes_local.add(c)
                         row["_acct_alias"] = f"{alias}({cano})"
-                        hold_rows.append(row)
-                        _code_account_map[c] = acct
+                        acct_rows.append(row)
+                        if c not in _code_account_map:
+                            _code_account_map[c] = acct
                 if not ctx_fk.strip() and not ctx_nk.strip():
                     break
-            logger.info(f"[{label}] {alias}({cano}) 조회 완료")
+            valid_rows = [
+                r for r in acct_rows
+                if int(float(str(r.get("hldg_qty", 0) or 0).replace(",", "") or 0)) > 0
+            ]
+            per_account.append({
+                "alias": alias, "cano": cano,
+                "summary": acct_summary, "valid_rows": valid_rows,
+            })
+            logger.info(f"[{label}] {alias}({cano}) 조회 완료 (보유 {len(valid_rows)}건)")
 
-        # ── 계좌 요약 ────────────────────────────────────────────────────────
-        def _f(key: str) -> float:
-            return float(str(summary.get(key, 0) or 0).replace(",", "") or 0)
-
-        dnca      = _f("dnca_tot_amt")
-        ord_cash  = _f("prvs_rcdl_excc_amt")
-        tot_eval  = _f("tot_evlu_amt")
-        buy_amt   = _f("thdt_buy_amt")
-        sll_amt   = _f("thdt_sll_amt")
-        eval_pfls = _f("evlu_pfls_smtm_amt")
-
+        # ── 출력 라인 구성 ─────────────────────────────────────────────────────
         SEP = "─" * 66
+        BIG_SEP = "═" * 66
+        ACCT_LINE_TAIL = "═" * 54
         now_str = datetime.now(KST).strftime("%H:%M:%S")
-
-        sum_row = {
-            "출금가능": f"{dnca:,.0f}", "주문가능": f"{ord_cash:,.0f}",
-            "총 평가금액": f"{tot_eval:,.0f}", "평가손익합계": f"{eval_pfls:+,.0f}",
-            "당일매수금액": f"{buy_amt:,.0f}", "당일매도금액": f"{sll_amt:,.0f}",
-        }
         sum_cols = ["출금가능", "주문가능", "총 평가금액", "평가손익합계", "당일매수금액", "당일매도금액"]
         sum_align = {c: "right" for c in sum_cols}
-        sum_tbl = print_table([sum_row], sum_cols, sum_align, no_print=True)
+        hold_cols = ["코드", "종목명", "보유", "매도가능", "매입단가", "현재단가", "평가금액", "평가손익", "수익률"]
+        hold_align = {"코드": "left", "종목명": "left", "보유": "right", "매도가능": "right",
+                      "매입단가": "right", "현재단가": "right", "평가금액": "right", "평가손익": "right", "수익률": "right"}
 
-        lines: list[str] = ["", SEP, f"[{label}] {now_str}", SEP, sum_tbl]
+        lines: list[str] = [SEP, f"[{label}] {now_str}"]
+        tele_payload: list[dict] = []
 
-        # ── 보유종목 상세 ────────────────────────────────────────────────────
-        hold_map: dict[str, dict] = {}
-        valid_rows = [
-            r for r in hold_rows
-            if int(float(str(r.get("hldg_qty", 0) or 0).replace(",", "") or 0)) > 0
-        ]
+        for acc in per_account:
+            alias = acc["alias"]
+            cano = acc["cano"]
+            summary = acc["summary"] or {}
+            valid_rows = acc["valid_rows"]
 
-        if valid_rows:
-            tbl_rows = []
-            for r in valid_rows:
-                code   = str(r.get("pdno", "")).strip().zfill(6)
-                _raw_nm = str(r.get("hts_kor_isnm", "") or "").strip()
-                if not _raw_nm or _raw_nm == code:
-                    _raw_nm = code_name_map.get(code, code)
-                if code in _no_sell_codes:
-                    _raw_nm = f"{_raw_nm}[NS]"
-                hldg   = int(float(str(r.get("hldg_qty", 0) or 0).replace(",", "") or 0))
-                psbl   = int(float(str(r.get("ord_psbl_qty", 0) or 0).replace(",", "") or 0))
-                pchs   = float(str(r.get("pchs_avg_pric", 0) or 0).replace(",", "") or 0)
-                prpr   = float(str(r.get("prpr", 0) or 0).replace(",", "") or 0)
-                evlu   = float(str(r.get("evlu_amt", 0) or 0).replace(",", "") or 0)
-                pfls   = float(str(r.get("evlu_pfls_amt", 0) or 0).replace(",", "") or 0)
-                rt     = float(str(r.get("evlu_pfls_rt", 0) or 0).replace(",", "") or 0)
-                if prpr == 0 and evlu > 0 and hldg > 0:
-                    prpr = evlu / hldg
-                elif prpr > 0 and hldg > 1 and abs(prpr - evlu) < 1:
-                    prpr = evlu / hldg
-                qty    = psbl if psbl > 0 else hldg
-                hold_map[code] = {"qty": qty, "buy_price": pchs}
-                tbl_rows.append({
-                    "코드": code, "종목명": _raw_nm,
-                    "보유": f"{hldg:,}", "매도가능": f"{psbl:,}",
-                    "매입단가": f"{pchs:,.0f}", "현재단가": f"{prpr:,.0f}",
-                    "평가금액": f"{evlu:,.0f}", "평가손익": f"{pfls:+,.0f}",
-                    "수익률": f"{rt:+.2f}%(▲)" if rt >= 29.5 else f"{rt:+.2f}%",
-                })
-            hold_cols = ["코드", "종목명", "보유", "매도가능", "매입단가", "현재단가", "평가금액", "평가손익", "수익률"]
-            hold_align = {"코드": "left", "종목명": "left", "보유": "right", "매도가능": "right",
-                          "매입단가": "right", "현재단가": "right", "평가금액": "right", "평가손익": "right", "수익률": "right"}
-            hold_tbl = print_table(tbl_rows, hold_cols, hold_align, no_print=True)
-            lines.append(SEP)
-            lines.append(f"  보유종목 {len(valid_rows)}건")
-            lines.append(hold_tbl)
-        else:
-            lines.append(SEP)
-            lines.append("  보유종목 없음")
+            def _f(key: str, _s=summary) -> float:
+                return float(str(_s.get(key, 0) or 0).replace(",", "") or 0)
 
-        lines.append(SEP)
-        lines.append("")
+            dnca      = _f("dnca_tot_amt")
+            ord_cash  = _f("prvs_rcdl_excc_amt")
+            tot_eval  = _f("tot_evlu_amt")
+            buy_amt   = _f("thdt_buy_amt")
+            sll_amt   = _f("thdt_sll_amt")
+            eval_pfls = _f("evlu_pfls_smtm_amt")
+
+            sum_row = {
+                "출금가능": f"{dnca:,.0f}", "주문가능": f"{ord_cash:,.0f}",
+                "총 평가금액": f"{tot_eval:,.0f}", "평가손익합계": f"{eval_pfls:+,.0f}",
+                "당일매수금액": f"{buy_amt:,.0f}", "당일매도금액": f"{sll_amt:,.0f}",
+            }
+            sum_tbl = print_table([sum_row], sum_cols, sum_align,
+                                  no_print=True, header_sep=False)
+
+            lines.append(f"◆ [{alias} ({cano})]   {ACCT_LINE_TAIL}")
+            lines.append(sum_tbl)
+
+            if valid_rows:
+                tbl_rows = []
+                for r in valid_rows:
+                    code   = str(r.get("pdno", "")).strip().zfill(6)
+                    _raw_nm = str(r.get("hts_kor_isnm", "") or "").strip()
+                    if not _raw_nm or _raw_nm == code:
+                        _raw_nm = code_name_map.get(code, code)
+                    if code in _no_sell_codes:
+                        _raw_nm = f"{_raw_nm}[NS]"
+                    hldg   = int(float(str(r.get("hldg_qty", 0) or 0).replace(",", "") or 0))
+                    psbl   = int(float(str(r.get("ord_psbl_qty", 0) or 0).replace(",", "") or 0))
+                    pchs   = float(str(r.get("pchs_avg_pric", 0) or 0).replace(",", "") or 0)
+                    prpr   = float(str(r.get("prpr", 0) or 0).replace(",", "") or 0)
+                    evlu   = float(str(r.get("evlu_amt", 0) or 0).replace(",", "") or 0)
+                    pfls   = float(str(r.get("evlu_pfls_amt", 0) or 0).replace(",", "") or 0)
+                    rt     = float(str(r.get("evlu_pfls_rt", 0) or 0).replace(",", "") or 0)
+                    if prpr == 0 and evlu > 0 and hldg > 0:
+                        prpr = evlu / hldg
+                    elif prpr > 0 and hldg > 1 and abs(prpr - evlu) < 1:
+                        prpr = evlu / hldg
+                    qty    = psbl if psbl > 0 else hldg
+                    if code not in hold_map:
+                        hold_map[code] = {"qty": qty, "buy_price": pchs}
+                    tbl_rows.append({
+                        "코드": code, "종목명": _raw_nm,
+                        "보유": f"{hldg:,}", "매도가능": f"{psbl:,}",
+                        "매입단가": f"{pchs:,.0f}", "현재단가": f"{prpr:,.0f}",
+                        "평가금액": f"{evlu:,.0f}", "평가손익": f"{pfls:+,.0f}",
+                        "수익률": f"{rt:+.2f}%(▲)" if rt >= 29.5 else f"{rt:+.2f}%",
+                    })
+                hold_tbl = print_table(tbl_rows, hold_cols, hold_align,
+                                       no_print=True, header_sep=False)
+                lines.append(f"<보유종목 {len(valid_rows)}건>")
+                lines.append(hold_tbl)
+            else:
+                lines.append("<보유종목 없음>")
+
+            tele_payload.append({
+                "alias": alias, "cano": cano,
+                "dnca": dnca, "ord_cash": ord_cash,
+                "tot_eval": tot_eval, "eval_pfls": eval_pfls,
+                "valid_rows": valid_rows,
+            })
+
+        lines.append(BIG_SEP)
         full_msg = "\n".join(lines)
-        sys.stdout.write(full_msg)
+        sys.stdout.write(full_msg + "\n")
         sys.stdout.flush()
         logger.info(full_msg)
         if tele_label:
-            _tele_balance_summary(tele_label, now_str, dnca, ord_cash, tot_eval, eval_pfls, valid_rows)
+            _tele_balance_summary(tele_label, now_str, tele_payload)
 
         return hold_map
 
     except Exception as e:
         logger.warning(f"{ts_prefix()} [{label}] 조회 실패: {e}")
-        return {}
+        return None
 
 
 def _run_balance_0858() -> None:
@@ -1152,8 +1184,11 @@ def _print_startup_balance() -> dict[str, dict]:
     실패 시 빈 dict 반환.
     """
     hold_map = _query_and_print_balance("시작 잔고조회", trade_only=True, tele_label="시작잔고")
+    if hold_map is None:
+        _notify(f"{ts_prefix()} [시작잔고] 조회 실패", tele=True)
+        return {}
     if not hold_map:
-        _notify(f"{ts_prefix()} [시작잔고] 조회 실패 또는 보유종목 없음", tele=True)
+        _notify(f"{ts_prefix()} [시작잔고] 보유종목 없음", tele=True)
     return hold_map
 
 
@@ -4056,7 +4091,15 @@ _active_kws = None
 # [260428] main WSS 보호 — appkey ALREADY IN USE 시 long backoff
 # (storm self-feeding loop 차단; close frame 송신 실패로 KIS 측 stale session 잔존 시 자연 회복 대기)
 _main_last_already_in_use_ts: float = 0.0
+# [260506] 핸드셰이크 실패(dwell<15s) 다발 시점. ALREADY IN USE 와는 별도로 추적해서
+# 로그/원인 진단을 정확히 분리한다. (예전엔 같은 변수 재사용해서 오인 진단 발생)
+_main_last_handshake_fail_ts: float = 0.0
 MAIN_WSS_BACKOFF_ALREADY_IN_USE_SEC: float = 90.0
+
+# [260506] WSS 자기보호 자동중단 — 핸드셰이크 N회 연속 실패 시 reconnect 중단 + 프로세스 종료
+# (KIS WSS 가 IP 단위 throttle 누적되기 전 자기측에서 끊어 IP 차단 자초 방지)
+# KRX 사이드카/서킷브레이커와는 무관 — KRX 정지 시 핸드셰이크는 정상이라 카운터 증가 안 함.
+HANDSHAKE_FAIL_SELF_STOP_LIMIT: int = 10
 
 # [260427] v5 진단 카운터 (5분 주기 INFO 로그) — 매수가 안 일어난 원인 추적
 _v5_diag_counters: dict[str, int] = {
@@ -4929,7 +4972,11 @@ def scheduler_loop():
                         _backup_log_file()
                         _end_time_reached = True
                         _stop_event.set()
-                        break
+                        # [260506] kws.start() 의 자동 reconnect 루프가 _stop_event 를 못 보고
+                        # 좀비로 살아남는 것을 막기 위한 강제 종료. 모든 저장/통보/백업 끝.
+                        _set_runtime_status(RUNTIME_STATUS_STOPPED)
+                        logger.info(f"{ts_prefix()} [scheduler] EXIT 모드 정리 완료 → os._exit(0)")
+                        os._exit(0)
 
                 # ── VI 종목별 구독 관리: 09:00에 prdy_ctrt>=10% 종목만 예상체결 유지 ──
                 if dtime(9, 0) <= now.time() <= dtime(9, 0, 1) and not _vi_delayed_codes and _vi_delay_until is None:
@@ -4984,8 +5031,9 @@ def scheduler_loop():
                         with _lock:
                             per_sec_total = sum(_per_sec_counts.values())
                             since_active = sum(1 for c in codes if _since_save_counts.get(c, 0) > 0)
+                        avg = _per_sec_sum_since_save // max(1, _per_sec_n_since_save)
                         _notify(
-                            f"{ts_prefix()} (초당 수신건수 {per_sec_total:03d}건/초), "
+                            f"{ts_prefix()} (초당 최대 {_per_sec_max_since_save}건/평균 {avg}건/현재 {per_sec_total}건 수신), "
                             f"(버퍼 {_part_buffer_rows}건/수신 종목 {since_active}개/구독 종목 {total_n}개)"
                         )
                         sys.stdout.flush()
@@ -5196,6 +5244,18 @@ _last_rebuild_ts = 0.0
 _last_no_data_warn_ts = 0.0
 _no_data_rebuild_count = 0   # 재구독 연속 실패 횟수 (데이터 수신 시 리셋)
 
+# 직전 parquet 저장 이후 초당 수신건수 통계 (최대/평균/현재 표기용)
+_per_sec_max_since_save = 0
+_per_sec_sum_since_save = 0
+_per_sec_n_since_save = 0
+
+
+def _reset_per_sec_stats() -> None:
+    global _per_sec_max_since_save, _per_sec_sum_since_save, _per_sec_n_since_save
+    _per_sec_max_since_save = 0
+    _per_sec_sum_since_save = 0
+    _per_sec_n_since_save = 0
+
 def _fmt_now_prefix() -> str:
     return datetime.now(KST).strftime(f"[%y%m%d_%H%M%S_{LOG_ID}]")
 
@@ -5216,13 +5276,22 @@ def _reset_recv_counters(reason: str) -> None:
     logger.info(f"{ts_prefix()} [recv] counters reset ({reason})")
 
 def _print_counts():
+    global _per_sec_max_since_save, _per_sec_sum_since_save, _per_sec_n_since_save
     prefix = _fmt_now_prefix()
     with _lock:
         per_sec_total = sum(_per_sec_counts.values())
         since_active = sum(1 for c in codes if _since_save_counts.get(c, 0) > 0)
         total_codes = len(codes)
+
+    # 직전 저장 이후 누적 통계 갱신
+    if per_sec_total > _per_sec_max_since_save:
+        _per_sec_max_since_save = per_sec_total
+    _per_sec_sum_since_save += per_sec_total
+    _per_sec_n_since_save += 1
+    avg = _per_sec_sum_since_save // max(1, _per_sec_n_since_save)
+
     line = (
-        f"{prefix} (초당 수신건수 {per_sec_total:03d}건/초), "
+        f"{prefix} (초당 최대 {_per_sec_max_since_save}건/평균 {avg}건/현재 {per_sec_total}건 수신), "
         f"(버퍼 {_part_buffer_rows}건/수신 종목 {since_active}개/구독 종목 {total_codes}개)"
     )
 
@@ -8691,6 +8760,7 @@ def _flush_part_buffer_inner(reason: str, force_full: bool) -> int:
         with _lock:
             _written_rows += n
         _last_save_time = time.time()
+        _reset_per_sec_stats()
         try:
             size_mb = part_path.stat().st_size / (1024 * 1024)
         except Exception:
@@ -9726,8 +9796,11 @@ def _check_uplimit_v4_from_tick(
     acml_col  = col_map.get("acml_tr_pbmn")
     oprc_col  = col_map.get("stck_oprc")
     acml_vol_col = col_map.get("acml_vol")
-    bid_sum_cols = [col_map.get(f"bidp_rsqn{i}") for i in range(1, 6)]
-    ask_sum_cols = [col_map.get(f"askp_rsqn{i}") for i in range(1, 6)]
+    # [260429] F11: 전체 호가 잔량 (top5 합산 → TOTAL 사용)
+    bid_total_col = col_map.get("total_bidp_rsqn")
+    ask_total_col = col_map.get("total_askp_rsqn")
+    # [260429] F12: 체결강도 CTTR 직접 사용 (REST volume_power 호출 제거)
+    cttr_col = col_map.get("cttr")
 
     df_tmp = result.with_columns(
         pl.col(code_col).cast(pl.Utf8).str.zfill(6).alias(code_col)
@@ -9758,8 +9831,10 @@ def _check_uplimit_v4_from_tick(
             stck_oprc = _f(oprc_col)
             acml_vol  = _f(acml_vol_col)
             acml_tr_pbmn = _f(acml_col)
-            bid_sum   = sum(_f(c) for c in bid_sum_cols)
-            ask_sum   = sum(_f(c) for c in ask_sum_cols)
+            # [260429] F11: 전체 호가 잔량 / F12: WSS CTTR 체결강도
+            bid_total = _f(bid_total_col)
+            ask_total = _f(ask_total_col)
+            cttr_wss  = _f(cttr_col)
             if acml_tr_pbmn > 0:
                 _uplimit_v5_last_acml[code] = acml_tr_pbmn
 
@@ -11000,6 +11075,58 @@ def ingest_loop():
     logger.info("[ingest] stopped")
 
 # =============================================================================
+# 런타임 상태 기록 (config.json 의 root key)
+# =============================================================================
+# [260506] watchdog 협업용 — 시작 시 1, 정상 종료 시 2
+# 워치독은 status=2 인데 프로세스가 살아있으면 강제 종료한다.
+RUNTIME_STATUS_KEY = "ws_realtime_trading_status"
+RUNTIME_STATUS_RUNNING = 1
+RUNTIME_STATUS_STOPPED = 2
+
+
+def _set_runtime_status(status: int) -> None:
+    try:
+        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+            _cfg = json.load(f)
+        _cfg[RUNTIME_STATUS_KEY] = status
+        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+            json.dump(_cfg, f, ensure_ascii=False, indent=2)
+        logger.info(f"[runtime_status] {RUNTIME_STATUS_KEY}={status}")
+    except Exception as e:
+        logger.warning(f"[runtime_status] 기록 실패: status={status} err={e}")
+
+
+# [260506] WSS 자기보호 자동중단 — 핸드셰이크 실패 N회 연속 시 호출
+def _wss_self_stop(reason: str, count: int) -> None:
+    msg = (
+        f"{ts_prefix()} [ws][자기보호중단] KIS WSS 핸드셰이크 {count}회 연속 실패 → "
+        f"IP throttle 회피를 위해 reconnect 중단 + 프로세스 종료.\n"
+        f"  사유: {reason}\n"
+        f"  ※ 시장 사이드카/서킷브레이커와 무관 — 자기측 connection 보호용"
+    )
+    try:
+        logger.warning(msg)
+    except Exception:
+        pass
+    try:
+        _notify(msg, tele=True)
+    except Exception as e:
+        try:
+            logger.warning(f"[자기보호중단] 텔레그램 통보 실패: {e}")
+        except Exception:
+            pass
+    try:
+        with _kws_lock:
+            if _active_kws is not None:
+                _request_ws_close(_active_kws)
+    except Exception:
+        pass
+    _set_runtime_status(RUNTIME_STATUS_STOPPED)
+    time.sleep(0.5)
+    os._exit(0)
+
+
+# =============================================================================
 # 종료 처리
 # =============================================================================
 def _shutdown(reason: str):
@@ -11042,6 +11169,13 @@ def _shutdown(reason: str):
     except Exception as e:
         logger.warning(f"[shutdown] 지표 스냅샷 저장 실패: {e}")
     time.sleep(0.3)
+    # [260506] 좀비 reconnect 루프 차단 — kws.start() 가 KIS 라이브러리 내부에서
+    # 자동 reconnect 루프를 도는 경우 _stop_event 만으로는 빠져나오지 않아
+    # 47시간 좀비 thread 가 매 새벽 KIS 핸드셰이크를 시도하며 appkey 잔재를 남겼다.
+    # 모든 정리 단계가 끝났으므로 process 자체를 강제 종료한다 (runner 는 정상 종료로 인식).
+    _set_runtime_status(RUNTIME_STATUS_STOPPED)
+    logger.info("[shutdown] os._exit(0) — 좀비 thread 차단을 위한 강제 종료")
+    os._exit(0)
 
 def _handle_signal(signum, frame):
     _shutdown(f"signal={signum}")
@@ -11266,7 +11400,7 @@ def _desired_subscription_map(now: datetime) -> dict:
     return {}
 
 def run_ws_forever():
-    global _close_force_stopped, _main_last_already_in_use_ts
+    global _close_force_stopped, _main_last_already_in_use_ts, _main_last_handshake_fail_ts
     backoff = 2
     attempt = 0
 
@@ -11449,22 +11583,66 @@ def run_ws_forever():
 
             _kws_dwell = time.time() - _kws_start_ts
             logger.info(f"{ts_prefix()} [ws] kws.start returned (mode={mode.name}, dwell={_kws_dwell:.1f}s)")
-            # [260428] kws.start 의 dwell 이 짧으면 storm 추정 → long backoff 트리거
-            # max_retries=10 + 각 retry 1초 sleep = 약 10~12초가 storm 패턴의 상한
-            # 정상 connect 는 분~시간 단위 dwell 이므로 15초 임계로 충분히 안전
-            # (_on_system 콜백이 ALREADY IN USE / InvalidMessage 메시지를 못 잡는 경우 대비)
-            if _kws_dwell < 15.0 and (time.time() - _main_last_already_in_use_ts) >= 30.0:
-                _main_last_already_in_use_ts = time.time()
-                logger.warning(
-                    f"{ts_prefix()} [ws] kws.start dwell={_kws_dwell:.2f}s < 15s "
-                    f"→ KIS 거부 추정 (long backoff 트리거)"
+            # [260506] dwell 이 짧으면 핸드셰이크 실패가 다발한 상태로 추정 → long backoff
+            # 실제 원인은 보통 직전 세션의 좀비 reconnect 잔재(같은 appkey 재사용) 또는
+            # 자기측 연결 lifecycle 미정리. 서버 거부로 단정하지 말 것.
+            # max_retries=10 + 각 retry 1초 sleep = 약 10~12초가 핸드셰이크 실패 다발 패턴의 상한.
+            if _kws_dwell < 15.0:
+                if (time.time() - _main_last_handshake_fail_ts) >= 30.0:
+                    _main_last_handshake_fail_ts = time.time()
+                    logger.warning(
+                        f"{ts_prefix()} [ws] kws.start dwell={_kws_dwell:.2f}s < 15s "
+                        f"→ 핸드셰이크 실패 다발 추정 (long backoff 트리거, "
+                        f"좀비 reconnect 잔재 또는 자기측 lifecycle 미정리 가능성)"
+                    )
+                # [260506] 자기보호 자동중단 카운터 — 연속 N회 핸드셰이크 실패 시 reconnect 중단
+                run_ws_forever._handshake_fail_count = (
+                    getattr(run_ws_forever, "_handshake_fail_count", 0) + 1
                 )
+                _hs_n = run_ws_forever._handshake_fail_count
+                logger.warning(
+                    f"{ts_prefix()} [ws] handshake_fail_count={_hs_n}/"
+                    f"{HANDSHAKE_FAIL_SELF_STOP_LIMIT} (dwell={_kws_dwell:.2f}s)"
+                )
+                if _hs_n >= HANDSHAKE_FAIL_SELF_STOP_LIMIT:
+                    _wss_self_stop(
+                        reason=f"dwell<15s 연속 (마지막 dwell={_kws_dwell:.2f}s)",
+                        count=_hs_n,
+                    )
+            else:
+                # 정상 connect — 카운터 리셋
+                if getattr(run_ws_forever, "_handshake_fail_count", 0) > 0:
+                    logger.info(
+                        f"{ts_prefix()} [ws] handshake_fail_count 리셋 "
+                        f"(이전={run_ws_forever._handshake_fail_count}, dwell={_kws_dwell:.1f}s)"
+                    )
+                    run_ws_forever._handshake_fail_count = 0
 
         except SystemExit:
             break
         except Exception as e:
             logger.error(f"{ts_prefix()} [ws] connection exception: {e}")
             logger.error(traceback.format_exc())
+            # [260506] kws.start 자체가 예외로 끝난 경우 — 핸드셰이크 단계 실패 패턴이면 카운터 증가
+            _exn = type(e).__name__
+            _emsg = str(e)
+            _is_handshake_err = (
+                _exn in ("InvalidMessage", "ConnectionResetError", "TimeoutError", "OSError")
+                or "did not receive a valid HTTP response" in _emsg
+                or "during opening handshake" in _emsg
+                or "Connection reset" in _emsg
+            )
+            if _is_handshake_err:
+                run_ws_forever._handshake_fail_count = (
+                    getattr(run_ws_forever, "_handshake_fail_count", 0) + 1
+                )
+                _hs_n = run_ws_forever._handshake_fail_count
+                logger.warning(
+                    f"{ts_prefix()} [ws] handshake_fail_count={_hs_n}/"
+                    f"{HANDSHAKE_FAIL_SELF_STOP_LIMIT} (예외={_exn})"
+                )
+                if _hs_n >= HANDSHAKE_FAIL_SELF_STOP_LIMIT:
+                    _wss_self_stop(reason=f"{_exn}: {_emsg[:120]}", count=_hs_n)
         finally:
             with _kws_lock:
                 if _active_kws is kws:
@@ -11529,13 +11707,19 @@ def run_ws_forever():
                 time.sleep(1.0)
             logger.info(f"{ts_prefix()} [ws] 16:00 도달 → 시간외 단일가 연결 시작")
         else:
-            # [260428] 직전 30초 내 ALREADY IN USE 감지 시 → long backoff (KIS 자연 timeout 대기)
+            # [260506] 직전 30초 내 핸드셰이크 실패 다발 또는 ALREADY IN USE 감지 시
+            # → long backoff (자기측 잔재 정리 + 동일 appkey 재시도 storm 차단)
+            elapsed_fail = time.time() - _main_last_handshake_fail_ts
             elapsed_already = time.time() - _main_last_already_in_use_ts
-            if elapsed_already < 30.0:
+            if elapsed_already < 30.0 or elapsed_fail < 30.0:
                 wait = MAIN_WSS_BACKOFF_ALREADY_IN_USE_SEC
+                cause = (
+                    "ALREADY IN USE 감지" if elapsed_already < 30.0
+                    else "핸드셰이크 실패 다발 (dwell<15s)"
+                )
                 logger.warning(
-                    f"{ts_prefix()} [ws] ALREADY IN USE 감지 → "
-                    f"long backoff {wait:.0f}s (KIS appkey timeout 대기, storm 차단)"
+                    f"{ts_prefix()} [ws] {cause} → "
+                    f"long backoff {wait:.0f}s (storm 차단)"
                 )
             else:
                 wait = backoff
@@ -11557,10 +11741,14 @@ if __name__ == "__main__":
     if is_holiday():
         msg = f"{ts_prefix()} {PROGRAM_NAME} [v={_CODE_VERSION}] => 오늘은 휴일이므로 프로그램을 종료합니다."
         _notify(msg, tele=True)
+        # [260506] 휴일 즉시 종료도 watchdog 협업용 status=2 기록 (실행 흔적 남김)
+        _set_runtime_status(RUNTIME_STATUS_STOPPED)
         sys.exit(0)
     else:
         msg = f"{ts_prefix()} {PROGRAM_NAME} [v={_CODE_VERSION}] => 오늘은 개장일이므로 프로그램을 시작합니다."
         _notify(msg, tele=True)
+        # [260506] 영업일 시작 — watchdog 가 살아있는 프로세스로 인식하도록 status=1 기록
+        _set_runtime_status(RUNTIME_STATUS_RUNNING)
     logger.info(f"[save_mode] {SAVE_MODE}")
     logger.info(f"[part] flush {PART_FLUSH_THRESHOLD}행 시 {PART_FLUSH_SAVE}행 저장/{PART_FLUSH_SEC}s -> parts/ -> 18:00 merge")
     logger.info(f"[monitor] summary_every={SUMMARY_EVERY_SEC}s stale={STALE_SEC}s")
@@ -11572,6 +11760,7 @@ if __name__ == "__main__":
         sys.stdout.flush()
         logger.info(f"{prefix} 종료 시각 경과 → 스냅샷={FINAL_PARQUET_PATH}")
         _notify(f"{prefix} {PROGRAM_NAME} 종료 시각 경과로 종료", tele=True)
+        _set_runtime_status(RUNTIME_STATUS_STOPPED)
         raise SystemExit(0)
 
     # ── KRX_code로 57/59(30분 단일가) 종목 사전 초기화 ──────────

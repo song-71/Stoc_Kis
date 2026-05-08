@@ -2,6 +2,17 @@
 
 ---
 
+## [2026-05-08] 3078c8e
+- **Category**: refactor
+- **Title**: 잔고조회 출력을 계좌별 블록으로 분리
+- **Files**: `kis_utils.py`, `ws_realtime_trading.py`
+- **Changes**:
+  1. `print_table`에 `header_sep: bool = True` 파라미터 추가. `False` 지정 시 헤더와 데이터 사이 `─` 구분선 생략. 기존 호출자는 기본값 `True`로 동작 무변경.
+  2. `_tele_balance_summary` 시그니처 변경: 단일 집계값 `(dnca/ord_cash/tot_eval/eval_pfls/valid_rows)` → `per_account: list[dict]` 수신으로 변경. 계좌별 블록 메시지 구성.
+  3. `_query_and_print_balance` 리팩터링: 계좌별 데이터를 수집한 후 계좌별 블록으로 출력. 첫 계좌 요약만 잡히던 버그 해소(`if not summary` 가드 제거). `◆ [<alias> (<cano>)]   <═×54>` 헤더 + `보유종목 N건`/`보유종목 없음` 라벨. 요약/보유 테이블 모두 `header_sep=False` 호출.
+  4. 부수적으로 이미 staged 상태였던 `fetch_investor_daily.py → fetch_foreign_investor_daily.py` 리네임(내용 변경 없음, R100) 포함.
+- **Impact**: a1(43444822, 보유 없음) / a2(63614390) 두 계좌 잔고조회 로그가 계좌별 블록으로 명확히 분리됨. a2 요약 영구 누락 버그 해소. 텔레그램 잔고 메시지도 계좌별 블록으로 전송.
+
 ## [2026-04-28] bff4039
 - **Category**: cleanup
 - **Title**: kis_auth_llm.py — a2 흔적 (approval_key 파라미터 + _use_global_open_map) 제거

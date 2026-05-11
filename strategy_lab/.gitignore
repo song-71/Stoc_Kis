@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+
+backtests/results/*.json
+backtests/results/*.csv
+backtests/reports/*.html
+backtests/reports/*.png
+
+strategies_local/*.kis.yaml
+strategies_local/*.py
+!strategies_local/__init__.py
+
+.DS_Store

@@ -5871,14 +5871,17 @@ def _vi_exp_sub_switch(code: str) -> None:
     _vi_exp_sub_ts[code] = time.time()
     _vi_active_codes.add(code)
     name = code_name_map.get(code, code)
+    # snapshot pattern: lock 안에서는 _active_kws 참조만 캡쳐, send 는 lock 밖
+    # → dead socket 의 send 가 hang 해도 lock 점유 안 함 (260511 사고 재발 방지)
     with _kws_lock:
-        if _active_kws is not None:
-            try:
-                _send_subscribe(_active_kws, ccnl_krx, [code], "2")  # noqa: F405  실시간 해제
-                _send_subscribe(_active_kws, exp_ccnl_krx, [code], "1")  # noqa: F405  예상체결 구독
-                logger.info(f"{ts_prefix()} [VI전환] {name}({code}) ccnl→exp swap 완료")
-            except Exception as e:
-                logger.warning(f"{ts_prefix()} [VI전환] {name}({code}) swap 실패: {e}")
+        kws_snap = _active_kws
+    if kws_snap is not None:
+        try:
+            _send_subscribe(kws_snap, ccnl_krx, [code], "2")  # noqa: F405  실시간 해제
+            _send_subscribe(kws_snap, exp_ccnl_krx, [code], "1")  # noqa: F405  예상체결 구독
+            logger.info(f"{ts_prefix()} [VI전환] {name}({code}) ccnl→exp swap 완료")
+        except Exception as e:
+            logger.warning(f"{ts_prefix()} [VI전환] {name}({code}) swap 실패: {e}")
     try:
         _mkstatus_sub_add({code})
     except Exception as e:
@@ -5891,14 +5894,16 @@ def _vi_exp_sub_restore(code: str) -> None:
     _vi_active_codes.discard(code)
     _vi_exp_last_notify.pop(code, None)
     name = code_name_map.get(code, code)
+    # snapshot pattern: lock 안에서는 _active_kws 참조만 캡쳐, send 는 lock 밖
     with _kws_lock:
-        if _active_kws is not None:
-            try:
-                _send_subscribe(_active_kws, exp_ccnl_krx, [code], "2")  # noqa: F405  예상체결 해제
-                _send_subscribe(_active_kws, ccnl_krx, [code], "1")      # noqa: F405  실시간 복귀
-                logger.info(f"{ts_prefix()} [VI복구] {name}({code}) exp→ccnl 복귀 완료")
-            except Exception as e:
-                logger.warning(f"{ts_prefix()} [VI복구] {name}({code}) 복귀 실패: {e}")
+        kws_snap = _active_kws
+    if kws_snap is not None:
+        try:
+            _send_subscribe(kws_snap, exp_ccnl_krx, [code], "2")  # noqa: F405  예상체결 해제
+            _send_subscribe(kws_snap, ccnl_krx, [code], "1")      # noqa: F405  실시간 복귀
+            logger.info(f"{ts_prefix()} [VI복구] {name}({code}) exp→ccnl 복귀 완료")
+        except Exception as e:
+            logger.warning(f"{ts_prefix()} [VI복구] {name}({code}) 복귀 실패: {e}")
     # ── H0STMKO0 keep-alive 순환 (마켓당 1개 유지) ──
     market = _code_market_map.get(code, "")
     if market:
@@ -7209,15 +7214,22 @@ def _mkstatus_sub_add(codes_to_add: set[str]) -> None:
         )
     if not new_codes:
         return
+    # snapshot pattern: lock 안에서는 _active_kws 참조만 캡쳐, send 는 lock 밖
     with _kws_lock:
-        if _active_kws is not None:
-            try:
-                _send_subscribe(_active_kws, market_status_krx, list(new_codes), "1")  # noqa: F405
-                _mkstatus_sub_codes.update(new_codes)
-                names = [f"{code_name_map.get(c, c)}({c})" for c in new_codes]
-                logger.info(f"{ts_prefix()} [H0STMKO0] 구독 추가: {', '.join(names)}")
-            except Exception as e:
-                logger.warning(f"{ts_prefix()} [H0STMKO0] 구독 추가 실패: {e}")
+        kws_snap = _active_kws
+    if kws_snap is None:
+        return
+    try:
+        _send_subscribe(kws_snap, market_status_krx, list(new_codes), "1")  # noqa: F405
+        send_ok = True
+    except Exception as e:
+        send_ok = False
+        logger.warning(f"{ts_prefix()} [H0STMKO0] 구독 추가 실패: {e}")
+    if send_ok:
+        with _kws_lock:
+            _mkstatus_sub_codes.update(new_codes)
+        names = [f"{code_name_map.get(c, c)}({c})" for c in new_codes]
+        logger.info(f"{ts_prefix()} [H0STMKO0] 구독 추가: {', '.join(names)}")
 
 
 def _mkstatus_sub_remove(codes_to_remove: set[str]) -> None:
@@ -7226,15 +7238,23 @@ def _mkstatus_sub_remove(codes_to_remove: set[str]) -> None:
     active = set(codes_to_remove) & _mkstatus_sub_codes
     if not active:
         return
+    # snapshot pattern: lock 안에서는 _active_kws 참조만 캡쳐, send 는 lock 밖
+    # → 260511 09:13:17 lock-holding-hang 사고 직접 원인 경로 차단
     with _kws_lock:
-        if _active_kws is not None:
-            try:
-                _send_subscribe(_active_kws, market_status_krx, list(active), "2")  # noqa: F405
-                _mkstatus_sub_codes -= active
-                names = [f"{code_name_map.get(c, c)}({c})" for c in active]
-                logger.info(f"{ts_prefix()} [H0STMKO0] 구독 해제: {', '.join(names)}")
-            except Exception as e:
-                logger.warning(f"{ts_prefix()} [H0STMKO0] 구독 해제 실패: {e}")
+        kws_snap = _active_kws
+    if kws_snap is None:
+        return
+    try:
+        _send_subscribe(kws_snap, market_status_krx, list(active), "2")  # noqa: F405
+        send_ok = True
+    except Exception as e:
+        send_ok = False
+        logger.warning(f"{ts_prefix()} [H0STMKO0] 구독 해제 실패: {e}")
+    if send_ok:
+        with _kws_lock:
+            _mkstatus_sub_codes -= active
+        names = [f"{code_name_map.get(c, c)}({c})" for c in active]
+        logger.info(f"{ts_prefix()} [H0STMKO0] 구독 해제: {', '.join(names)}")
 
 
 def _mkstatus_sub_remove_with_min(code: str) -> None:

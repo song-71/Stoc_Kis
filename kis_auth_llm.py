@@ -13,7 +13,7 @@ from base64 import b64decode
 from collections import namedtuple
 from collections.abc import Callable
 from typing import Any
-from datetime import datetime
+from datetime import datetime, timedelta
 from io import StringIO
 
 import pandas as pd
@@ -131,6 +131,38 @@ def read_token():
             return None
     except Exception:
         # print('read token error: ', e)
+        return None
+
+
+# [260511] WSS approval_key 일일 파일 캐시 (save_token/read_token 패턴 모방)
+# - 동기: 운영 본체/보조 스크립트가 매 시작마다 ka.auth_ws() 호출 → 매번 POST /oauth2/Approval
+#         발급. 메모리에만 저장되어 같은 날 여러 번 발급되는 비효율 + KIS 측 세션 잔재 위험.
+# - 해결: REST access_token 과 동일하게 일일 파일 캐시. 같은 날 재실행 시 파일에서 재사용.
+def _approval_tmp_path() -> str:
+    return os.path.join(
+        config_root, f"KIS_approval_{datetime.today().strftime('%Y%m%d')}"
+    )
+
+
+def save_approval_key(my_approval_key, my_expired):
+    """WSS approval_key 일일 파일 캐시 저장."""
+    valid_date = datetime.strptime(my_expired, "%Y-%m-%d %H:%M:%S")
+    with open(_approval_tmp_path(), "w", encoding="utf-8") as f:
+        f.write(f"approval_key: {my_approval_key}\n")
+        f.write(f"valid-date: {valid_date}\n")
+
+
+def read_approval_key():
+    """저장된 approval_key 읽기 — 만료 시 None 반환하여 재발급 유도."""
+    try:
+        with open(_approval_tmp_path(), encoding="UTF-8") as f:
+            data = yaml.load(f, Loader=yaml.FullLoader)
+        exp_dt = datetime.strftime(data["valid-date"], "%Y-%m-%d %H:%M:%S")
+        now_dt = datetime.today().strftime("%Y-%m-%d %H:%M:%S")
+        if exp_dt > now_dt:
+            return data["approval_key"]
+        return None
+    except Exception:
         return None
 
 
@@ -519,14 +551,28 @@ def auth_ws(svr="prod", product=_cfg["my_prod"]):
     p["appkey"] = _cfg[ak1]
     p["secretkey"] = _cfg[ak2]
 
-    url = f"{_cfg[svr]}/oauth2/Approval"
-    res = requests.post(url, data=json.dumps(p), headers=_getBaseHeader())  # 토큰 발급
-    rescode = res.status_code
-    if rescode == 200:  # 토큰 정상 발급
-        approval_key = _getResultObject(res.json()).approval_key
+    # [260511] 일일 파일 캐시 우선 — 같은 날 재발급 회피 (KIS 잔재/storm 방지)
+    saved_approval = read_approval_key()
+    if saved_approval is not None:
+        approval_key = saved_approval
+        if _DEBUG:
+            print(f"[{datetime.now()}] => approval_key 캐시 재사용 (KIS_approval_{datetime.today().strftime('%Y%m%d')})")
     else:
-        print("Get Approval token fail!\nYou have to restart your app!!!")
-        return
+        url = f"{_cfg[svr]}/oauth2/Approval"
+        res = requests.post(url, data=json.dumps(p), headers=_getBaseHeader())  # 토큰 발급
+        rescode = res.status_code
+        if rescode == 200:  # 토큰 정상 발급
+            approval_key = _getResultObject(res.json()).approval_key
+            # KIS Approval 응답에 expires_in 없음 → 23시간 보수적으로 가정 (매일 cron 첫 운영 시 자연 갱신)
+            my_expired = (datetime.now() + timedelta(hours=23)).strftime("%Y-%m-%d %H:%M:%S")
+            try:
+                save_approval_key(approval_key, my_expired)
+            except Exception as _e:
+                if _DEBUG:
+                    print(f"[{datetime.now()}] approval_key 캐시 저장 실패 (무시): {_e}")
+        else:
+            print("Get Approval token fail!\nYou have to restart your app!!!")
+            return
 
     changeTREnv(None, svr, product)
 

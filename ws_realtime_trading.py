@@ -5311,8 +5311,11 @@ def _emit_save_done(rows: int) -> None:
     # stdout: 현재 제자리 출력 오른쪽에 붙여서 한 줄로 종료
     sys.stdout.write(f"=> [{LOG_ID}] [save] {rows} rows done\n")
     sys.stdout.flush()
-    # 로그: save 정보만 기록 (제자리 출력 내용은 제외)
-    logger.info(f"{_fmt_now_prefix()} [save] {rows} rows done")
+    # 로그: 마지막 수신통계와 save 정보를 한 줄로 기록 (스크립트 로그에서도 수신상태 추적 가능)
+    if _last_status_line:
+        logger.info(f"{_last_status_line} => [save] {rows} rows done")
+    else:
+        logger.info(f"{_fmt_now_prefix()} [save] {rows} rows done")
 
 ## Phase 3-7: 수신건수 디버그 로그 제거 (광동(0/1255) 등)
 def _format_full_entries() -> list[str]:

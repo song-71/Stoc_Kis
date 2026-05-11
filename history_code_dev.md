@@ -2,6 +2,29 @@
 
 ---
 
+## [2026-05-11] a8e1f49
+- **Category**: feat
+- **Title**: strategy_lab Phase 2.1 — 모멘텀 데이트레이딩 전략 + DAY_TRADE 액션
+- **Files**: `strategy_lab/local_backtest/engine.py` (수정), `strategy_lab/local_backtest/types.py` (수정), `strategy_lab/local_backtest/examples/momentum_day_trade.py` (신규)
+- **Changes**:
+  1. 도입 배경: SMA 크로스오버는 스윙 전략이라 보유 기간이 길어 데이트레이딩 불가. 사용자 요청 — "당일 매도" + "학술·실무적으로 검증된 단순 전략". "전일 강한 상승 + 거래대금 폭증 → 다음날 시가 매수 → 종가 매도" 패턴 채택.
+  2. `momentum_day_trade.py`: `MomentumDayTradeStrategy` 구현.
+     - 편입 조건: `pdy_ctrt` 3~27%, `value / vema20 ≥ 1.5`.
+     - 매일 거래대금 상위 5종목 균등 분배 (strength=0.2).
+     - universe 가 매일 동적이라 `generate_signals()` 인터페이스 우회 → 자체 `backtest()` 메서드 보유.
+     - `build_name_map()` 헬퍼: symbol → 종목명 매핑.
+  3. `engine.py`: `DAY_TRADE` 액션 처리 추가.
+     - 같은 날 시가(open) 매수 + 종가(close) 매도, pnl 즉시 확정.
+     - strength < 1.0 이면 해당 값, 아닌 경우 당일 DAY_TRADE 종목 수로 균등 분배.
+     - 포지션 미보유 (당일 청산) — positions 딕셔너리 변동 없음.
+  4. `types.py`: `Action` Literal 에 `"DAY_TRADE"` 추가.
+- **Validation** (2025년 풀 백테스트):
+  - Total Return -62.90%, MDD 66.69%, Sharpe -1.88
+  - Win Rate 42.59% (509승 / 686패), Profit Factor 0.80
+  - 거래 수 2,390 (매수 1,195 + 매도 1,195)
+  - 해석: 단순 일간 모멘텀은 한국시장에서 손실. 수수료·세금 누적 + 시가 갭 변동성이 불리. 학술적 모멘텀 효과는 1~12개월 단위에서 발견됨.
+- **Impact**: 데이트레이딩 첫 전략 검증 완료. 운영 코드(ws_realtime_trading 계열) 무수정, 무영향. 향후 동적 universe 전략은 동일 패턴(자체 backtest()) 따를 예정.
+
 ## [2026-05-11] b54017b
 - **Category**: feat
 - **Title**: strategy_lab Phase 2 — 자체 Polars 백테스트 엔진 + SMA 크로스오버 예제

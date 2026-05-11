@@ -36,7 +36,7 @@ import pyarrow.parquet as pq
 MERGE_TARGET = 1
 #   특정 날짜만 병합 (YYMMDD 형식, 예: "260227")
 #   빈 문자열("") 이면 오늘 날짜 자동 적용
-TARGET_DATE = "260507"
+TARGET_DATE = ""
 # ─────────────────────────────────────────────────────────────────────
 
 KST = ZoneInfo("Asia/Seoul")

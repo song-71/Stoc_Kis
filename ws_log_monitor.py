@@ -9,7 +9,7 @@
 - 18:10 → Claude 전체 로그 정밀 분석
 """
 
-import subprocess, re, sys, os, json, signal, threading, time, select
+import subprocess, re, sys, os, json, signal, threading, time
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from collections import defaultdict
@@ -436,32 +436,21 @@ class LogMonitor:
             text=True,
         )
 
-        # tail -F 출력은 line-buffered. 새 라인이 없어도 1초마다 깨어나
-        # _stop / SHUTDOWN_TIME 을 검사해야 SIGTERM·자연 종료가 즉시 동작한다.
         try:
-            stdout_fd = proc.stdout
-            while not self._stop.is_set():
-                ready, _, _ = select.select([stdout_fd], [], [], 1.0)
-                if ready:
-                    line = stdout_fd.readline()
-                    if not line:  # tail 종료(EOF)
-                        break
-                    if line.strip():
-                        self.process_line(line)
-                # 자동 종료 체크 (라인 유무와 무관하게 매 폴링마다)
-                if datetime.now(KST).strftime("%H:%M") >= SHUTDOWN_TIME:
+            for line in proc.stdout:
+                if self._stop.is_set():
+                    break
+                if line.strip():
+                    self.process_line(line)
+
+                # 자동 종료 체크
+                now_t = datetime.now(KST).strftime("%H:%M")
+                if now_t >= SHUTDOWN_TIME:
                     print(f"[monitor] {SHUTDOWN_TIME} 도달, 종료")
                     break
         finally:
             proc.terminate()
-            try:
-                proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                try:
-                    proc.wait(timeout=2)
-                except subprocess.TimeoutExpired:
-                    pass
+            proc.wait(timeout=5)
             if self._batch_timer:
                 self._batch_timer.cancel()
 

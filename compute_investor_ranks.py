@@ -15,7 +15,7 @@
   # 특정 일자만 처리 (cron 통합용)
   python3 compute_investor_ranks.py --date 20260427
 
-  # 모듈 import 사용 (fetch_foreign_investor_daily.py 에서)
+  # 모듈 import 사용 (fetch_investor_daily.py 에서)
   from compute_investor_ranks import compute_ranks_for_dates
   df = compute_ranks_for_dates(df, dates=["20260427"])
 """

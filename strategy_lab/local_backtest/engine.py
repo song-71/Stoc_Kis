@@ -126,11 +126,53 @@ class BacktestEngine:
             today = merged.filter(pl.col("date") == d)
             close_lookup = {row["symbol"]: row["close"] for row in today.iter_rows(named=True)}
 
+            # 1단계: DAY_TRADE 시그널 분리 — 자본 균등 분배 위해 종목 수 먼저 집계
+            day_trade_rows = [
+                r for r in today.iter_rows(named=True) if r["action"] == "DAY_TRADE"
+            ]
+            n_day_trade = len(day_trade_rows)
+
             for row in today.iter_rows(named=True):
                 sym = row["symbol"]
                 action = row["action"]
                 strength = float(row["strength"])
                 close = float(row["close"])
+                open_px = float(row["open"])
+
+                if action == "DAY_TRADE" and cash > 0:
+                    # 시가 매수 → 종가 매도 (같은 날 청산)
+                    # strength 가 명시되어 있으면 사용, 아니면 동일 영업일 종목 수로 균등 분배
+                    weight = strength if strength < 1.0 else (1.0 / max(n_day_trade, 1))
+                    buy_price = open_px * (1.0 + self._slip)
+                    sell_price = close * (1.0 - self._slip)
+                    budget = cash * weight * 0.995
+                    qty = int(budget // buy_price)
+                    if qty <= 0:
+                        continue
+                    buy_gross = qty * buy_price
+                    buy_fee = buy_gross * self._fee_buy
+                    sell_gross = qty * sell_price
+                    sell_fee = sell_gross * self._fee_sell
+                    # 같은 날 청산 — cash 변동만 기록 (포지션 미보유)
+                    cash -= buy_gross + buy_fee
+                    cash += sell_gross - sell_fee
+                    pnl = (sell_gross - sell_fee) - (buy_gross + buy_fee)
+                    d_obj = d if isinstance(d, date) else d.date()
+                    trades.append(
+                        Trade(
+                            symbol=sym, side="BUY",
+                            date=d_obj,
+                            price=buy_price, quantity=qty, fee=buy_fee, pnl=0.0,
+                        )
+                    )
+                    trades.append(
+                        Trade(
+                            symbol=sym, side="SELL",
+                            date=d_obj,
+                            price=sell_price, quantity=qty, fee=sell_fee, pnl=pnl,
+                        )
+                    )
+                    continue
 
                 if action == "BUY" and cash > 0 and sym not in positions:
                     fill_price = close * (1.0 + self._slip)

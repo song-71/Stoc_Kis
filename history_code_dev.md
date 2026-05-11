@@ -2,6 +2,23 @@
 
 ---
 
+## [2026-05-11] b54017b
+- **Category**: feat
+- **Title**: strategy_lab Phase 2 — 자체 Polars 백테스트 엔진 + SMA 크로스오버 예제
+- **Files**: `strategy_lab/local_backtest/__init__.py`, `strategy_lab/local_backtest/types.py`, `strategy_lab/local_backtest/strategy.py`, `strategy_lab/local_backtest/metrics.py`, `strategy_lab/local_backtest/engine.py`, `strategy_lab/local_backtest/examples/__init__.py`, `strategy_lab/local_backtest/examples/sma_crossover.py`, `strategy_lab/tests/test_local_backtest.py` (전부 신규, 8개)
+- **Changes**:
+  1. 방향 전환 배경: quantconnect/lean:latest Docker pull 중 루트 파티션 여유 12GB 부족(압축 해제 10GB+ 추정)으로 디스크 소진. 사용자 결정으로 자체 Polars 기반 백테스트 엔진으로 전환. Docker 0 의존, 검증은 symulation/ SQL 결과와 교차검증으로 보완 예정.
+  2. `types.py`: Signal(날짜/종목/action/strength), Trade(매수-매도 쌍 + PnL), BacktestResult(equity_curve + trades + metrics dict) 데이터 타입 정의.
+  3. `strategy.py`: Strategy ABC — `generate_signals(bars: pl.DataFrame) → pl.DataFrame[date, symbol, action, strength]` 인터페이스.
+  4. `metrics.py`: Total Return / CAGR / MDD / Sharpe / Win Rate / Profit Factor 6종 산출. equity_curve에 drawdown_pct 컬럼 추가.
+  5. `engine.py`: BacktestEngine — provider + initial_cash + fee_buy(0.015%) + fee_sell(0.015%+0.18% 거래세) + slippage_rate. 흐름: get_history() → bars → generate_signals() → 날짜 순회 시뮬레이션 → BacktestResult.
+  6. `examples/sma_crossover.py`: SmaCrossoverStrategy — 단기/장기 SMA 크로스오버 첫 검증 예제.
+  7. pytest 3건 PASSED: initial_cash 정합성, equity_curve 일관성, 다종목 동작.
+- **Validation**:
+  - 005930 SMA(10/30) 2025-01-01~09-30: CAGR 13.55%, MDD 21.71%, Sharpe 0.52, Trades 9
+  - 005930+000660 SMA(5/20) 6개월: Total Return +57.73%, CAGR 153.42%, MDD 12.93%, Sharpe 3.36, Trades 16
+- **Impact**: Docker 없는 경량 자체 백테스트 기반 확보. 운영 코드(ws_realtime_trading 계열) 무수정, 무영향. 다음(Phase 3): symulation/ SQL 백테스트 결과와 교차검증 → 운영 연결.
+
 ## [2026-05-11] 0bd6f6d
 - **Category**: feat
 - **Title**: strategy_lab Phase 1 — LocalParquetProvider (우리 parquet → kis_backtest DataProvider 어댑터)

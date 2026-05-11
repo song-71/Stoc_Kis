@@ -8,7 +8,7 @@ from typing import List, Literal
 
 import polars as pl
 
-Action = Literal["BUY", "SELL", "HOLD"]
+Action = Literal["BUY", "SELL", "HOLD", "DAY_TRADE"]
 
 
 @dataclass(frozen=True)

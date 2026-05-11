@@ -1,0 +1,9547 @@
+"""
+# ── TODO ──
+# [ ] H0STMKO0를 a2 계좌 별도 WSS 연결로 전체 구독 종목 확대 검토
+#     → 고객센터에 H0STMKO0가 WSS 구독 카운트(40슬롯)에 포함되는지 확인 중 (2026-04-02)
+#     → 현재는 FHPST01390000 REST 폴링으로 전체 VI 감지 구현
+#     → 결과에 따라 kis_auth_llm.py 인스턴스별 open_map/approval_key 분리 필요
+
+[260309] fix: 잔고조회 REST API를 별도 스레드로 분리 → ingest_loop 블로킹 해소
+  - _print_opening_call_auction_monitor에서 _query_and_print_balance 동기 호출 → threading.Thread로 비동기 실행
+  - 매 60초 잔고조회 시 ingest_loop 2-3초 멈춤 → 수신 데이터 처리/저장 지연 해소
+
+시간대별로 서로 다른 TR 호출코드가 적용됨.
+    정규장 실시간 체결가: ccnl_krx
+    정규장 예상 체결가: exp_ccnl_krx
+    시간외 실시간 체결가: overtime_ccnl_krx
+    시간외 예상 체결가: overtime_exp_ccnl_krx
+
+# 국내주식 시간대별 주문구분코드(ORD_DVSN) 참고
+| 시간대           | 구분            | 체결방식       | ORD_DVSN                        | 가격(ORD_UNPR)     | 비고           |
+| --------------- | -------------- | -------------- | ------------------------------- | ------------------ | -------------- |
+| 08:30~08:40     | 장전 시간외 종가  | 즉시 매칭       | 05(장전시간외)                    | 0 (가격 미입력)    | 전일 종가 고정 |
+| 08:30~09:00     | 시초가 동시호가   | 09:00 일괄     | 00(지정가) 01(시장가)             | 지정가/0           | 시가 결정      |
+| 09:00~15:20     | 정규장           | 실시간 체결     | 00(지정가) 01(시장가)             | 지정가/0           | 일반 매매      |
+| 15:20~15:30     | 종가 동시호가     | 15:30 일괄     | 00(지정가) 01(시장가)             | 지정가/0           | 종가 결정      |
+| 15:40~16:00     | 장후 시간외 종가  | 즉시 매칭        | 06(장후시간외)                    | 0 (가격 미입력)    | 당일 종가 고정 |
+| 16:00~18:00     | 시간외 단일가     | 10분 단위 일괄   | 07(시간외단일가)                  | 가격 입력 필수     | 시장가 불가    |
+
+스케줄 모드별 구독 구성 현황
+    08:29~08:59: exp_ccnl_krx
+    08:59~09:00: exp_ccnl_krx + ccnl_krx
+    09:00~15:19: ccnl_krx
+    15:20~15:30: ccnl_krx + exp_ccnl_krx
+    15:59~18:00: overtime_exp_ccnl_krx + overtime_ccnl_krx
+
+=> 현재 지정된 목록과 초기 및 30분 간격 top30리스트로 5개씩 추가한 목록에 대해 최대 41개 범위내에서 구독 지속
+=> 이 부분까지 잘 작동됨(지정된 목록 + 30분 단위 top30의 5개 종목 추가, 매일 자동화 잘 됨.)
+  * 다만 매일 기본 종목 목록은 수기로 수정해야 함.
+
+시장가 매수 시 증거금 계산  => 확인 필요
+  - 장 중 : 현재가(또는 예상 체결가) 기준으로 증거금 산정
+  - (예외) 다음과 같은 경우에는 상한가 기준 증거금 적용 가능:
+    * VI 직후 단일가 전환 구간
+    * 종가 동시호가 구간
+    * 30분 단일가 매매 종목
+    * 변동성 매우 큰 종목
+    * 내부 리스크 관리 상 보수적 적용 종목
+
+"57(관리종목)" "59(단기과열)" => 이 코드가 맞는지 확인 필요
+
+공통계정(계정1/메인) 사용 : 한도 초과 시 계정2(syw_2)로 재시도
+데이터 저장: /home/ubuntu/Stoc_Kis/data/wss_data/
+
+종가매수 대상 기록:
+  - 선정/주문/체결 state: data/fetch_top_list/closing_buy_state_{yymmdd}.json
+  - top30 추가 리스트: data/fetch_top_list/wss_sub_add_top10_list_{yymmdd}.csv
+"""
+# =============================================================================
+# 시간대 운영(구독 + 저장)
+# - 스케줄에 따라 웹소켓 구독을 재구성(연결 재시작)합니다.
+# - 저장은 SAVE_MODE/time_flag에 의해 on/off 됩니다.
+# =============================================================================
+#260223 수신대상 종목(업종) 목록 : 26개
+CODE_TEXT = """
+페이퍼코리아
+모헨즈
+참엔지니어링
+"""
+
+# Top5 추가 구독 (False면 CODE_TEXT만 18:00까지 수신, Top50 다운/저장만 수행)
+TOP5_ADD = True   # False: Top50 다운·저장 O, Top5 추가/해제/종가매매전환/미수신구독해제 X
+
+# 한도 초과 시 폴백 계정 사용 여부 (True: 한도 초과 시 계정2(syw_2)로 재시도)
+USE_FALLBACK_ACCOUNT = False
+
+# 15:20 종가매수 옵션 (True: 15:19 선정 종목에 init_cash 균등분배 시장가=상한가 매수, 선정조건=Select_Tr_target_list)
+CLOSE_BUY = True
+
+# Str1 실전 매도 옵션 (True: 종가매수 체결 종목에 대해 다음날 실시간 매도 전략 적용)
+STR1_SELL_ENABLED = True
+# VI 발동 매매 옵션: "test_mode"=1주만 매수/매도, "run_mode"=정상 매수/매도, "off"=적용 제외
+VI_TRADE_MODE = "off"
+# 상한가 스톱 연속 이탈 확인 틱 수 (서버 스톱지정가 대신 클라이언트에서 N틱 연속 확인 후 매도)
+STOP_LIMIT_CONFIRM_TICKS = 30
+
+# NXT 애프터마켓 모니터링 대상이 없으면 조기 종료 (True: 즉시 종료 프로세스 실행, False: 20:00까지 대기)
+NXT_AFTER_EARLY_EXIT = True
+
+# 직전 영업일 종가매수 선정 종목을 당일 base codes로 자동 사용
+AUTO_CODE_FROM_PREV_CLOSING = True
+
+# 재시작 시 미체결 매수주문 전부 취소 (True: 정정취소가능주문조회 후 취소, 주문번호 기록 없어도 가능)
+OPEN_BUY_ORDER_CANCEL = True
+# 08:30~08:40 시간외 종가 추가 매수 (True: 전일 미매수 종목에 전일종가 지정가 ORD_DVSN=02 매수)
+MORNING_EXTRA_CLOSING_PR_BUY = True
+
+"""
+실행/모니터링/종료 명령어
+
+재시작 (기존 종료 후 업데이트 버전 즉시 실행):
+  /home/ubuntu/Stoc_Kis/ws_run_restart_wss_trading.py
+    => restart_wss_trading.sh을 재시작해줌.
+
+nohup 실행:
+  nohup /home/ubuntu/Stoc_Kis/venv/bin/python /home/ubuntu/Stoc_Kis/ws_realtime_trading.py > /home/ubuntu/Stoc_Kis/out/wss_realtime_trading.out 2>&1 &
+
+로그 모니터링:
+  <노협 백그라운드 실행 모니터링>
+  tail -f /home/ubuntu/Stoc_Kis/out/wss_realtime_trading.out
+  tail -n 200 -f /home/ubuntu/Stoc_Kis/out/wss_realtime_trading.out
+
+  파일이 크면 VS Code에서 직접 여는 게 스크롤하기 편함.(단, 현재 시점 내용만 가져올 수 있음.)
+  code /home/ubuntu/Stoc_Kis/out/wss_realtime_trading.out
+
+  <터미널 실행 모니터링>
+  tail -f /home/ubuntu/Stoc_Kis/out/logs/wss_TR_{yymmdd}.log
+
+  <log 파일 내 특정 문자 검색>
+  grep -n "Thread 0x\|Current thread" out/wss_realtime_trading.out | head -20 
+
+  
+프로세스 확인:
+  pgrep -af ws_realtime_trading.py
+
+일괄 종료:현재 떠있는 여러 프로세스를 동시에 종료하는 명령어
+  pkill -f ws_realtime_trading.py
+  
+  <정말 안죽으면>
+  pkill -9 -f ws_realtime_trading.py
+
+종료 확인:
+  pgrep -af ws_realtime_trading.py || echo "no process"
+
+
+
+wss 데이터 저장위치 : /home/ubuntu/Stoc_Kis/data/wss_data/
+
+cd /home/ubuntu/Stoc_Kis
+git add ws_realtime_trading.py
+git commit -m "feat: 260226_1810, 셧다운시 메모리 파일만 저장토록 개선"
+git push
+
+cd /home/ubuntu/Stoc_Kis
+git add -A
+git commit -m "feat: ws_realtime_trading.py 전체 파일 커밋"
+git push
+"""
+
+import os
+import sys
+import time
+import shutil
+import signal
+import threading
+import traceback
+import queue
+import math
+import warnings
+import faulthandler
+from collections import deque
+from pathlib import Path
+from datetime import date, datetime, time as dtime, timedelta
+from enum import Enum, auto
+from zoneinfo import ZoneInfo
+
+import pandas as pd
+import polars as pl
+import requests
+
+import logging
+from logging.handlers import RotatingFileHandler
+
+try:
+    from telegMsg import tmsg
+except Exception:
+    tmsg = None
+
+# =============================================================================
+# [중요] 라이브러리 INFO 로그(예: "received message >>") 원천 차단
+# - 반드시 ka / domestic_stock_functions_ws import "전에" 실행되어야 합니다.
+# =============================================================================
+logging.basicConfig(level=logging.WARNING, force=True)
+
+# 자주 원본 프레임을 찍는 로거들 레벨 상향
+logging.getLogger("websockets").setLevel(logging.ERROR)
+logging.getLogger("asyncio").setLevel(logging.ERROR)
+
+# 루트 로거에도 필터를 강하게 추가 (handlers 없어도 logger filter는 동작)
+class DropReceivedMessageFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            msg = record.getMessage()
+        except Exception:
+            return True
+        if "received message >>" in msg:
+            return False
+        return True
+
+class DropStaleWarningFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            msg = record.getMessage()
+        except Exception:
+            return True
+        if "[stale] no data >=" in msg:
+            return False
+        return True
+
+root_logger = logging.getLogger()
+root_logger.addFilter(DropReceivedMessageFilter())
+
+KST = ZoneInfo("Asia/Seoul")
+
+LOG_ID = "TR"  # 로그/텔레그램 메시지 식별용 (여러 파일 동시 실행 시 구분)
+
+# ORD_DVSN 시간대별 매핑 상수
+# 가격 미입력(ORD_UNPR=0) 대상: 01(시장가), 05(장전시간외), 06(장후시간외)
+ORD_DVSN_NO_PRICE = frozenset({"01", "05", "06"})
+
+# 시간대별 ORD_DVSN 매핑
+ORD_DVSN_BY_TIME = {
+    "pre_market_otc":    "05",   # 08:30~08:40 장전시간외종가, 가격 미입력
+    "pre_market_auction":"00",   # 08:30~09:00 시초가 동시호가, 00=지정가/01=시장가
+    "regular":           "00",   # 09:00~15:20 정규장, 00=지정가/01=시장가
+    "closing_auction":   "00",   # 15:20~15:30 종가 동시호가, 00=지정가/01=시장가
+    "post_market_otc":   "06",   # 15:40~16:00 장후시간외종가, 가격 미입력
+    "overtime_single":   "07",   # 16:00~18:00 시간외단일가, 가격 입력 필수
+}
+
+def ts_prefix() -> str:
+    return datetime.now(KST).strftime(f"[%y%m%d_%H%M%S_{LOG_ID}]")
+
+def _notify(msg: str, tele: bool = False) -> None:
+    logger.info(msg)
+    sys.stdout.write("\r\033[2K" + msg + "\n")
+    sys.stdout.flush()
+    if tele and tmsg is not None:
+        try:
+            tmsg(msg, "-t")
+        except Exception:
+            pass
+
+
+# =============================================================================
+# 경로
+# =============================================================================
+SCRIPT_DIR = Path(__file__).resolve().parent
+PROGRAM_NAME = Path(__file__).name
+OUT_DIR = SCRIPT_DIR / "data" / "wss_data"
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+CONFIG_PATH = SCRIPT_DIR / "config.json"
+SUB_CFG_PATH = SCRIPT_DIR / "config_wss_1.json"  # 구독 관리 전용 (trading)
+
+LOG_DIR = SCRIPT_DIR / "out" / "logs"
+LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+today_yymmdd = datetime.now(KST).strftime("%y%m%d")
+FINAL_PARQUET_PATH = OUT_DIR / f"{today_yymmdd}_wss_data.parquet"
+PART_DIR = OUT_DIR / "parts"
+PART_DIR.mkdir(parents=True, exist_ok=True)
+BACKUP_DIR = OUT_DIR / "backup"
+SNAPSHOT_PATH = OUT_DIR / f"{today_yymmdd}_indicator_snapshot.parquet"
+SNAPSHOT_INTERVAL_SEC = 300  # 지표 스냅샷 저장 간격 (5분)
+LOG_PATH = LOG_DIR / f"wss_TR_{today_yymmdd}.log"
+CCNL_NOTICE_CSV_PATH = LOG_DIR / f"ccnl_notice_{today_yymmdd}.csv"
+
+# ── faulthandler: freeze 진단용 스택 덤프 ─────────────────────────────
+# 60초마다 모든 스레드의 호출 스택을 별도 일자 로그파일에 덤프.
+# 정상 시에도 계속 찍히지만 out/wss_realtime_trading.out 는 건드리지 않음.
+# 재발 시 같은 줄에 스택이 고정되어 있으면 → freeze 지점 역추적 가능.
+# 주의: 파일 객체는 faulthandler 가 내부에서 참조하므로 모듈 전역으로 유지해야 GC 되지 않음.
+FAULTHANDLER_LOG_PATH = LOG_DIR / f"faulthandler_{today_yymmdd}.log"
+_faulthandler_log_fp = open(FAULTHANDLER_LOG_PATH, "a", buffering=1, encoding="utf-8")
+_faulthandler_log_fp.write(
+    f"\n===== faulthandler start @ {datetime.now(KST).isoformat()} pid={os.getpid()} =====\n"
+)
+faulthandler.enable(file=_faulthandler_log_fp)
+# dump_traceback_later(60, repeat=True) 제거 — 60초마다 C 확장 실행 중 스택 순회 시 SIGSEGV 유발
+# (4/10 apport.log signal 11 × 3회 확인). watchdog 의 freeze 시 1회 덤프는 별도로 유지.
+
+# 거래장부 CSV (일자별 누적, 하루치 모든 주문/체결 기록)
+LEDGER_DIR = SCRIPT_DIR / "data" / "ledger"
+LEDGER_DIR.mkdir(parents=True, exist_ok=True)
+LEDGER_PATH = LEDGER_DIR / f"trade_ledger_{today_yymmdd}.csv"
+LEDGER_COLS = [
+    "date", "time", "code", "name", "cano_alias",
+    "order_type",    # buy_order / sell_order / buy_fill / sell_fill / buy_cancel
+    "ord_dvsn",      # 시장가/지정가/시간외종가 등
+    "stck_prpr",     # 현재가 (주문 시 현재가, 체결 시 체결가)
+    "buy_price",     # 매수가 (시장가=0, 지정가=주문가)
+    "sell_price",    # 매도가 (시장가=0, 지정가=주문가)
+    "order_qty",     # 주문 수량
+    "fill_qty",      # 체결 수량
+    "amount",        # 금액 (price × fill_qty)
+    "ret",           # 수익률 (sell_price/buy_price - 1), sell_fill 시 계산
+    "profit",        # 수익액 (sell_price*qty - buy_price*qty), sell_fill 시 계산
+    "prdy_ctrt",     # 전일대비율 (%)
+    "reason",        # 매매 사유 (_주문/_체결 접미사로 구분)
+    "ord_no",        # 주문번호
+    "note",
+]
+_ledger_lock = threading.Lock()
+_cano_alias_map: dict[str, str] = {}  # cano → alias (체결통보 시 계좌 식별용)
+
+# =============================================================================
+# 로깅 (콘솔 + 파일)
+# =============================================================================
+logger = logging.getLogger("wss")
+logger.setLevel(logging.INFO)
+
+ch = logging.StreamHandler()
+ch.setLevel(logging.WARNING)   # ★ nohup 이중출력 방지: INFO는 FileHandler(로그파일)만, WARNING+는 stderr에도 출력
+
+fh = RotatingFileHandler(
+    filename=str(LOG_PATH),
+    maxBytes=50 * 1024 * 1024,  # 50MB
+    backupCount=5,
+    encoding="utf-8",
+)
+fh.setLevel(logging.INFO)
+
+fmt = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
+fmt.converter = lambda *args: datetime.now(KST).timetuple()  # UTC → KST
+ch.setFormatter(fmt)
+fh.setFormatter(fmt)
+
+# root 로거에도 파일 핸들러 추가 (WARNING 이상 파일 기록)
+root_fh = RotatingFileHandler(
+    filename=str(LOG_PATH),
+    maxBytes=50 * 1024 * 1024,  # 50MB
+    backupCount=5,
+    encoding="utf-8",
+)
+root_fh.setLevel(logging.WARNING)
+root_fh.setFormatter(fmt)
+root_fh.addFilter(DropStaleWarningFilter())
+root_logger.addHandler(root_fh)
+
+logger.handlers.clear()
+logger.addHandler(ch)
+logger.addHandler(fh)
+logger.propagate = False
+
+# wss 로거에도 필터 적용
+logger.addFilter(DropReceivedMessageFilter())
+
+# 라이브러리/모듈 로거에도 필터 적용 (WARNING:domestic_stock_functions_ws... 같은 것도 정리)
+logging.getLogger("domestic_stock_functions_ws").addFilter(DropReceivedMessageFilter())
+
+logger.info("=== WSS START ===")
+logger.info(f"[paths] parquet={FINAL_PARQUET_PATH}  parts={PART_DIR}  log={LOG_PATH}")
+
+def _cleanup_old_temp_dirs() -> None:
+    for p in OUT_DIR.glob("*_backup"):
+        shutil.rmtree(p, ignore_errors=True)
+    for p in OUT_DIR.glob("*_parts"):
+        shutil.rmtree(p, ignore_errors=True)
+    PART_DIR.mkdir(parents=True, exist_ok=True)
+    BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+
+_cleanup_old_temp_dirs()
+
+## 이전 로그 삭제 비활성화 (Phase 3-2: 로그 보존)
+# def _cleanup_old_logs() -> None:
+#     """당일 로그만 남기고 이전 날짜 로그 파일 삭제."""
+#     ...
+# _cleanup_old_logs()
+
+# =============================================================================
+# open-trading-api 예제 경로 추가
+# =============================================================================
+OPEN_API_WS_DIR = Path.home() / "open-trading-api" / "examples_user" / "domestic_stock"
+sys.path.append(str(OPEN_API_WS_DIR))
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+
+import kis_auth_llm as ka  # noqa: E402
+sys.modules["kis_auth"] = ka
+
+from domestic_stock_functions_ws import *  # noqa: F403,E402
+import json  # noqa: E402
+from kis_utils import is_holiday, load_config, load_symbol_master, save_config, calc_limit_up_price, price_minus_one_tick, print_table, KRX_code_batch  # noqa: E402
+from ws_realtime_tr_str1 import (  # noqa: E402
+    check_opening_call_auction_sell, check_opening_call_auction_cancel, check_realtime_sell,
+    vi_buy_strategy, vi_should_cancel, check_vi_sell,
+    calc_sell_pnl, FEE_RATE_MARKET_SELL,
+)
+from kis_API_ohlcv_download_Utils import DEFAULT_BASE_URL, KisClient, KisConfig  # noqa: E402
+from symulation.Select_Tr_target_list_symulation_pdy_ctrt import get_closing_buy_candidates  # noqa: E402
+
+# ★ import * 이 logger 를 덮어쓰므로 재설정
+logger = logging.getLogger("wss")
+
+# =============================================================================
+# 인증 — 공통계정(계정1/메인)으로 접속
+# =============================================================================
+_cfg_json_auth = load_config(str(SCRIPT_DIR / "config.json"))
+# 공통계정: config.json 루트의 appkey/appsecret 사용
+_main_appkey = _cfg_json_auth.get("appkey")
+_main_appsecret = _cfg_json_auth.get("appsecret")
+if not _main_appkey or not _main_appsecret:
+    raise ValueError("config.json 루트에 appkey/appsecret이 필요합니다.")
+
+# WSS 접속 credential을 공통계정(메인)으로 설정
+ka._cfg["my_app"] = _main_appkey
+ka._cfg["my_sec"] = _main_appsecret
+# 토큰 파일을 공통계정 전용으로 분리 (계정2와 충돌 방지)
+_main_token_path = Path(ka.config_root) / f"KIS_main_{datetime.today().strftime('%Y%m%d')}"
+ka.token_tmp = str(_main_token_path)
+if not _main_token_path.exists():
+    _main_token_path.touch()
+logger.info(f"[auth] 공통계정(계정1/메인) credential 적용, token_file={ka.token_tmp}")
+
+ka.auth(svr="prod")
+ka.auth_ws(svr="prod")
+if not getattr(ka, "_base_headers_ws", {}).get("approval_key"):
+    raise RuntimeError("auth_ws() 실패: 공통계정(계정1/메인)의 앱키/시크릿을 확인하세요.")
+
+trenv = ka.getTREnv()
+htsid = getattr(trenv, "my_htsid", "") if trenv is not None else ""
+if not htsid:
+    htsid = ka.getEnv().get("my_htsid", "")
+
+# ── a2 계좌 WSS 인증 (VI 예상체결가 전용) ──
+_a1_approval_key = ka._base_headers_ws["approval_key"]
+_a2_approval_key: str | None = None
+_a2_cfg_acct = _cfg_json_auth.get("accounts", {}).get("syw_2", {})
+if _a2_cfg_acct.get("appkey") and _a2_cfg_acct.get("appsecret"):
+    _saved_app, _saved_sec = ka._cfg["my_app"], ka._cfg["my_sec"]
+    _saved_token = ka.token_tmp
+    ka._cfg["my_app"] = _a2_cfg_acct["appkey"]
+    ka._cfg["my_sec"] = _a2_cfg_acct["appsecret"]
+    _a2_token_path = Path(ka.config_root) / f"KIS_syw2_{datetime.today().strftime('%Y%m%d')}"
+    ka.token_tmp = str(_a2_token_path)
+    if not _a2_token_path.exists():
+        _a2_token_path.touch()
+    try:
+        ka.auth_ws(svr="prod")
+        _a2_approval_key = ka._base_headers_ws["approval_key"]
+        logger.info(f"[auth] a2(syw_2) WSS approval_key 발급 완료")
+    except Exception as e:
+        logger.warning(f"[auth] a2(syw_2) WSS 인증 실패: {e}")
+    # a1 상태 복원
+    ka._cfg["my_app"], ka._cfg["my_sec"] = _saved_app, _saved_sec
+    ka._base_headers_ws["approval_key"] = _a1_approval_key
+    ka.token_tmp = _saved_token
+else:
+    logger.info("[auth] a2(syw_2) 계좌 미설정 → VI 예상체결가는 a1 WSS 사용")
+
+# =============================================================================
+# 사용자 설정
+# =============================================================================
+print_option = 2  # 1: 수신 DF print, 2: 초당/누적 카운트 1줄 모니터링
+
+# 저장 모드:
+# - "always": 시간대와 무관하게 모두 저장
+# - "time": 시간대 플래그에 따라 저장
+SAVE_MODE = "always"
+
+# part 파일 저장: THRESHOLD행 수신 시 오래된 SAVE행 저장·나머지 버퍼 유지, 또는 1분마다 flush → 18:00 parts 병합
+PART_FLUSH_THRESHOLD = 3000
+PART_FLUSH_SAVE = 2000
+PART_FLUSH_SEC = 60
+
+# ── 기술적 지표 설정 ──
+# EMA 기간 리스트 (ma3, ma50, ma200, ma300, ma500, ma2000 컬럼 생성)
+INDICATOR_MA_LINE = [3, 50, 200, 300, 500, 2000]
+# 볼린저 밴드 기간 및 승수
+INDICATOR_BB_PERIOD = 200
+INDICATOR_BB_K = 2.0
+# 롤링 버퍼 최대 크기 (BB 계산에 필요한 최대 윈도우)
+_IND_MAX_WINDOW = max(max(INDICATOR_MA_LINE), INDICATOR_BB_PERIOD)
+
+# 15:30 장마감 체결 후 구독 강제 중단 시각 (15:31:00)
+CLOSE_STOP_TIME = dtime(15, 31)
+
+# 세션당 종목수 제한(서버 제약): 10개
+MAX_CODES_PER_SESSION = 10
+
+# 요약 로그 / stale
+SUMMARY_EVERY_SEC = 30
+FULL_STATUS_EVERY_SEC = 300  # 5분마다 전체 진행상황 출력
+STALE_SEC = 20
+NO_DATA_WARN_SEC = 10        # 10초 미수신 시 경고 (연결은 살아있으나 데이터 스트림 끊김 감지)
+NO_DATA_REBUILD_SEC = 15     # 15초 미수신 시 강제 재구독 (60초→15초: 프레임 에러 후 빠른 복구)
+
+# 출력 시 "초당 카운트"는 1000을 넘으면 0부터 다시(999 -> 0)
+PER_SEC_ROLLOVER = 1000
+
+# 현재가 REST 보강 (1초 미수신 종목 보강)
+REST_MAX_PER_SEC = 10
+REST_AFTER_WINDOW_DELAY = 0.1
+
+# 장중 미수신 감시 — REST 거래상태 확인
+STALE_CHECK_SEC = 60            # 종목별 미수신 기준(초) → REST 상태 확인 트리거
+STALE_CHECK_HALTED_SEC = 300    # 거래중단 확인 후 재확인 간격(초)
+STALE_CHECK_VI_SEC = 30         # VI 발동 종목 재확인 간격(초)
+STALE_CHECK_INACTIVE_SEC = 20   # 거래비활성 종목 재확인 간격(초) — REST 폴백 빠른 복귀용
+
+# 상승률 상위 종목 추가 구독
+TOP_RANK_ENABLED = True
+TOP_RANK_END = dtime(15, 20)           # 15:19 종가매매 종목 선정까지 포함
+TOP_RANK_N = 50                        # 상승률 상위 다운로드 수
+TOP_RANK_ADD_N = 5                     # 랭킹 결과에서 실제 구독 추가할 최대 종목 수
+TOP_RANK_REMOVE_THRESHOLD = 20         # 이 순위 밖으로 밀린 종목만 해제
+TOP_RANK_MARKET_DIV = "J"
+TOP_RANK_OUT_DIR = Path("/home/ubuntu/Stoc_Kis/data/fetch_top_list")
+MAX_WSS_SUBSCRIBE = 40                 # WSS 구독 총 상한 (H0STCNI0 체결통보 1슬롯 별도 확보)
+# 15:19 종가매매 종목 선정 (Select_Tr_target_list_symulation 조건 사용, 10개 제한 없음)
+CLOSING_PERIOD_START = "2026-01-30"    # 1d 조회 시작일 (YYYY-MM-DD)
+CLOSING_PERIOD_END = ""                # 종료일, 비우면 오늘
+CLOSING_STRATEGY = "str3"              # str1~str5 (Select_Tr_target_list 동일)
+CLOSING_TARGET_PDY_CTRT = 0.20         # str1/str3 전일/당일 등락률 기준
+
+
+# =============================================================================
+# 종목 코드 파싱
+# =============================================================================
+def _parse_codes(text: str) -> list[str]:
+    name_to_code = {}
+    try:
+        sdf = load_symbol_master()
+        sdf["code"] = sdf["code"].astype(str).str.zfill(6)
+        name_to_code = dict(zip(sdf["name"].astype(str), sdf["code"]))
+    except Exception:
+        name_to_code = {}
+
+    out: list[str] = []
+    for line in text.splitlines():
+        raw = line.strip()
+        if not raw:
+            continue
+        if raw.isdigit():
+            out.append(raw.zfill(6))
+        else:
+            c = name_to_code.get(raw)
+            if c:
+                out.append(c)
+    return out
+
+
+def _normalize_code_list(items: list[object]) -> list[str]:
+    lines = [str(x) for x in items if str(x).strip()]
+    if not lines:
+        return []
+    return _parse_codes("\n".join(lines))
+
+
+def _read_cfg() -> dict | None:
+    try:
+        return load_config(str(CONFIG_PATH))
+    except Exception:
+        return None
+
+
+def _read_sub_cfg() -> dict:
+    """구독 관리 전용 config 읽기 (없으면 빈 dict)."""
+    try:
+        return load_config(str(SUB_CFG_PATH))
+    except Exception:
+        return {}
+
+
+def _hashkey(base_url: str, appkey: str, appsecret: str, body: dict) -> str:
+    url = f"{base_url}/uapi/hashkey"
+    r = requests.post(url, headers={"content-type": "application/json", "appkey": appkey, "appsecret": appsecret}, data=json.dumps(body), timeout=10)
+    r.raise_for_status()
+    j = r.json()
+    return j.get("HASH") or j.get("hash") or ""
+
+
+def _get_balance_page(client, cano: str, acnt_prdt_cd: str, tr_id: str, ctx_fk: str = "", ctx_nk: str = "") -> tuple:
+    url = f"{client.cfg.base_url}/uapi/domestic-stock/v1/trading/inquire-balance"
+    params = {
+        "CANO": cano, "ACNT_PRDT_CD": acnt_prdt_cd, "AFHR_FLPR_YN": "N",
+        "OFL_YN": "", "INQR_DVSN": "02", "UNPR_DVSN": "01", "FUND_STTL_ICLD_YN": "N",
+        "FNCG_AMT_AUTO_RDPT_YN": "N", "PRCS_DVSN": "00",
+        "CTX_AREA_FK100": ctx_fk, "CTX_AREA_NK100": ctx_nk,
+    }
+    r = requests.get(url, headers=client._headers(tr_id=tr_id), params=params, timeout=10)
+    r.raise_for_status()
+    j = r.json()
+    if str(j.get("rt_cd")) != "0":
+        raise RuntimeError(f"잔고조회 실패: {j.get('msg1')} raw={j}")
+    out1 = j.get("output1") or []
+    out2 = j.get("output2") or {}
+    if isinstance(out1, dict):
+        out1 = [out1]
+    return out1, out2, str(j.get("ctx_area_fk100") or out2.get("ctx_area_fk100") or ""), str(j.get("ctx_area_nk100") or out2.get("ctx_area_nk100") or "")
+
+
+def _buy_order_cash(client, cano: str, acnt_prdt_cd: str, tr_id: str, code: str, qty: int, price: float, ord_dvsn: str = "00") -> dict:
+    """ord_dvsn: 00=지정가, 01=시장가, 05=장전시간외종가(08:30~08:40), 06=장후시간외종가(15:40~16:00), 07=시간외단일가(16:00~18:00)"""
+    # 시장가(01), 장전시간외(05), 장후시간외(06)는 ORD_UNPR=0 (가격 미입력)
+    # 시간외단일가(07)는 가격 입력 필수
+    ord_unpr = "0" if ord_dvsn in ORD_DVSN_NO_PRICE else str(int(price))
+    url = f"{client.cfg.base_url}/uapi/domestic-stock/v1/trading/order-cash"
+    body = {"CANO": cano, "ACNT_PRDT_CD": acnt_prdt_cd, "PDNO": code, "ORD_DVSN": ord_dvsn, "ORD_QTY": str(qty), "ORD_UNPR": ord_unpr}
+    headers = client._headers(tr_id=tr_id)
+    headers["hashkey"] = _hashkey(client.cfg.base_url, client.cfg.appkey, client.cfg.appsecret, body)
+    headers["content-type"] = "application/json"
+    r = requests.post(url, headers=headers, data=json.dumps(body), timeout=10)
+    r.raise_for_status()
+    j = r.json()
+    if str(j.get("rt_cd")) != "0":
+        msg1 = j.get("msg1", "")
+        # APBK0406: 상한가 초과 → 1틱 낮춘 가격으로 재시도 (최대 3회)
+        if "APBK0406" in str(msg1) and ord_dvsn not in ORD_DVSN_NO_PRICE and price > 0:
+            retry_price = price
+            for attempt in range(3):
+                retry_price = price_minus_one_tick(retry_price)
+                logger.warning(f"[매수주문] APBK0406 상한가초과 → {attempt+1}차 재시도 price={retry_price:,.0f} (원래={price:,.0f})")
+                body["ORD_UNPR"] = str(int(retry_price))
+                headers["hashkey"] = _hashkey(client.cfg.base_url, client.cfg.appkey, client.cfg.appsecret, body)
+                r2 = requests.post(url, headers=headers, data=json.dumps(body), timeout=10)
+                r2.raise_for_status()
+                j2 = r2.json()
+                if str(j2.get("rt_cd")) == "0":
+                    return j2
+                if "APBK0406" not in str(j2.get("msg1", "")):
+                    raise RuntimeError(f"매수 주문 실패: {j2.get('msg1')} raw={j2}")
+            raise RuntimeError(f"매수 주문 실패 (3회 재시도 후): {msg1} raw={j}")
+        raise RuntimeError(f"매수 주문 실패: {msg1} raw={j}")
+    # 주문 성공 → 해당 종목 H0STCNI0 체결통보 구독 (종목별 등록)
+    try:
+        _ccnl_notice_sub_add(code)
+    except Exception:
+        pass
+    return j
+
+
+def _append_ledger(
+    order_type: str,
+    code: str,
+    name: str = "",
+    buy_price: float = 0.0,
+    sell_price: float = 0.0,
+    order_qty: int = 0,
+    fill_qty: int = 0,
+    prdy_ctrt: float = 0.0,
+    reason: str = "",
+    ord_no: str = "",
+    ord_dvsn: str = "",
+    note: str = "",
+    cano_alias: str = "",
+    stck_prpr: float = 0.0,
+) -> None:
+    """거래장부 CSV 에 1행 추가 (스레드 안전)."""
+    try:
+        now = datetime.now(KST)
+        amount = sell_price * fill_qty if sell_price > 0 else buy_price * fill_qty
+        # 수익률/수익액: sell_fill 시에만 의미 있음
+        ret = round((sell_price / buy_price - 1), 4) if buy_price > 0 and sell_price > 0 else 0.0
+        profit = round(sell_price * fill_qty - buy_price * fill_qty, 0) if fill_qty > 0 and sell_price > 0 and buy_price > 0 else 0.0
+        row = {
+            "date":       now.strftime("%Y-%m-%d"),
+            "time":       now.strftime("%H:%M:%S"),
+            "code":       str(code).zfill(6),
+            "name":       name or code_name_map.get(str(code).zfill(6), ""),
+            "cano_alias": cano_alias,
+            "order_type": order_type,
+            "ord_dvsn":   ord_dvsn,
+            "stck_prpr":  round(stck_prpr, 2),
+            "buy_price":  round(buy_price, 2),
+            "sell_price": round(sell_price, 2),
+            "order_qty":  order_qty,
+            "fill_qty":   fill_qty,
+            "amount":     round(amount, 0),
+            "ret":        ret,
+            "profit":     profit,
+            "prdy_ctrt":  round(prdy_ctrt, 2),
+            "reason":     reason,
+            "ord_no":     ord_no,
+            "note":       note,
+        }
+        write_header = not LEDGER_PATH.exists()
+        with _ledger_lock:
+            # BOM은 신규 파일 최초 작성 시에만 추가 (append 시 BOM 중복 삽입 방지)
+            enc = "utf-8-sig" if write_header else "utf-8"
+            with open(LEDGER_PATH, "a", encoding=enc, newline="") as f:
+                import csv as _csv
+                writer = _csv.DictWriter(f, fieldnames=LEDGER_COLS)
+                if write_header:
+                    writer.writeheader()
+                writer.writerow(row)
+    except Exception as e:
+        logger.warning(f"[ledger] 기록 실패: {e}")
+
+
+def _append_daily_ledger_to_yearly() -> None:
+    """당일 거래장부 CSV를 연도별 parquet에 append. 18:00 종료 시 1회 호출."""
+    if not LEDGER_PATH.exists():
+        logger.info("[ledger] 당일 CSV 없음 → 연도별 parquet 갱신 스킵")
+        return
+    try:
+        year = datetime.now(KST).strftime("%Y")
+        yearly_path = LEDGER_DIR / f"trade_ledger_{year}.parquet"
+        daily_df = pd.read_csv(LEDGER_PATH, encoding="utf-8-sig")
+        if daily_df.empty:
+            return
+        # recv_ts 통일: date + time → recv_ts
+        if "date" in daily_df.columns and "time" in daily_df.columns:
+            daily_df["recv_ts"] = daily_df["date"].astype(str) + " " + daily_df["time"].astype(str)
+        if yearly_path.exists():
+            existing = pd.read_parquet(yearly_path)
+            combined = pd.concat([existing, daily_df], ignore_index=True)
+            # 중복 제거: date+time+code+order_type+ord_no
+            dedup_cols = [c for c in ["date", "time", "code", "order_type", "ord_no"] if c in combined.columns]
+            if dedup_cols:
+                combined = combined.drop_duplicates(subset=dedup_cols, keep="last")
+        else:
+            combined = daily_df
+        combined.to_parquet(yearly_path, index=False, engine="pyarrow", compression="zstd")
+        logger.info(f"[ledger] 연도별 parquet 갱신: {yearly_path.name} ({len(combined):,}행)")
+    except Exception as e:
+        logger.warning(f"[ledger] 연도별 parquet 갱신 실패: {e}")
+
+
+def _sell_order_cash(
+    client, cano: str, acnt_prdt_cd: str, code: str, qty: int,
+    price: float = 0, ord_dvsn: str = "01", cndt_pric: float = 0,
+) -> dict:
+    """주식 매도. TR_ID=TTTC0801U. ord_dvsn: 01=시장가, 22=스톱지정가(CNDT_PRIC 필수)"""
+    # 시장가(01), 장전시간외(05), 장후시간외(06)는 가격 미입력
+    ord_unpr = "0" if ord_dvsn in ORD_DVSN_NO_PRICE else str(int(price))
+    url = f"{client.cfg.base_url}/uapi/domestic-stock/v1/trading/order-cash"
+    body = {
+        "CANO": cano, "ACNT_PRDT_CD": acnt_prdt_cd,
+        "PDNO": code, "ORD_DVSN": ord_dvsn,
+        "ORD_QTY": str(qty), "ORD_UNPR": ord_unpr,
+    }
+    if cndt_pric > 0:
+        body["CNDT_PRIC"] = str(int(cndt_pric))
+    headers = client._headers(tr_id="TTTC0801U")
+    headers["hashkey"] = _hashkey(client.cfg.base_url, client.cfg.appkey, client.cfg.appsecret, body)
+    headers["content-type"] = "application/json"
+    r = requests.post(url, headers=headers, data=json.dumps(body), timeout=10)
+    r.raise_for_status()
+    j = r.json()
+    if str(j.get("rt_cd")) != "0":
+        raise RuntimeError(f"매도 주문 실패: {j.get('msg1')} raw={j}")
+    # 주문 성공 → 해당 종목 H0STCNI0 체결통보 구독 (종목별 등록)
+    try:
+        _ccnl_notice_sub_add(code)
+    except Exception:
+        pass
+    return j
+
+
+def _cancel_order_generic(
+    client, cano: str, acnt: str, ordno: str, code: str, qty: int, ord_dvsn: str = "01"
+) -> None:
+    """주문 취소. ORD_DVSN: 00=지정가, 01=시장가, 02=시간외종가, 06=시간외단일가."""
+    if not ordno or qty <= 0:
+        return
+    url = f"{client.cfg.base_url}/uapi/domestic-stock/v1/trading/order-rvsecncl"
+    body = {
+        "CANO": cano, "ACNT_PRDT_CD": acnt, "KRX_FWDG_ORD_ORGNO": "00000",
+        "ORGN_ORDNO": ordno, "ORD_DVSN": ord_dvsn, "RVSE_CNCL_DVSN_CD": "02",
+        "ORD_QTY": str(qty), "ORD_UNPR": "0", "PDNO": code,
+    }
+    headers = client._headers(tr_id="TTTC0803U")
+    headers["hashkey"] = _hashkey(client.cfg.base_url, client.cfg.appkey, client.cfg.appsecret, body)
+    headers["content-type"] = "application/json"
+    r = requests.post(url, headers=headers, data=json.dumps(body), timeout=10)
+    r.raise_for_status()
+    j = r.json()
+    if str(j.get("rt_cd")) != "0":
+        raise RuntimeError(f"주문취소 실패: {j.get('msg1')} raw={j}")
+
+
+def _cancel_closing_order(client, cano: str, acnt: str, ordno: str, code: str, qty: int) -> None:
+    """15:20~15:30 종가매수 시장가(01) 주문 취소."""
+    _cancel_order_generic(client, cano, acnt, ordno, code, qty, ord_dvsn="01")
+
+
+def _inquire_psbl_rvsecncl(client, cano: str, acnt: str, tr_id: str = "TTTC0084R",
+                            sll_buy_dvsn_cd: str = "00") -> list[dict]:
+    """주식정정취소가능주문조회. sll_buy_dvsn_cd: 00=매수, 01=매도, 02=전체."""
+    url = f"{client.cfg.base_url}/uapi/domestic-stock/v1/trading/inquire-psbl-rvsecncl"
+    headers = client._headers(tr_id=tr_id)
+    params = {
+        "CANO": cano, "ACNT_PRDT_CD": acnt,
+        "INQR_DVSN": "00", "SLL_BUY_DVSN_CD": sll_buy_dvsn_cd,
+        "INQR_STRT_DT": "", "INQR_END_DT": "", "PDNO": "", "ORD_GNO_BRNO": "", "ODNO": "",
+        "INQR_DVSN_1": "0", "INQR_DVSN_2": "0",
+        "CTX_AREA_FK100": "", "CTX_AREA_NK100": "",
+    }
+    out: list[dict] = []
+    for _ in range(20):
+        r = requests.get(url, headers=headers, params=params, timeout=10)
+        r.raise_for_status()
+        j = r.json()
+        if str(j.get("rt_cd")) != "0":
+            raise RuntimeError(f"정정취소가능주문조회 실패: {j.get('msg1')} raw={j}")
+        output1 = j.get("output1") or []
+        if isinstance(output1, dict):
+            output1 = [output1]
+        out.extend(output1)
+        ctx_fk = j.get("ctx_area_fk100") or ""
+        ctx_nk = j.get("ctx_area_nk100") or ""
+        if not ctx_fk and not ctx_nk:
+            break
+        params["CTX_AREA_FK100"] = ctx_fk
+        params["CTX_AREA_NK100"] = ctx_nk
+    return out
+
+
+def _cancel_open_sell_orders_for_code(client, cano: str, acnt: str, code: str) -> int:
+    """특정 종목의 미체결 매도주문을 모두 취소. 취소 건수 반환."""
+    orders = _inquire_psbl_rvsecncl(client, cano, acnt, sll_buy_dvsn_cd="01")
+    cancelled = 0
+    for o in orders:
+        o_code = str(o.get("pdno") or o.get("PDNO") or "").strip().zfill(6)
+        if o_code != code:
+            continue
+        ordno = str(o.get("odno") or o.get("ODNO") or o.get("ordno") or "").strip()
+        psbl_qty = int(float(str(o.get("psbl_qty") or o.get("PSBL_QTY") or 0).replace(",", "") or 0))
+        ord_qty = int(float(str(o.get("ord_qty") or o.get("ORD_QTY") or 0).replace(",", "") or 0))
+        ord_unpr = str(o.get("ord_unpr") or o.get("ORD_UNPR") or "0").replace(",", "")
+        ord_dvsn = str(o.get("ord_dvsn_cd") or o.get("ORD_DVSN_CD") or o.get("ord_dvsn") or "01").strip() or "01"
+        ord_dvsn_name = {"00": "지정가", "01": "시장가", "02": "시간외종가", "05": "장전시간외", "06": "장후시간외", "07": "시간외단일가"}.get(ord_dvsn, ord_dvsn)
+        name = code_name_map.get(code, code)
+        logger.info(
+            f"[str1_sell] 미체결매도 발견 {name}({code})"
+            f"  주문번호={ordno}  주문수량={ord_qty}  취소가능수량={psbl_qty}"
+            f"  주문가={ord_unpr}  주문방식={ord_dvsn_name}({ord_dvsn})"
+        )
+        if not ordno or psbl_qty <= 0:
+            continue
+        try:
+            _cancel_order_generic(client, cano, acnt, ordno, code, psbl_qty, ord_dvsn)
+            cancelled += 1
+            logger.info(f"[str1_sell] 미체결매도 취소 성공 {name}({code}) ordno={ordno} qty={psbl_qty}")
+            time.sleep(0.3)
+        except Exception as e:
+            logger.error(f"[str1_sell] 미체결매도 취소 실패 {name}({code}) ordno={ordno}: {e}")
+    return cancelled
+
+
+def _run_open_buy_order_cancel_on_startup() -> None:
+    """재시작 시 미체결 매수주문 전부 취소. 조회 → 현황 출력 → 취소 → 결과 출력.
+    단, 16:00~18:00 시간외 단일가 시간대에는 기존 주문이 10분 주기로 자동 유지되므로 취소 스킵."""
+    if not OPEN_BUY_ORDER_CANCEL:
+        return
+    # 15:30~16:00: 정규장 종료 후 주문 자동 실효 → 취소 불필요
+    # 16:00~18:00: 시간외 단일가 기존 주문 자동 유지 → 취소 스킵
+    nt = datetime.now(KST).time()
+    if dtime(15, 30) <= nt < dtime(16, 0):
+        _notify(f"{ts_prefix()} [미체결취소] 정규장 종료(15:30~16:00) → 주문 자동 실효, 취소 스킵")
+        return
+    if dtime(16, 0) <= nt < dtime(18, 0):
+        _notify(f"{ts_prefix()} [미체결취소] 시간외 단일가 시간대(16:00~18:00) → 기존 주문 유지, 취소 스킵")
+        return
+    sys.stdout.write("\n")
+    _notify(f"{ts_prefix()} [미체결취소] 매수주문 확인 중...")
+    try:
+        cfg = _read_cfg() or load_config(str(CONFIG_PATH))
+        cano = str(cfg.get("cano", "")).strip()
+        acnt = str(cfg.get("acnt_prdt_cd", "01")).strip() or "01"
+        if not cano:
+            _notify(f"{ts_prefix()} [미체결취소] config cano 없음")
+            return
+        client = _top_client or _init_top_client()
+        orders = _inquire_psbl_rvsecncl(client, cano, acnt)
+        targets = [o for o in orders if int(float(str(o.get("psbl_qty") or o.get("PSBL_QTY") or 0)).replace(",", "") or 0) > 0]
+        if not targets:
+            _notify(f"{ts_prefix()} [미체결취소] 미체결 매수주문 없음")
+            sys.stdout.write("\n")
+            return
+        lines = [f"{ts_prefix()} [미체결취소] 현황 {len(targets)}건"]
+        for o in targets:
+            code = str(o.get("pdno") or o.get("PDNO") or "").strip().zfill(6)
+            qty = int(float(str(o.get("psbl_qty") or o.get("PSBL_QTY") or 0)).replace(",", "") or 0)
+            name = code_name_map.get(code, code)
+            lines.append(f"  {name}({code}) qty={qty}")
+        _notify("\n".join(lines))
+        _notify(f"{ts_prefix()} [미체결취소] 취소 요청 중...")
+        n_ok, n_fail = 0, 0
+        for o in targets:
+            ordno = str(o.get("odno") or o.get("ODNO") or o.get("ordno") or "").strip()
+            code = str(o.get("pdno") or o.get("PDNO") or "").strip().zfill(6)
+            qty = int(float(str(o.get("psbl_qty") or o.get("PSBL_QTY") or o.get("ord_qty") or 0)).replace(",", "") or 0)
+            if not ordno or not code or qty <= 0:
+                continue
+            ord_dvsn = str(o.get("ord_dvsn_cd") or o.get("ORD_DVSN_CD") or o.get("ord_dvsn") or "01").strip() or "01"
+            try:
+                _cancel_order_generic(client, cano, acnt, ordno, code, qty, ord_dvsn)
+                n_ok += 1
+                time.sleep(0.5)
+            except Exception as e:
+                n_fail += 1
+                logger.warning(f"{ts_prefix()} [미체결취소실패] {code} ordno={ordno}: {e}")
+        _notify(f"{ts_prefix()} [미체결취소] 완료: 성공={n_ok} 실패={n_fail}", tele=True)
+        sys.stdout.write("\n")
+    except Exception as e:
+        _notify(f"{ts_prefix()} [미체결취소] 실패: {e}")
+        logger.warning(f"{ts_prefix()} [미체결취소] 실패: {e}")
+
+
+def _tele_balance_summary(title: str, now_str: str, dnca: float, ord_cash: float,
+                          tot_eval: float, eval_pfls: float, valid_rows: list[dict]) -> None:
+    """텔레그램 전용 잔고 요약 전송 (stdout 출력 없음)."""
+    tele_lines = [
+        f"[{title} {now_str}]",
+        f"출금가능 {dnca:,.0f}  주문가능 {ord_cash:,.0f}",
+        f"총평가 {tot_eval:,.0f}  평가손익 {eval_pfls:+,.0f}",
+    ]
+    if valid_rows:
+        tele_lines.append(f"보유 {len(valid_rows)}종목:")
+        for r in valid_rows:
+            code = str(r.get("pdno", "")).strip().zfill(6)
+            _tnm = str(r.get("hts_kor_isnm", "") or "").strip()
+            if not _tnm or _tnm == code:
+                _tnm = code_name_map.get(code, code)
+            psbl = int(float(str(r.get("ord_psbl_qty", 0) or 0).replace(",", "") or 0))
+            hldg = int(float(str(r.get("hldg_qty", 0) or 0).replace(",", "") or 0))
+            pchs = float(str(r.get("pchs_avg_pric", 0) or 0).replace(",", "") or 0)
+            rt   = float(str(r.get("evlu_pfls_rt", 0) or 0).replace(",", "") or 0)
+            tele_lines.append(f"  {_tnm}({code}) 보유={hldg} 매도가능={psbl} 매입단가={pchs:,.0f} 수익={rt:+.2f}%")
+    if tmsg is not None:
+        try:
+            tmsg("\n".join(tele_lines), "-t")
+        except Exception:
+            pass
+
+
+def _query_and_print_balance(label: str, *, trade_only: bool = True,
+                              tele_label: str | None = None) -> dict[str, dict]:
+    """
+    REST API(TTTC8434R) 잔고조회 → 상세 테이블 출력 → hold_map 반환.
+
+    반환: {종목코드(6자리): {"qty": 매도가능수량, "buy_price": 매입평균가}}
+    tele_label: 텔레그램 전송 시 사용할 라벨. None이면 전송 안 함.
+    실패 시 빈 dict 반환.
+    """
+    global _code_account_map
+    try:
+        # ── 잔고조회: kis_inquire_balance_simple.fetch_balance_simple() 재사용 ──
+        # 기존 _iter_enabled_accounts + _init_account_client + _get_balance_page 경로는
+        # 어떤 이유(토큰 캐시 / 클라이언트 초기화 / ConfigProxy 필드 매핑 등)로 out2 가
+        # all-zero 로 수신되는 사례가 있어, 검증된 심플 경로로 치환.
+        from kis_inquire_balance_simple import fetch_balance_simple
+
+        # 거래 대상 계좌 식별 (기본: default_user + main). 계좌별 alias 표기용.
+        enabled_accts = _iter_enabled_accounts(trade_only=trade_only)
+        if enabled_accts:
+            primary = enabled_accts[0]
+            alias = primary.get("alias", primary.get("account_id", "a1"))
+            primary_cano = str(primary.get("cano", "")).strip()
+            account_id = primary.get("account_id")
+        else:
+            alias = "a1"
+            primary_cano = ""
+            account_id = None
+
+        try:
+            res = fetch_balance_simple(config_path=str(CONFIG_PATH), account_id=account_id)
+        except Exception as e:
+            logger.warning(f"{ts_prefix()} [{label}] fetch_balance_simple 실패: {e}")
+            return {}
+
+        cano = res.get("cano") or primary_cano or "?"
+        if not res.get("ok"):
+            logger.warning(f"{ts_prefix()} [{label}] KIS 응답 오류: {res.get('raw', {}).get('msg1')}")
+        logger.info(f"[{label}] {alias}({cano}) 조회 완료")
+
+        # 보유종목 리스트 (심플 포맷) → 기존 테이블 출력 포맷에 맞춤
+        simple_holdings = res.get("holdings", [])
+        hold_rows: list[dict] = []
+        seen_codes: set[str] = set()
+        for h in simple_holdings:
+            c = str(h.get("pdno", "")).strip().zfill(6)
+            if not c or c == "000000" or c in seen_codes:
+                continue
+            seen_codes.add(c)
+            row = {
+                "pdno": c,
+                "hts_kor_isnm": h.get("hts_kor_isnm", ""),
+                "hldg_qty": h.get("hldg_qty", 0),
+                "ord_psbl_qty": h.get("ord_psbl_qty", 0),
+                "pchs_avg_pric": h.get("pchs_avg_pric", 0.0),
+                "prpr": h.get("prpr", 0.0),
+                "evlu_amt": h.get("evlu_amt", 0.0),
+                "evlu_pfls_amt": h.get("evlu_pfls_amt", 0.0),
+                "evlu_pfls_rt": h.get("evlu_pfls_rt", 0.0),
+                "_acct_alias": f"{alias}({cano})",
+            }
+            hold_rows.append(row)
+            if enabled_accts:
+                _code_account_map[c] = enabled_accts[0]
+
+        # ── 계좌 요약 ────────────────────────────────────────────────────────
+        summary = res.get("summary", {}) or {}
+        dnca      = float(summary.get("dnca_tot_amt", 0) or 0)
+        ord_cash  = float(summary.get("prvs_rcdl_excc_amt", 0) or 0)
+        tot_eval  = float(summary.get("tot_evlu_amt", 0) or 0)
+        buy_amt   = float(summary.get("thdt_buy_amt", 0) or 0)
+        sll_amt   = float(summary.get("thdt_sll_amt", 0) or 0)
+        eval_pfls = float(summary.get("evlu_pfls_smtm_amt", 0) or 0)
+
+        SEP = "─" * 66
+        now_str = datetime.now(KST).strftime("%H:%M:%S")
+
+        sum_row = {
+            "출금가능": f"{dnca:,.0f}", "주문가능": f"{ord_cash:,.0f}",
+            "총 평가금액": f"{tot_eval:,.0f}", "평가손익합계": f"{eval_pfls:+,.0f}",
+            "당일매수금액": f"{buy_amt:,.0f}", "당일매도금액": f"{sll_amt:,.0f}",
+        }
+        sum_cols = ["출금가능", "주문가능", "총 평가금액", "평가손익합계", "당일매수금액", "당일매도금액"]
+        sum_align = {c: "right" for c in sum_cols}
+        sum_tbl = print_table([sum_row], sum_cols, sum_align, no_print=True)
+
+        lines: list[str] = ["", SEP, f"[{label}] {now_str}", SEP, sum_tbl]
+
+        # ── 보유종목 상세 ────────────────────────────────────────────────────
+        hold_map: dict[str, dict] = {}
+        valid_rows = [
+            r for r in hold_rows
+            if int(float(str(r.get("hldg_qty", 0) or 0).replace(",", "") or 0)) > 0
+        ]
+
+        if valid_rows:
+            tbl_rows = []
+            for r in valid_rows:
+                code   = str(r.get("pdno", "")).strip().zfill(6)
+                _raw_nm = str(r.get("hts_kor_isnm", "") or "").strip()
+                if not _raw_nm or _raw_nm == code:
+                    _raw_nm = code_name_map.get(code, code)
+                if code in _no_sell_codes:
+                    _raw_nm = f"{_raw_nm}[NS]"
+                hldg   = int(float(str(r.get("hldg_qty", 0) or 0).replace(",", "") or 0))
+                psbl   = int(float(str(r.get("ord_psbl_qty", 0) or 0).replace(",", "") or 0))
+                pchs   = float(str(r.get("pchs_avg_pric", 0) or 0).replace(",", "") or 0)
+                prpr   = float(str(r.get("prpr", 0) or 0).replace(",", "") or 0)
+                evlu   = float(str(r.get("evlu_amt", 0) or 0).replace(",", "") or 0)
+                pfls   = float(str(r.get("evlu_pfls_amt", 0) or 0).replace(",", "") or 0)
+                rt     = float(str(r.get("evlu_pfls_rt", 0) or 0).replace(",", "") or 0)
+                if prpr == 0 and evlu > 0 and hldg > 0:
+                    prpr = evlu / hldg
+                elif prpr > 0 and hldg > 1 and abs(prpr - evlu) < 1:
+                    prpr = evlu / hldg
+                qty    = psbl if psbl > 0 else hldg
+                hold_map[code] = {"qty": qty, "buy_price": pchs}
+                tbl_rows.append({
+                    "코드": code, "종목명": _raw_nm,
+                    "보유": f"{hldg:,}", "매도가능": f"{psbl:,}",
+                    "매입단가": f"{pchs:,.0f}", "현재단가": f"{prpr:,.0f}",
+                    "평가금액": f"{evlu:,.0f}", "평가손익": f"{pfls:+,.0f}",
+                    "수익률": f"{rt:+.2f}%(▲)" if rt >= 29.5 else f"{rt:+.2f}%",
+                })
+            hold_cols = ["코드", "종목명", "보유", "매도가능", "매입단가", "현재단가", "평가금액", "평가손익", "수익률"]
+            hold_align = {"코드": "left", "종목명": "left", "보유": "right", "매도가능": "right",
+                          "매입단가": "right", "현재단가": "right", "평가금액": "right", "평가손익": "right", "수익률": "right"}
+            hold_tbl = print_table(tbl_rows, hold_cols, hold_align, no_print=True)
+            lines.append(SEP)
+            lines.append(f"  보유종목 {len(valid_rows)}건")
+            lines.append(hold_tbl)
+        else:
+            lines.append(SEP)
+            lines.append("  보유종목 없음")
+
+        lines.append(SEP)
+        lines.append("")
+        full_msg = "\n".join(lines)
+        sys.stdout.write(full_msg)
+        sys.stdout.flush()
+        logger.info(full_msg)
+        if tele_label:
+            _tele_balance_summary(tele_label, now_str, dnca, ord_cash, tot_eval, eval_pfls, valid_rows)
+
+        return hold_map
+
+    except Exception as e:
+        logger.warning(f"{ts_prefix()} [{label}] 조회 실패: {e}")
+        return {}
+
+
+def _run_balance_0758() -> dict[str, dict]:
+    """07:58 잔고조회 → NXT 프리마켓 보유종목 파악."""
+    global _balance_0758_done
+    if _balance_0758_done:
+        return {}
+    hold_map = _query_and_print_balance("07:58 잔고조회(NXT)", trade_only=True, tele_label="07:58 NXT잔고")
+    _balance_0758_done = True
+    return hold_map
+
+
+def _run_balance_0858() -> None:
+    """08:58 계좌잔고조회 1회 실행, 결과 출력. 모든 활성 계좌 순회."""
+    global _balance_0858_done
+    if _balance_0858_done:
+        return
+    _query_and_print_balance("08:58 잔고조회", trade_only=False, tele_label="08:58 잔고")
+    _balance_0858_done = True
+
+
+def _print_startup_balance() -> dict[str, dict]:
+    """
+    프로그램 시작 시 계좌 잔고조회 → 상세 출력 → balance_map 반환.
+
+    반환: {종목코드(6자리): {"qty": 매도가능수량, "buy_price": 매입평균가}}
+    실패 시 빈 dict 반환.
+    """
+    hold_map = _query_and_print_balance("시작 잔고조회", trade_only=True, tele_label="시작잔고")
+    if not hold_map:
+        _notify(f"{ts_prefix()} [시작잔고] 조회 실패 또는 보유종목 없음", tele=True)
+    return hold_map
+
+
+def _get_ccnl_notice_tr_key() -> str:
+    """H0STCNI0 체결통보 구독용 tr_key. 공식: my_htsid (HTS 로그인 ID). kis_devlp.yaml의 my_htsid 확인 필요."""
+    trenv = ka.getTREnv()
+    h = getattr(trenv, "my_htsid", "") if trenv else ""
+    if not h:
+        h = ka.getEnv().get("my_htsid", "")
+    return (h or "").strip()
+
+
+def _closing_buy_state_path() -> Path:
+    return TOP_RANK_OUT_DIR / f"closing_buy_state_{today_yymmdd}.json"
+
+
+def _closing_filled_path(yymmdd: str | None = None) -> Path:
+    return TOP_RANK_OUT_DIR / f"closing_filled_{yymmdd or today_yymmdd}.json"
+
+
+def _save_closing_filled() -> None:
+    """체결통보 수신 시 _closing_filled_by_code를 파일로 저장 (재시작 복원용)."""
+    global _closing_filled_by_code
+    if not _closing_filled_by_code:
+        return
+    path = _closing_filled_path()
+    TOP_RANK_OUT_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({str(k).zfill(6): v for k, v in _closing_filled_by_code.items()}, f)
+    except Exception as e:
+        logger.warning(f"{ts_prefix()} [종가매수] 체결 저장 실패: {e}")
+
+
+def _load_closing_filled(yymmdd: str | None = None) -> dict[str, int]:
+    """저장된 체결 수량 로드 (재시작 시 remain 계산용)."""
+    path = _closing_filled_path(yymmdd or today_yymmdd)
+    if not path.exists():
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return {str(k).zfill(6): int(v) for k, v in data.items() if v is not None}
+    except Exception as e:
+        logger.warning(f"{ts_prefix()} [종가매수] 체결 로드 실패: {e}")
+        return {}
+
+
+def _closing_exp_first_tick_path() -> Path:
+    """15:20 첫 예상체결가 저장 (재시작 시 모니터링 기준값 복원용)."""
+    return TOP_RANK_OUT_DIR / f"closing_exp_first_tick_{today_yymmdd}.json"
+
+
+def _save_exp_first_tick() -> None:
+    """_closing_exp_first_tick을 파일에 저장. 재시작 시 로드하여 모니터링 기준 복원."""
+    data = dict(_closing_exp_first_tick)
+    if not data:
+        return
+    path = _closing_exp_first_tick_path()
+    TOP_RANK_OUT_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+    except Exception as e:
+        logger.warning(f"{ts_prefix()} [종가모니터] 첫틱 저장 실패: {e}")
+
+
+def _load_exp_first_tick_from_wss(codes: list[str]) -> dict[str, float]:
+    """
+    저장된 parquet 파일에서 15:20~15:30 예상체결(is_real_ccnl=N) 첫 틱 조회.
+    closing_buy_state codes 대상. parts 및 FINAL parquet 파일에서 조회.
+    """
+    if not codes:
+        return {}
+    codes_set = {str(c).zfill(6) for c in codes}
+    today_ymd = datetime.now(KST).strftime("%Y-%m-%d")
+    ts_min = f"{today_ymd} 15:20:00"
+    ts_max = f"{today_ymd} 15:30:00"
+    result: dict[str, float] = {}
+    try:
+        # parquet 우선 (parts 백업용)
+        sources: list[Path] = []
+        if FINAL_PARQUET_PATH.exists() and _is_valid_parquet(FINAL_PARQUET_PATH):
+            sources.append(FINAL_PARQUET_PATH)
+        for p in sorted(PART_DIR.glob("*.parquet")):
+            if _is_valid_parquet(p):
+                sources.append(p)
+        if not sources:
+            return {}
+
+        dfs: list[pl.DataFrame] = []
+        for p in sources:
+            try:
+                dfs.append(pl.read_parquet(str(p)))
+            except Exception:
+                continue
+        if not dfs:
+            return {}
+        df = pl.concat(dfs, how="diagonal_relaxed")
+
+        # 코드 컬럼 탐색
+        code_col = next(
+            (c for c in ("mksc_shrn_iscd", "stck_shrn_iscd", "code") if c in df.columns), None
+        )
+        # H0STANC0(예상체결) 스키마: stck_prpr 우선
+        pr_col = "stck_prpr" if "stck_prpr" in df.columns else "antc_prce"
+        if not code_col or pr_col not in df.columns or "recv_ts" not in df.columns:
+            return {}
+
+        df = df.with_columns(
+            pl.col(code_col).cast(pl.Utf8).str.zfill(6).alias("_code"),
+            pl.col("recv_ts").cast(pl.Utf8).alias("_ts"),
+            pl.col(pr_col).cast(pl.Float64, strict=False).alias("_pr"),
+        ).filter(
+            pl.col("_code").is_in(codes_set)
+            & (pl.col("_ts").str.slice(0, 19) >= ts_min)
+            & (pl.col("_ts").str.slice(0, 19) < ts_max)
+        )
+        if "is_real_ccnl" in df.columns:
+            df = df.filter(pl.col("is_real_ccnl").cast(pl.Utf8).str.strip_chars() == "N")
+
+        if df.is_empty():
+            return {}
+
+        df = df.sort("_ts").group_by("_code").first()
+        for row in df.iter_rows(named=True):
+            c = str(row["_code"]).zfill(6)
+            if c in codes_set:
+                try:
+                    p = float(row["_pr"] or 0)
+                    if p > 0:
+                        result[c] = p
+                except Exception:
+                    pass
+    except Exception as e:
+        logger.warning(f"{ts_prefix()} [종가모니터] parquet 첫틱 조회 실패: {e}")
+    return result
+
+
+def _load_exp_first_tick(codes: list[str] | None = None) -> dict[str, float]:
+    """
+    재시작 시 15:20 첫 예상체결가 로드.
+    1) JSON(즉시저장) → 2) WSS parquet(보조, codes 미충족 시)
+    """
+    out: dict[str, float] = {}
+    path = _closing_exp_first_tick_path()
+    if path.exists():
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            out = {str(k).zfill(6): float(v) for k, v in data.items() if v is not None}
+        except Exception as e:
+            logger.warning(f"{ts_prefix()} [종가모니터] 첫틱 JSON 로드 실패: {e}")
+    if codes:
+        need = {str(c).zfill(6) for c in codes} - set(out.keys())
+        if need:
+            from_wss = _load_exp_first_tick_from_wss(list(need))
+            out.update(from_wss)
+            if from_wss:
+                logger.info(f"{ts_prefix()} [종가모니터] WSS parquet에서 첫틱 {len(from_wss)}건 보완")
+    return out
+
+
+def _save_closing_buy_state(
+    codes: list[str],
+    code_info: dict[str, dict],
+    orders: list[dict] | None = None,
+) -> None:
+    """15:19 선정 목록 + 주문 결과 저장."""
+    path = _closing_buy_state_path()
+    TOP_RANK_OUT_DIR.mkdir(parents=True, exist_ok=True)
+    data = {
+        "date": today_yymmdd,
+        "selected_at": datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S"),
+        "codes": list(codes),
+        "code_info": {k: dict(v) for k, v in code_info.items()},
+        "orders": orders or [],
+    }
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.warning(f"{ts_prefix()} [종가매수] state 저장 실패: {e}")
+
+
+def _save_str1_sell_state() -> None:
+    """_str1_sell_state를 closing_buy_state_{yymmdd}.json 의 sell_state 필드에 저장."""
+    if not _str1_sell_state:
+        return
+    path = _closing_buy_state_path()
+    if not path.exists():
+        return
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        with _str1_sell_state_lock:
+            data["sell_state"] = {k: dict(v) for k, v in _str1_sell_state.items()}
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.warning(f"{ts_prefix()} [str1_sell] state 저장 실패: {e}")
+
+
+def _get_balance_holdings() -> dict[str, dict]:
+    """
+    KIS API 잔고조회(TTTC8434R)로 실제 보유 종목·수량·매입단가 반환.
+    반환: {종목코드(6자리): {"qty": 보유수량, "buy_price": 매입평균가}}
+    모든 활성 계좌를 순회하여 합산. 실패 시 빈 dict 반환.
+    """
+    hold_map: dict[str, dict] = {}
+    # _code_account_map: 종목별 매도 시 사용할 계좌 정보 저장
+    global _code_account_map
+    accounts = _iter_enabled_accounts(trade_only=True)
+    if not accounts:
+        # V1 fallback
+        try:
+            cfg = _read_cfg() or load_config(str(CONFIG_PATH))
+            cano = str(cfg.get("cano", "")).strip()
+            acnt = str(cfg.get("acnt_prdt_cd", "01")).strip() or "01"
+            if not cano:
+                return {}
+            accounts = [{"account_id": "main", "alias": "a1", "cano": cano, "acnt_prdt_cd": acnt}]
+        except Exception:
+            return {}
+    for acct in accounts:
+        cano = acct["cano"]
+        acnt = acct.get("acnt_prdt_cd", "01") or "01"
+        alias = acct.get("alias", acct.get("account_id", "?"))
+        try:
+            client = _init_account_client(acct) if "appkey" in acct else (_top_client or _init_top_client())
+            ctx_fk, ctx_nk = "", ""
+            for _ in range(10):
+                out1, _, ctx_fk, ctx_nk = _get_balance_page(client, cano, acnt, "TTTC8434R", ctx_fk, ctx_nk)
+                rows = out1 if isinstance(out1, list) else ([out1] if isinstance(out1, dict) else [])
+                if not rows:
+                    break
+                for row in rows:
+                    c = str(row.get("pdno", "") or "").strip().zfill(6)
+                    if not c or c == "000000":
+                        continue
+                    qty = int(float(str(row.get("hldg_qty", 0) or 0).replace(",", "") or 0))
+                    psbl = int(float(str(row.get("ord_psbl_qty", 0) or 0).replace(",", "") or 0))
+                    pchs = float(str(row.get("pchs_avg_pric", 0) or 0).replace(",", "") or 0)
+                    effective_qty = psbl if psbl > 0 else 0  # 주문가능수량 기준 (매도완료 T+2 결제 전 hldg_qty 잔존 방지)
+                    if effective_qty <= 0:
+                        continue
+                    if c not in hold_map:
+                        hold_map[c] = {"qty": effective_qty, "buy_price": pchs}
+                        _code_account_map[c] = acct  # 해당 종목을 보유한 계좌 기록
+                    else:
+                        # 다른 계좌에도 동일 종목 보유 시 수량 합산
+                        hold_map[c]["qty"] += effective_qty
+                if not ctx_fk.strip() and not ctx_nk.strip():
+                    break
+            logger.info(f"[str1_sell] 잔고조회 {alias}({cano}): {sum(1 for c, v in hold_map.items() if _code_account_map.get(c) == acct and v.get('qty', 0) > 0)}종목")
+        except Exception as e:
+            logger.warning(f"{ts_prefix()} [str1_sell] 잔고조회 실패 {alias}({cano}): {e}")
+    return hold_map
+
+
+def _load_str1_sell_state_on_startup(balance_map: dict[str, dict] | None = None) -> None:
+    """
+    프로그램 시작 시 어제(또는 당일) closing_buy_state에서 매도 상태 복원.
+
+    1) JSON state의 filled_qty로 1차 수량 산정
+    2) KIS API 잔고조회로 실제 보유수량 검증
+       - balance_map이 전달된 경우: 재조회 없이 그대로 사용 (시작 시 이미 조회했으므로)
+       - balance_map이 None인 경우: _get_balance_holdings() 재호출
+       - 잔고에 있는 종목: 실제 보유수량을 사용 (JSON보다 정확)
+       - 잔고에 없는 종목(qty=0): 이미 매도됐거나 미체결 → 등록 스킵
+    3) 미매도 포지션을 _str1_sell_state에 등록, 구독 목록에도 추가
+    """
+    global _str1_sell_state
+    if not STR1_SELL_ENABLED or not CLOSE_BUY:
+        return
+
+    # 당일 state 우선, 없으면 전일 state
+    state = _load_closing_buy_state()
+    if not state or not state.get("orders"):
+        from datetime import timedelta
+        yesterday = (datetime.now(KST) - timedelta(days=1)).strftime("%y%m%d")
+        state = _load_closing_buy_state_by_date(yesterday)
+
+    filled_map    = _get_closing_filled_for_remain(state) if state and state.get("orders") else {}
+    existing_sell = state.get("sell_state") or {} if state else {}
+    code_info     = state.get("code_info") or {} if state else {}
+
+    # ── 잔고조회: 시작 시 전달받은 balance_map 우선 사용, 없으면 재조회 ──
+    if balance_map is not None:
+        logger.info(f"[str1_sell] 시작잔고 재사용: {len(balance_map)}종목")
+    else:
+        _notify(f"{ts_prefix()} [str1_sell] 잔고조회 시작 (보유수량 검증)…")
+        balance_map = _get_balance_holdings()
+        if balance_map:
+            logger.info(f"[str1_sell] 잔고조회 완료: {len(balance_map)}종목 {balance_map}")
+        else:
+            logger.warning("[str1_sell] 잔고조회 실패 → JSON state filled_qty로 fallback")
+
+    # 잔고에 아무것도 없으면 (빈 dict) → 포지션 없음 처리
+    if not balance_map:
+        _notify(f"{ts_prefix()} [str1_sell] 보유종목 없음 → 매도 모니터링 대상 없음")
+        return
+
+    # closing_buy_state orders가 없어도, 잔고에 있는 종목은 최소한 등록 시도
+    if not state or not state.get("orders"):
+        logger.info("[str1_sell] closing_buy_state 없음 → 잔고 보유 종목만으로 sell_state 구성")
+        # orders가 없으므로 balance_map 종목 전부를 대상으로 등록
+        added_for_sell: list[str] = []
+        with _str1_sell_state_lock:
+            for code, bm_val in balance_map.items():
+                if isinstance(bm_val, dict):
+                    qty = bm_val.get("qty", 0)
+                    buy_price = bm_val.get("buy_price", 0.0)
+                else:
+                    qty = bm_val
+                    buy_price = 0.0
+                if qty <= 0:
+                    continue
+                name = code_name_map.get(code, code)
+                _str1_sell_state[code] = {
+                    "sold": False, "sell_reason": "", "qty": qty,
+                    "sell_price": 0.0, "sell_time": "", "ordno": "",
+                    "pnl": 0.0, "ret_pct": 0.0,
+                    "buy_price": buy_price, "highest": 0.0,
+                    "name": name, "opening_call_auction_ordered": False,
+                    "balance_qty": qty,
+                }
+                added_for_sell.append(code)
+        if added_for_sell:
+            added_subs = _ensure_code_structs(added_for_sell)
+            with _lock:
+                # watchdog/top_rank_loop 에 의한 구독 해제 방지: _base_codes 에 추가
+                _base_codes.update(added_for_sell)
+                for c in added_for_sell:
+                    _top_added_codes.discard(c)
+            lines = [f"[str1_sell] 잔고 기반 포지션 등록 {len(added_for_sell)}건"]
+            for c in added_for_sell:
+                st = _str1_sell_state.get(c, {})
+                lines.append(f"  {st.get('name',c)}({c}) 수량={st.get('qty',0)}")
+            if added_subs:
+                lines.append(f"  구독 추가: {added_subs}")
+            msg = "\n".join(lines)
+            _notify(msg, tele=True)
+            logger.info(msg)
+            # H0STMKO0: a2 온디맨드로 이전 (상시구독 불필요)
+            # WSS 구독 재구성: 잔고 종목이 open_map 구성 이후에 추가된 경우 대비
+            _trigger_ws_rebuild()
+        return
+
+    added_for_sell: list[str] = []
+    skipped_zero:   list[str] = []
+
+    with _str1_sell_state_lock:
+        for o in state["orders"]:
+            code = str(o.get("code", "")).zfill(6)
+            if not code:
+                continue
+
+            # ① 이미 매도 완료된 종목: 상태 복원만
+            if code in existing_sell and existing_sell[code].get("sold"):
+                _str1_sell_state[code] = dict(existing_sell[code])
+                continue
+
+            # ② 실제 보유수량 결정
+            #    우선순위: 잔고조회 > JSON filled_qty
+            balance_buy_price = 0.0
+            if balance_map:
+                bm_val = balance_map.get(code, {})
+                if isinstance(bm_val, dict):
+                    actual_qty = bm_val.get("qty", 0)
+                    balance_buy_price = bm_val.get("buy_price", 0.0)
+                else:
+                    actual_qty = bm_val
+            else:
+                order_qty  = int(o.get("order_qty", o.get("qty", 0)))
+                actual_qty = min(order_qty, max(int(o.get("filled_qty", 0)), filled_map.get(code, 0)))
+
+            if actual_qty <= 0:
+                # 잔고 없음 → 이미 매도됐거나 미체결
+                skipped_zero.append(code)
+                continue
+
+            # ③ 미매도 포지션 등록
+            info       = code_info.get(code, {})
+            prev_close = float(info.get("prev_close") or 0)
+            name       = info.get("name") or code_name_map.get(code, code)
+            # buy_price: 잔고조회 매입단가 > prev_close(전일종가) 순으로 사용
+            effective_buy_price = balance_buy_price if balance_buy_price > 0 else prev_close
+            _str1_sell_state[code] = {
+                "sold":               False,
+                "sell_reason":        "",
+                "qty":                actual_qty,
+                "sell_price":         0.0,
+                "sell_time":          "",
+                "ordno":              "",
+                "pnl":                0.0,
+                "ret_pct":            0.0,
+                "buy_price":          effective_buy_price,
+                "highest":            0.0,
+                "name":               name,
+                "opening_call_auction_ordered":  False,
+                "balance_qty":        actual_qty,   # 잔고조회 원본 수량 (기록용)
+            }
+            added_for_sell.append(code)
+
+        # ── 잔고에 있지만 orders에 없는 종목 보충 등록 (전일 이전 매수 보유 종목) ──
+        if balance_map:
+            orders_codes = {str(o.get("code","")).zfill(6) for o in state["orders"]}
+            for code, bm_val in balance_map.items():
+                if code in orders_codes or code in _str1_sell_state:
+                    continue  # 이미 처리됨
+                if isinstance(bm_val, dict):
+                    qty = bm_val.get("qty", 0)
+                    buy_price = bm_val.get("buy_price", 0.0)
+                else:
+                    qty = bm_val
+                    buy_price = 0.0
+                if qty <= 0:
+                    continue
+                name = code_name_map.get(code, code)
+                _str1_sell_state[code] = {
+                    "sold": False, "sell_reason": "", "qty": qty,
+                    "sell_price": 0.0, "sell_time": "", "ordno": "",
+                    "pnl": 0.0, "ret_pct": 0.0,
+                    "buy_price": buy_price, "highest": 0.0,
+                    "name": name, "opening_call_auction_ordered": False,
+                    "balance_qty": qty,
+                }
+                added_for_sell.append(code)
+                logger.info(f"[str1_sell] 잔고 보충 등록: {name}({code}) qty={qty} buy_price={buy_price}")
+
+    if skipped_zero:
+        logger.info(f"[str1_sell] 잔고 없어 스킵(미체결 or 기매도): {skipped_zero}")
+
+    if added_for_sell:
+        added_subs = _ensure_code_structs(added_for_sell)
+        with _lock:
+            # watchdog/top_rank_loop 에 의한 구독 해제 방지: _base_codes 에 추가
+            _base_codes.update(added_for_sell)
+            for c in added_for_sell:
+                _top_added_codes.discard(c)
+        lines = [f"[str1_sell] 미매도 포지션 복원 {len(added_for_sell)}건"]
+        for c in added_for_sell:
+            st = _str1_sell_state.get(c, {})
+            lines.append(f"  {st.get('name',c)}({c}) 수량={st.get('qty',0)}")
+        if added_subs:
+            lines.append(f"  구독 추가: {added_subs}")
+        msg = "\n".join(lines)
+        _notify(msg, tele=True)
+        logger.info(msg)
+        # H0STMKO0: a2 온디맨드로 이전 (상시구독 불필요)
+        # WSS 구독 재구성: 잔고 종목이 open_map 구성 이후에 추가된 경우 대비
+        _trigger_ws_rebuild()
+
+
+# ── no_sell_codes 로드/갱신/추가 ─────────────────────────────────────────────
+
+def _load_no_sell_codes() -> None:
+    """시작 시 config.json에서 no_sell_codes 로드."""
+    global _no_sell_codes
+    cfg = _read_cfg()
+    if not cfg:
+        return
+    raw = cfg.get("no_sell_codes", [])
+    if isinstance(raw, list):
+        _no_sell_codes = {str(c).strip().zfill(6) for c in raw if str(c).strip()}
+    if _no_sell_codes:
+        msg = f"{ts_prefix()} [no_sell] 매도금지 종목 로드: {sorted(_no_sell_codes)}"
+        _notify(msg, tele=True)
+        logger.info(msg)
+
+
+def _refresh_no_sell_from_cfg(cfg: dict) -> None:
+    """_check_external_orders() 에서 매 사이클 호출 → 변경 감지 시 갱신."""
+    global _no_sell_codes
+    raw = cfg.get("no_sell_codes", [])
+    new_set: set[str] = set()
+    if isinstance(raw, list):
+        new_set = {str(c).strip().zfill(6) for c in raw if str(c).strip()}
+    if new_set != _no_sell_codes:
+        added = new_set - _no_sell_codes
+        removed = _no_sell_codes - new_set
+        _no_sell_codes = new_set
+        parts = []
+        if added:
+            parts.append(f"추가={sorted(added)}")
+        if removed:
+            parts.append(f"해제={sorted(removed)}")
+        msg = f"{ts_prefix()} [no_sell] 매도금지 변경: {', '.join(parts)}"
+        _notify(msg, tele=True)
+        logger.info(msg)
+
+
+def _add_no_sell_code(code: str, source: str = "") -> None:
+    """런타임 추가 + config.json에 영구 저장."""
+    global _no_sell_codes
+    code = str(code).strip().zfill(6)
+    if code in _no_sell_codes:
+        return
+    _no_sell_codes.add(code)
+    # config.json에 저장
+    try:
+        cfg = _read_cfg()
+        if cfg is not None:
+            ns_list = cfg.get("no_sell_codes", [])
+            if not isinstance(ns_list, list):
+                ns_list = []
+            if code not in ns_list:
+                ns_list.append(code)
+            cfg["no_sell_codes"] = ns_list
+            save_config(cfg, str(CONFIG_PATH))
+    except Exception as e:
+        logger.warning(f"[no_sell] config 저장 실패: {e}")
+    src_label = f" (source={source})" if source else ""
+    msg = f"{ts_prefix()} [no_sell] 매도금지 추가: {code}{src_label}"
+    _notify(msg, tele=True)
+    logger.info(msg)
+
+
+def _str1_sell_worker() -> None:
+    """
+    별도 스레드: _str1_sell_queue에서 매도/취소 요청을 꺼내 KIS API로 처리.
+    - action=="sell": 매도 주문
+    - action=="cancel": 장전 매도 주문 취소 (09:00 전까지)
+    ingest_loop(hot path)과 분리하여 API 지연이 틱 처리를 막지 않도록 함.
+    """
+    logger.info("[str1_sell] worker started")
+    while not _stop_event.is_set() or not _str1_sell_queue.empty():
+        try:
+            req = _str1_sell_queue.get(timeout=0.5)
+        except queue.Empty:
+            continue
+        if req is None:
+            break
+        action = req.get("action", "sell")
+        code   = req["code"]
+        name   = req.get("name", code)
+
+        if action == "cancel":
+            # ── 동시호가 매도 주문 취소 ──
+            qty   = int(req.get("qty", 0))
+            ordno = str(req.get("ordno", "")).strip()
+            reason = req.get("reason", "")
+            try:
+                if not ordno or qty <= 0:
+                    logger.warning(f"[str1_sell] 취소 스킵 {code}: ordno/수량 없음")
+                    continue
+                # 종목별 보유 계좌로 취소 (syw_2 등 서브계좌 지원)
+                acct = _code_account_map.get(code)
+                if acct:
+                    cano = acct["cano"]
+                    acnt = acct.get("acnt_prdt_cd", "01") or "01"
+                    client = _init_account_client(acct)
+                else:
+                    cfg = _read_cfg() or load_config(str(CONFIG_PATH))
+                    cano = str(cfg.get("cano", "")).strip()
+                    acnt = str(cfg.get("acnt_prdt_cd", "01")).strip() or "01"
+                    client = _top_client or _init_top_client()
+                if not cano:
+                    logger.warning(f"[str1_sell] config cano 없음 → {code} 취소 스킵")
+                    continue
+                logger.info(
+                    f"{ts_prefix()} [str1_sell] ■ 동시호가매도 취소 API호출 {name}({code})"
+                    f"  tr_id=TTTC0803U  원주문번호={ordno}  수량={qty}  사유={reason}"
+                )
+                _cancel_order_generic(client, cano, acnt, ordno, code, qty, ord_dvsn="01")
+                with _str1_sell_state_lock:
+                    st = _str1_sell_state.get(code, {})
+                    _str1_sell_state[code] = {
+                        **st,
+                        "opening_call_auction_ordered": False,
+                        "opening_call_auction_cancel_requested": False,
+                        "cancel_retry_cnt": 0,
+                        "ordno": "",
+                    }
+                    _opening_call_auction_cancelled_log.append((code, name, reason))
+                _save_str1_sell_state()
+                msg = (
+                    f"{ts_prefix()} [str1_sell] ✔ 동시호가매도 취소완료 {name}({code})"
+                    f"  tr_id=TTTC0803U  원주문번호={ordno}  수량={qty}  사유={reason}"
+                )
+                _notify(msg, tele=True)
+                logger.info(msg)
+            except Exception as e:
+                with _str1_sell_state_lock:
+                    if code in _str1_sell_state:
+                        retry_cnt = _str1_sell_state[code].get("cancel_retry_cnt", 0) + 1
+                        _str1_sell_state[code]["cancel_retry_cnt"] = retry_cnt
+                        if retry_cnt >= 5:
+                            # 5회 실패 → 재시도 포기 (플래그 True로 설정하여 재큐잉 차단)
+                            _str1_sell_state[code]["opening_call_auction_cancel_requested"] = True
+                            logger.error(f"[str1_sell] 동시호가매도 취소 {retry_cnt}회 실패 → 재시도 중단 {name}({code}) err={e}")
+                            _notify(f"{ts_prefix()} [str1_sell] 동시호가매도 취소 {retry_cnt}회 실패→포기 {name}({code})", tele=True)
+                        else:
+                            # 재시도 허용 (플래그 해제)
+                            _str1_sell_state[code]["opening_call_auction_cancel_requested"] = False
+                            logger.error(f"[str1_sell] 동시호가매도 취소실패 ({retry_cnt}/5) {code}: {e}")
+                            _notify(f"{ts_prefix()} [str1_sell] 동시호가매도 취소실패 ({retry_cnt}/5) {name}({code}) err={e}", tele=True)
+            continue
+
+        # ── 매도 주문 ──
+        qty       = int(req.get("qty", 0))
+        reason    = req.get("reason", "")
+        ref_price = req.get("ref_price", 0.0)
+        ord_dvsn  = req.get("ord_dvsn", "01")
+        sell_price = req.get("price", 0.0)
+        cndt_pric  = req.get("cndt_pric", 0.0)
+        ord_dvsn_name = {"00": "지정가", "01": "시장가", "02": "시간외종가", "05": "장전시간외", "06": "장후시간외", "07": "시간외단일가", "22": "스톱지정가"}.get(ord_dvsn, ord_dvsn)
+        retry_after_cancel = False   # 미체결 취소 후 재주문 플래그
+        try:
+            # 종목별 보유 계좌로 매도 (syw_2 등 서브계좌 지원)
+            acct = _code_account_map.get(code)
+            if acct:
+                cano = acct["cano"]
+                acnt = acct.get("acnt_prdt_cd", "01") or "01"
+                client = _init_account_client(acct)
+                alias = acct.get("alias", acct.get("account_id", "?"))
+                logger.info(f"[str1_sell] {name}({code}) → {alias}({cano}) 계좌로 매도")
+            else:
+                cfg = _read_cfg() or load_config(str(CONFIG_PATH))
+                cano = str(cfg.get("cano", "")).strip()
+                acnt = str(cfg.get("acnt_prdt_cd", "01")).strip() or "01"
+                client = _top_client or _init_top_client()
+            if not cano:
+                logger.warning(f"[str1_sell] config cano 없음 → {code} 매도 스킵")
+                continue
+
+            is_stop_limit = (ord_dvsn == "22")
+            is_opening_call_auction = reason.startswith("str1_시초가하락_예상")
+            sell_label = "스톱지정가매도" if is_stop_limit else ("동시호가매도" if is_opening_call_auction else "매도")
+            if is_stop_limit:
+                price_info = f"  조건가={cndt_pric:,.0f}  지정가={sell_price:,.0f}"
+            elif ord_dvsn not in ORD_DVSN_NO_PRICE:
+                price_info = f"  주문가={ref_price:,.0f}"
+            else:
+                price_info = ""
+            api_call_msg = (
+                f"{ts_prefix()} [str1_sell] ■ {sell_label}주문 API호출 {name}({code})"
+                f"  tr_id=TTTC0801U  수량={qty}  주문방식={ord_dvsn_name}({ord_dvsn}){price_info}"
+                f"  사유={reason}"
+            )
+            _notify(api_call_msg, tele=True)
+            logger.info(api_call_msg)
+            j = _sell_order_cash(
+                client, cano, acnt, code, qty,
+                price=sell_price, ord_dvsn=ord_dvsn, cndt_pric=cndt_pric,
+            )
+            out = j.get("output") or {}
+            ordno = str(out.get("ODNO") or out.get("odno") or "").strip()
+
+            with _str1_sell_state_lock:
+                st = _str1_sell_state.get(code, {})
+                buy_price = st.get("buy_price") or ref_price
+            pnl_info = calc_sell_pnl(buy_price, ref_price, qty) if buy_price > 0 else {}
+            with _str1_sell_state_lock:
+                st = _str1_sell_state.get(code, {})
+                sell_ts = datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S")
+                new_st = {
+                    **st,
+                    "sell_reason": reason,
+                    "sell_price": ref_price,
+                    "ordno": ordno,
+                }
+                if is_stop_limit:
+                    # 스톱지정가: 조건 미충족 시 미체결 → sold=False 유지, 일반 매도 계속 가능
+                    new_st["stop_limit_ordered"] = True
+                    new_st["sold"] = False
+                elif is_opening_call_auction:
+                    # 동시호가 매도: 09:00 시초가에 체결 예정 → sold=False, opening_call_auction_ordered=True
+                    # 이후 예상가 복귀 시 취소 가능
+                    new_st["opening_call_auction_ordered"] = True
+                    new_st["sold"] = False
+                else:
+                    new_st["sold"] = True
+                    new_st["sell_time"] = sell_ts
+                    new_st["pnl"] = pnl_info.get("pnl", 0.0)
+                    new_st["ret_pct"] = pnl_info.get("ret_pct", 0.0)
+                _str1_sell_state[code] = new_st
+            _save_str1_sell_state()
+
+            pnl_txt = f"  PNL≈{pnl_info.get('pnl', 0):+,.0f}원  ret≈{pnl_info.get('ret_pct', 0):+.2f}%" if pnl_info else ""
+            opening_call_auction_suffix = " → 09:00 시초가 체결대기(복귀 시 취소가능)" if is_opening_call_auction else ""
+            msg = (
+                f"{ts_prefix()} [str1_sell] ✔ {sell_label}주문 접수완료 {name}({code})"
+                f"  tr_id=TTTC0801U  주문번호={ordno}  수량={qty}"
+                f"  주문방식={ord_dvsn_name}({ord_dvsn}){price_info}"
+                f"  사유={reason}{pnl_txt}{opening_call_auction_suffix}"
+            )
+            _notify(msg, tele=True)
+            logger.info(msg)
+            # 매도 성공 시 EMA 데드크로스 상태 해제
+            _ema_sell_cond.pop(code, None)
+            _up_trend_state.pop(code, None)
+            # VI 포지션 정리
+            if code in _vi_positions:
+                _vi_positions[code]["sold"] = True
+            # H0STMKO0: a2 온디맨드 → 매도완료 시 별도 해제 불필요
+            # 거래장부 기록
+            with _str1_sell_state_lock:
+                bp = _str1_sell_state.get(code, {}).get("buy_price", 0.0)
+            _is_market = ord_dvsn == "01"
+            _append_ledger(
+                order_type="sell_order",
+                code=code, name=name,
+                buy_price=float(bp or 0),
+                sell_price=0.0 if _is_market else float(ref_price or 0),
+                order_qty=qty,
+                reason=f"{reason}_주문",
+                ord_no=ordno,
+                ord_dvsn=f"{ord_dvsn}({ord_dvsn_name})",
+                prdy_ctrt=float(_last_prdy_ctrt.get(code, 0.0)),
+                stck_prpr=float(ref_price or 0),
+            )
+
+        except Exception as e:
+            err_str = str(e)
+            logger.error(
+                f"[str1_sell] 매도주문 실패 {name}({code})"
+                f"  수량={qty}  기준가={ref_price:,.0f}  주문방식={ord_dvsn_name}({ord_dvsn})"
+                f"  사유={reason}  에러={e}"
+            )
+
+            # ── 수량 초과(APBK0400) → 미체결 매도주문 취소 후 재주문 ──
+            if "APBK0400" in err_str or "수량을 초과" in err_str:
+                try:
+                    logger.info(f"[str1_sell] 수량초과 → {name}({code}) 미체결 매도주문 조회/취소 시도")
+                    n_cancelled = _cancel_open_sell_orders_for_code(client, cano, acnt, code)
+                    if n_cancelled > 0:
+                        logger.info(f"[str1_sell] {name}({code}) 미체결 매도 {n_cancelled}건 취소 완료 → 재주문 예정")
+                        retry_after_cancel = True
+                    else:
+                        logger.warning(f"[str1_sell] {name}({code}) 취소할 미체결 매도주문 없음")
+                except Exception as ce:
+                    logger.error(f"[str1_sell] {name}({code}) 미체결 매도 취소 중 에러: {ce}")
+
+            if not retry_after_cancel:
+                _notify(
+                    f"{ts_prefix()} [str1_sell] 매도실패 {name}({code})"
+                    f"  수량={qty}  기준가={ref_price:,.0f}  주문방식={ord_dvsn_name}({ord_dvsn})"
+                    f"  사유={reason} err={e}",
+                    tele=True,
+                )
+                # 주문 실패 시 sell_ordered/sold 복구 → 재시도 가능
+                with _str1_sell_state_lock:
+                    if code in _str1_sell_state:
+                        _str1_sell_state[code]["sell_ordered"] = False
+                        _str1_sell_state[code]["sold"] = False
+
+        # ── 미체결 취소 후 재주문 ──
+        if retry_after_cancel:
+            time.sleep(0.5)  # 취소 반영 대기
+            try:
+                logger.info(
+                    f"[str1_sell] 재주문 시도 {name}({code})"
+                    f"  수량={qty}  기준가={ref_price:,.0f}  주문방식={ord_dvsn_name}({ord_dvsn})"
+                )
+                j2 = _sell_order_cash(client, cano, acnt, code, qty, ord_dvsn=ord_dvsn)
+                out2 = j2.get("output") or {}
+                ordno2 = str(out2.get("ODNO") or out2.get("odno") or "").strip()
+                is_opening_call_auction = reason.startswith("str1_시초가하락_예상")
+                with _str1_sell_state_lock:
+                    st = _str1_sell_state.get(code, {})
+                    buy_price = st.get("buy_price") or ref_price
+                pnl_info = calc_sell_pnl(buy_price, ref_price, qty) if buy_price > 0 else {}
+                with _str1_sell_state_lock:
+                    st = _str1_sell_state.get(code, {})
+                    sell_ts = datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S")
+                    new_st = {
+                        **st,
+                        "sell_reason": reason,
+                        "sell_price": ref_price,
+                        "ordno": ordno2,
+                    }
+                    if is_opening_call_auction:
+                        new_st["opening_call_auction_ordered"] = True
+                        new_st["sold"] = False
+                    else:
+                        new_st["sold"] = True
+                        new_st["sell_time"] = sell_ts
+                        new_st["pnl"] = pnl_info.get("pnl", 0.0)
+                        new_st["ret_pct"] = pnl_info.get("ret_pct", 0.0)
+                    _str1_sell_state[code] = new_st
+                _save_str1_sell_state()
+
+                pnl_txt = f"  PNL≈{pnl_info.get('pnl', 0):+,.0f}원  ret≈{pnl_info.get('ret_pct', 0):+.2f}%" if pnl_info else ""
+                msg = (
+                    f"{ts_prefix()} [str1_sell] 재주문 성공 {name}({code})"
+                    f"  주문번호={ordno2}  수량={qty}  기준가={ref_price:,.0f}"
+                    f"  주문방식={ord_dvsn_name}({ord_dvsn})  사유={reason}{pnl_txt}"
+                )
+                _notify(msg, tele=True)
+                logger.info(msg)
+                # H0STMKO0: a2 온디맨드 → 매도완료 시 별도 해제 불필요
+                with _str1_sell_state_lock:
+                    bp = _str1_sell_state.get(code, {}).get("buy_price", 0.0)
+                _is_market2 = ord_dvsn == "01"
+                _append_ledger(
+                    order_type="sell_order",
+                    code=code, name=name,
+                    buy_price=float(bp or 0),
+                    sell_price=0.0 if _is_market2 else float(ref_price or 0),
+                    order_qty=qty,
+                    reason=f"{reason}_주문(미체결취소후재주문)",
+                    ord_no=ordno2,
+                    ord_dvsn=f"{ord_dvsn}({ord_dvsn_name})",
+                    prdy_ctrt=float(_last_prdy_ctrt.get(code, 0.0)),
+                    stck_prpr=float(ref_price or 0),
+                )
+            except Exception as e2:
+                logger.error(
+                    f"[str1_sell] 재주문도 실패 {name}({code})"
+                    f"  수량={qty}  기준가={ref_price:,.0f}  에러={e2}"
+                )
+                _notify(
+                    f"{ts_prefix()} [str1_sell] 재주문실패 {name}({code})"
+                    f"  수량={qty}  기준가={ref_price:,.0f}  주문방식={ord_dvsn_name}({ord_dvsn})"
+                    f"  사유={reason} err={e2}",
+                    tele=True,
+                )
+                with _str1_sell_state_lock:
+                    if code in _str1_sell_state:
+                        _str1_sell_state[code]["sell_ordered"] = False
+                        _str1_sell_state[code]["sold"] = False
+
+    logger.info("[str1_sell] worker stopped")
+
+
+# 15:19:30 일괄 매도 — 1일 1회 실행 플래그
+_sell_1518_done: bool = False
+
+
+def _run_sell_1518() -> None:
+    """
+    15:19:30 조건부 전체 매도.
+
+    - _str1_sell_state 에 등록된 미매도 포지션을 전부 점검
+    - 보유 조건: 전일대비 20% 이상 AND 당일 최고가 대비 현재가 -5% 이내
+    - 위 조건 미충족 종목은 즉시 시장가 매도
+    - 하루 1회만 실행
+    """
+    global _sell_1518_done
+    if _sell_1518_done:
+        return
+
+    KEEP_THRESHOLD = 20.0   # 전일대비 이 값 이상이면 보유 후보
+    HIGH_MARGIN = 0.05      # 당일 최고가 대비 5% 이내
+
+    if not STR1_SELL_ENABLED:
+        _sell_1518_done = True
+        if not _str1_sell_state:
+            _notify(f"{ts_prefix()} [일괄매도] 15:19:30 시작 | 보유종목 0건 | 매도대상 없음", tele=True)
+        return
+
+    if not _str1_sell_state:
+        _sell_1518_done = True
+        _notify(f"{ts_prefix()} [일괄매도] 15:19:30 시작 | 보유종목 0건 | 매도대상 없음", tele=True)
+        return
+
+    sell_list: list[tuple] = []
+    keep_list: list[str] = []
+
+    # 현재가/고가 조회용 클라이언트
+    client = _top_client or _init_top_client()
+
+    with _str1_sell_state_lock:
+        active_positions = {
+            code: dict(st)
+            for code, st in _str1_sell_state.items()
+            if not st.get("sold") and not st.get("sell_ordered")
+        }
+
+    for code, st in active_positions.items():
+        prdy = float(_last_prdy_ctrt.get(code, 0.0))
+        name = code_name_map.get(code, code)
+
+        # 고가 대비 현재가 확인 (REST API)
+        high_ratio = 1.0  # 기본값: 고가 = 현재가
+        try:
+            resp = client.inquire_price(code)
+            stck_prpr = float(str(resp.get("stck_prpr") or 0).replace(",", "") or 0)
+            stck_hgpr = float(str(resp.get("stck_hgpr") or 0).replace(",", "") or 0)
+            if stck_hgpr > 0 and stck_prpr > 0:
+                high_ratio = stck_prpr / stck_hgpr
+        except Exception:
+            pass
+
+        # 보유 조건: 전일대비 20%+ AND 고가 대비 -5% 이내
+        keep = (prdy >= KEEP_THRESHOLD) and (high_ratio >= (1 - HIGH_MARGIN))
+        if keep:
+            keep_list.append(f"{name}({code}) {prdy:+.1f}% 고가비={high_ratio:.1%}")
+        else:
+            sell_list.append((code, prdy, high_ratio))
+
+    total = len(active_positions)
+    lines = [
+        f"[일괄매도] 15:19:30 시작 | 보유종목 {total}건 | "
+        f"매도 {len(sell_list)}건 / 유지 {len(keep_list)}건 "
+        f"(기준: 전일대비 {KEEP_THRESHOLD}%+ AND 고가대비 -{HIGH_MARGIN*100:.0f}% 이내)"
+    ]
+    if keep_list:
+        lines.append(f"  유지: {', '.join(keep_list)}")
+    if sell_list:
+        sell_desc = [f"{code_name_map.get(c,c)}({c}) {p:+.1f}% 고가비={h:.1%}" for c, p, h in sell_list]
+        lines.append(f"  매도: {', '.join(sell_desc)}")
+    _notify("\n".join(lines), tele=True)
+    logger.info("\n".join(lines))
+
+    for code, prdy, _ in sell_list:
+        reason = f"일괄매도(prdy_ctrt={prdy:+.1f}%)"
+        with _str1_sell_state_lock:
+            bp = float(_str1_sell_state.get(code, {}).get("buy_price", 0) or 0)
+        ref_price = bp * (1 + prdy / 100) if bp > 0 and abs(prdy) < 100 else 0.0
+        _enqueue_str1_sell(code, reason, ref_price)
+
+    _sell_1518_done = True
+
+
+def _enqueue_str1_sell(
+    code: str, reason: str, ref_price: float,
+    ord_dvsn: str = "01", price: float = 0.0, cndt_pric: float = 0.0,
+) -> None:
+    """ingest_loop에서 호출: 매도 조건 충족 시 sell worker에 비동기 주문 요청."""
+    if code in _no_sell_codes:
+        logger.debug(f"{ts_prefix()} [no_sell] 매도 차단: {code} 사유={reason}")
+        return
+    is_stop_limit = (ord_dvsn == "22")
+    with _str1_sell_state_lock:
+        st = _str1_sell_state.get(code)
+        if not st or st.get("sold"):
+            return
+        if st.get("sell_ordered"):
+            return  # 이미 매도 주문 진행 중 → 중복 방지
+        if is_stop_limit and st.get("stop_limit_ordered"):
+            return  # 스톱지정가 중복 방지
+        if reason.startswith("str1_시초가하락_예상") and st.get("opening_call_auction_ordered"):
+            return  # 사전 매도 주문 중복 방지
+        qty  = int(st.get("qty") or 0)
+        name = st.get("name", code)
+        if qty <= 0:
+            return
+        # 상태 선점 (중복 큐잉 방지)
+        is_opening_call_auction = reason.startswith("str1_시초가하락_예상")
+        if is_stop_limit:
+            _str1_sell_state[code]["stop_limit_ordered"] = True
+            # sold=True 하지 않음 — 조건 미충족 시 미체결이므로 일반 매도 계속 가능
+        elif is_opening_call_auction:
+            _str1_sell_state[code]["sell_ordered"] = True
+            _str1_sell_state[code]["opening_call_auction_ordered"] = True
+        else:
+            _str1_sell_state[code]["sell_ordered"] = True
+            _str1_sell_state[code]["sold"] = True  # 낙관적 선점
+    sell_type = "스톱지정가매도" if is_stop_limit else ("동시호가매도" if is_opening_call_auction else "매도")
+    logger.info(
+        f"{ts_prefix()} [str1_sell] ▶ {sell_type} 큐등록 {name}({code})"
+        f"  수량={qty}  기준가={ref_price:,.0f}  사유={reason}"
+    )
+    _str1_sell_queue.put({
+        "action": "sell",
+        "code": code, "qty": qty, "reason": reason,
+        "ref_price": ref_price, "name": name,
+        "ord_dvsn": ord_dvsn, "price": price, "cndt_pric": cndt_pric,
+    })
+
+
+_periodic_sell_check_ts: float = 0.0   # 마지막 주기적 매도 체크 시각
+PERIODIC_SELL_CHECK_SEC: float = 15.0  # 주기 체크 (초) — 메인은 틱 기반
+
+
+def _check_sell_by_prdy_ctrt_periodic() -> None:
+    """
+    틱 수신과 무관하게 주기적으로 _last_prdy_ctrt 캐시를 확인해
+    전일종가 이하 하락 포지션을 즉시 시장가 매도.
+
+    - 메인 매도 판단은 ingest_loop의 _check_str1_sell_conditions (틱 기반)
+    - 이 함수는 저거래량 종목(틱 미수신) 누락 보완용 주기 체크 (15초 간격)
+    - scheduler_loop 에서 호출
+    - 정규장(09:00~15:20) 시간대에만 동작
+    """
+    global _periodic_sell_check_ts
+    if not STR1_SELL_ENABLED or not _str1_sell_state:
+        return
+
+    now_t = datetime.now(KST).time()
+    if not (dtime(9, 0) <= now_t < dtime(15, 20)):
+        return
+
+    if (time.time() - _periodic_sell_check_ts) < PERIODIC_SELL_CHECK_SEC:
+        return
+    _periodic_sell_check_ts = time.time()
+
+    sold_list: list[str] = []
+    with _str1_sell_state_lock:
+        targets = [
+            (code, dict(st))
+            for code, st in _str1_sell_state.items()
+            if not st.get("sold") and not st.get("sell_ordered") and not st.get("opening_call_auction_ordered")
+            and code not in _no_sell_codes
+        ]
+
+    for code, st in targets:
+        bp = float(st.get("buy_price") or 0)
+        if bp <= 0:
+            continue
+        cur_price = _last_stck_prpr.get(code, 0.0)
+        if cur_price <= 0:
+            continue
+        if cur_price < bp * 0.97:
+            reason = f"3%손절-주기체크(cur={cur_price:.0f}/buy={bp:.0f}={cur_price/bp*100-100:+.2f}%)"
+            _enqueue_str1_sell(code, reason, cur_price)
+            sold_list.append(f"{st.get('name', code)}({code}) {cur_price/bp*100-100:+.1f}%")
+
+    if sold_list:
+        msg = f"{ts_prefix()} [주기매도체크] 틱기반매도 미실행 → 캐시확인 매도 {len(sold_list)}건: {', '.join(sold_list)}"
+        _notify(msg, tele=True)
+        logger.info(msg)
+
+
+def _enqueue_str1_opening_call_auction_cancel(code: str, reason: str) -> None:
+    """ingest_loop에서 호출: 장전 매도 주문 후 예상가 복귀 시 취소 요청."""
+    with _str1_sell_state_lock:
+        st = _str1_sell_state.get(code)
+        if not st or st.get("sold"):
+            return
+        if not st.get("opening_call_auction_ordered"):
+            return
+        ordno = str(st.get("ordno", "")).strip()
+        if not ordno:
+            return  # worker가 아직 주문 처리 전
+        if st.get("opening_call_auction_cancel_requested"):
+            return  # 중복 취소 방지
+        if st.get("cancel_retry_cnt", 0) >= 5:
+            return  # 5회 실패 → 재시도 차단
+        qty = int(st.get("qty") or 0)
+        name = st.get("name", code)
+        if qty <= 0:
+            return
+        _str1_sell_state[code]["opening_call_auction_cancel_requested"] = True
+    logger.info(
+        f"{ts_prefix()} [str1_sell] ▶ 동시호가매도 취소 큐등록 {name}({code})"
+        f"  수량={qty}  원주문번호={ordno}  사유={reason}"
+    )
+    _str1_sell_queue.put({
+        "action": "cancel",
+        "code": code, "qty": qty, "ordno": ordno, "reason": reason, "name": name,
+    })
+
+
+_ccnl_notice_header_written = False
+
+_CCNL_CSV_COLUMNS = [
+    "date", "time", "cust_id", "acnt_no", "stck_shrn_iscd", "cntg_isnm40",
+    "oder_no", "cntg_qty", "cntg_unpr", "stck_cntg_hour",
+    "cntg_yn", "acpt_yn", "acnt_no2", "oder_qty", "seln_byov_cls",
+    "rctf_cls", "oder_kind", "oder_cond", "rfus_yn", "brnc_no",
+    "acnt_name", "ord_cond_prc", "ord_exg_gb", "popup_yn", "filler",
+    "crdt_cls", "crdt_loan_date", "oder_prc",
+]
+
+def _write_ccnl_notice_log(df, recv_ts: str) -> None:
+    """H0STCNI0 체결통보 수신 데이터를 CSV 파일에 저장."""
+    global _ccnl_notice_header_written
+    try:
+        parts = recv_ts.split(" ", 1)
+        date_str = parts[0]
+        time_str = parts[1] if len(parts) > 1 else ""
+
+        out = df.copy()
+        out.insert(0, "date", date_str)
+        out.insert(1, "time", time_str)
+
+        # 없는 컬럼은 빈 값으로 추가
+        for c in _CCNL_CSV_COLUMNS:
+            if c not in out.columns:
+                out[c] = ""
+        out = out[_CCNL_CSV_COLUMNS]
+
+        with open(CCNL_NOTICE_CSV_PATH, "a", encoding="utf-8") as f:
+            if not _ccnl_notice_header_written:
+                f.write(",".join(_CCNL_CSV_COLUMNS) + "\n")
+                _ccnl_notice_header_written = True
+            for _, row in out.iterrows():
+                f.write(",".join(str(row[c]) for c in _CCNL_CSV_COLUMNS) + "\n")
+    except Exception as e:
+        logger.warning(f"{ts_prefix()} [체결통보로그] 저장 실패: {e}")
+
+
+_closing_filled_by_code: dict[str, int] = {}  # code -> 체결 누적 수량 (H0STCNI0 체결 시 갱신)
+
+
+# ── H0STCNI0 종목별 구독 관리 ──────────────────────────────────────────────────
+_ccnl_notice_sub_codes: set[str] = set()  # 종목별 H0STCNI0 구독 중인 종목코드
+_ccnl_notice_order_ts: dict[str, float] = {}  # 주문 후 체결확인용 타임스탬프
+
+
+def _ccnl_notice_sub_add(code: str) -> None:
+    """주문 발생 시 H0STCNI0 체결통보 구독 등록. tr_key는 htsid(종목코드 아님).
+    a2 WSS 활성 시 a2에서 구독 (a1 슬롯 절약)."""
+    if code in _ccnl_notice_sub_codes:
+        return
+    htsid = _get_ccnl_notice_tr_key()
+    if not htsid:
+        logger.warning(f"{ts_prefix()} [체결통보] htsid 미설정 → H0STCNI0 구독 불가: {code}")
+        return
+    # a2 WSS 우선
+    if _kws_a2 is not None:
+        _a2_subscribe_ccnl_notice()  # 이미 구독됐으면 스킵
+        _ccnl_notice_sub_codes.add(code)
+        _ccnl_notice_order_ts[code] = time.time()
+        name = code_name_map.get(code, code)
+        logger.info(f"{ts_prefix()} [체결통보] a2 H0STCNI0 구독 확인: {name}({code})")
+        return
+    # a1 fallback
+    with _kws_lock:
+        if _active_kws is not None:
+            try:
+                _send_subscribe(_active_kws, ccnl_notice, [htsid], "1")  # noqa: F405
+                _ccnl_notice_sub_codes.add(code)
+                _ccnl_notice_order_ts[code] = time.time()
+                name = code_name_map.get(code, code)
+                logger.info(f"{ts_prefix()} [체결통보] H0STCNI0 구독 추가: {name}({code}), tr_key={htsid}")
+            except Exception as e:
+                logger.warning(f"{ts_prefix()} [체결통보] H0STCNI0 구독 실패: {code} {e}")
+
+
+def _ccnl_notice_sub_remove(code: str) -> None:
+    """전량 체결 시 종목 추적만 제거. WSS 해제는 보내지 않음 (htsid 단위이므로 타 종목 영향)."""
+    if code not in _ccnl_notice_sub_codes:
+        return
+    _ccnl_notice_sub_codes.discard(code)
+    _ccnl_notice_order_ts.pop(code, None)
+    name = code_name_map.get(code, code)
+    logger.info(f"{ts_prefix()} [체결통보] 종목 추적 해제: {name}({code}), WSS 구독은 유지")
+
+
+# ── Str1 실전 매도 상태 ──────────────────────────────────────────────────────
+# code → {"sold": bool, "sell_reason": str, "qty": int, "sell_price": float,
+#          "sell_time": str, "ordno": str, "pnl": float, "ret_pct": float,
+#          "buy_price": float, "opening_call_auction_ordered": bool}
+_str1_sell_state: dict[str, dict] = {}
+_str1_sell_state_lock = threading.Lock()
+# 매도 주문 큐: ingest_loop → sell_worker (비동기 처리)
+_str1_sell_queue: "queue.Queue[dict]" = queue.Queue()
+# 종목별 보유 계좌 매핑: _get_balance_holdings()에서 구축, 매도 시 올바른 계좌로 주문
+_code_account_map: dict[str, dict] = {}
+# ── 매도 금지 종목 (no_sell_codes) ─────────────────────────────────────────────
+# config.json의 no_sell_codes 배열에서 로드, 런타임 추가 가능
+_no_sell_codes: set[str] = set()
+# ── EMA 데드크로스 상태 기반 매도 ──────────────────────────────────────────────
+# up_trend 지속 상태: 정배열(ma50>ma200>ma300>ma500>ma2000>wghn) 유지 중이면 True
+_up_trend_state: dict[str, bool] = {}
+_oprc_cache: dict[str, float] = {}        # {code: stck_oprc} 당일 시가 캐시 (불변값)
+# EMA 매도 조건: up_trend→ma500<ma2000 데드크로스 발생 시 True, 매도 성공까지 유지
+_ema_sell_cond: dict[str, bool] = {}
+
+# ── VI 발동 매수 포지션 추적 ──────────────────────────────────────────────────
+# code → {buy_price, buy_ts, qty, highest, sold, name, ordno}
+_vi_positions: dict[str, dict] = {}
+
+# ── 장전 동시호가 모니터링 ──────────────────────────────────────────────────
+# code → {antc_prce, prdy_ctrt, buy_price, in_sell_cond, first_sell_ts, first_printed}
+_opening_call_auction_watch: dict[str, dict] = {}
+_opening_call_auction_last_summary_ts: float = 0.0   # 1분 주기 출력용
+OPENING_CALL_AUCTION_SUMMARY_INTERVAL = 60.0         # 주기적 출력 간격 (초)
+_opening_call_auction_order_summary_done: bool = False  # 08:59:50 주문현황 정리 1회 출력용
+
+# ── 장전 예상체결가 시계열 모니터링 ──
+# code → {"0851": price, "0855": price, ..., "0900": price}
+_antc_prce_timeline: dict[str, dict[str, float]] = {}
+_ANTC_SNAPSHOT_TIMES = ["0851", "0855", "0856", "0857", "0858", "0859", "0900"]
+_opening_call_auction_cancelled_log: list[tuple[str, str, str]] = []  # (code, name, reason) 장전 취소 완료
+
+
+def _on_ccnl_notice_filled(df, recv_ts: str) -> None:
+    """H0STCNI0 체결통보(CNTG_YN==2) 수신 시 filled_qty 갱신 및 state 저장."""
+    col = {str(c).strip().lower(): c for c in df.columns}
+    cntg_yn_col = col.get("cntg_yn") or col.get("CNTG_YN")
+    code_col = col.get("stck_shrn_iscd") or col.get("STCK_SHRN_ISCD")
+    cntg_qty_col = col.get("cntg_qty") or col.get("CNTG_QTY")
+    seln_col = col.get("seln_byov_cls") or col.get("SELN_BYOV_CLS")  # 매도/매수 구분
+    if not all([cntg_yn_col, code_col, cntg_qty_col]):
+        return
+    for _, row in df.iterrows():
+        try:
+            cntg_yn = str(row.get(cntg_yn_col, "")).strip()
+            if cntg_yn != "2":  # 2=체결통보
+                continue
+            code = str(row.get(code_col, "")).strip().zfill(6)
+            if not code:
+                continue
+            qty = int(float(str(row.get(cntg_qty_col, 0) or 0).replace(",", "") or 0))
+            if qty <= 0:
+                continue
+            # 매수/매도 체결 누적
+            seln = str(row.get(seln_col, "")).strip()
+            # 체결 단가
+            fill_pr_col = col.get("cntg_unpr") or col.get("stck_prpr") or col.get("CNTG_UNPR")
+            fill_pr = 0.0
+            if fill_pr_col:
+                try:
+                    fill_pr = float(str(row.get(fill_pr_col, 0) or 0).replace(",", "") or 0)
+                except Exception:
+                    pass
+            name_fill = code_name_map.get(code, "") or code
+
+            if seln in ("01", "1"):  # 매도
+                _closing_filled_by_code[code] = max(0, _closing_filled_by_code.get(code, 0) - qty)
+                # Str1 장전 매도 체결 시 sold=True 전환
+                with _str1_sell_state_lock:
+                    st = _str1_sell_state.get(code)
+                    if st and st.get("opening_call_auction_ordered") and not st.get("sold"):
+                        _str1_sell_state[code]["sold"] = True
+                        _str1_sell_state[code]["sell_reason"] = st.get("sell_reason") or "str1_시초가하락_예상"
+                        logger.info(f"{ts_prefix()} [체결통보] Str1 동시호가매도 체결 {code} 수량={qty}")
+                        _save_str1_sell_state()
+                        fill_msg = f"{ts_prefix()} [체결통보] Str1 동시호가매도 체결 {name_fill}({code}) 수량={qty}주"
+                        logger.info(fill_msg)
+                        sys.stdout.write(f"\n{fill_msg}\n")
+                        sys.stdout.flush()
+                # 거래장부: 매도 체결
+                with _str1_sell_state_lock:
+                    st2 = _str1_sell_state.get(code, {})
+                    bp2 = float(st2.get("buy_price") or 0)
+                    sr2 = st2.get("sell_reason", "")
+                _append_ledger(
+                    order_type="sell_fill",
+                    code=code, name=name_fill,
+                    buy_price=bp2, sell_price=fill_pr,
+                    fill_qty=qty,
+                    reason=f"{sr2}_체결" if sr2 else "",
+                    prdy_ctrt=float(_last_prdy_ctrt.get(code, 0.0)),
+                    note=f"체결통보 {recv_ts}",
+                    stck_prpr=fill_pr,
+                )
+            else:  # 매수
+                _closing_filled_by_code[code] = _closing_filled_by_code.get(code, 0) + qty
+                # 거래장부: 매수 체결 — reason 결정
+                _buy_fill_reason = ""
+                if any(p.get("code") == code for p in _closing_buy_prepared):
+                    _buy_fill_reason = "종가매수_체결(15:20)"
+                elif code in _vi_buy_pending:
+                    _buy_fill_reason = "VI매수_체결"
+                else:
+                    _buy_fill_reason = "매수_체결"
+                _append_ledger(
+                    order_type="buy_fill",
+                    code=code, name=name_fill,
+                    buy_price=fill_pr,
+                    fill_qty=qty,
+                    prdy_ctrt=float(_last_prdy_ctrt.get(code, 0.0)),
+                    note=f"체결통보 {recv_ts}",
+                    stck_prpr=fill_pr,
+                    reason=_buy_fill_reason,
+                )
+                # ── 매수 체결 시 매도전략 자동 등록 + 실시간 구독 확보 ──
+                _need_sub = False
+                with _str1_sell_state_lock:
+                    if code not in _str1_sell_state:
+                        _str1_sell_state[code] = {
+                            "sold": False, "sell_reason": "", "qty": qty,
+                            "sell_price": 0.0, "sell_time": "", "ordno": "",
+                            "pnl": 0.0, "ret_pct": 0.0,
+                            "buy_price": fill_pr, "name": name_fill,
+                            "opening_call_auction_ordered": False, "balance_qty": qty,
+                            "source": _buy_fill_reason,
+                        }
+                        _need_sub = True
+                        logger.info(f"{ts_prefix()} [체결통보] _str1_sell_state 자동등록: {name_fill}({code}) buy={fill_pr:,.0f} qty={qty}")
+                    else:
+                        # 이미 등록된 경우: 수량 누적, buy_price 보정 (부분체결 대응)
+                        _st = _str1_sell_state[code]
+                        _st["qty"] = _st.get("qty", 0) + qty
+                        _st["balance_qty"] = _st.get("balance_qty", 0) + qty
+                        if _st.get("buy_price", 0) <= 0:
+                            _st["buy_price"] = fill_pr
+                if _need_sub:
+                    _ensure_code_structs([code])
+                    with _lock:
+                        _base_codes.add(code)
+                    _trigger_ws_rebuild()
+                    logger.info(f"{ts_prefix()} [체결통보] 실시간 구독 추가: {name_fill}({code})")
+            # 전량 체결 시 H0STCNI0 구독 해제 (슬롯 반환)
+            if seln in ("01", "1"):
+                # 매도: sold=True인 경우 구독 해제
+                with _str1_sell_state_lock:
+                    st_chk = _str1_sell_state.get(code, {})
+                    if st_chk.get("sold"):
+                        _ccnl_notice_sub_remove(code)
+            else:
+                # 매수: 체결 누적이 주문수량 이상이면 구독 해제
+                state_chk = _load_closing_buy_state()
+                if state_chk and state_chk.get("orders"):
+                    for o_chk in state_chk["orders"]:
+                        c_chk = str(o_chk.get("code", "")).zfill(6)
+                        if c_chk == code:
+                            oq = int(o_chk.get("order_qty", o_chk.get("qty", 0)))
+                            fq = _closing_filled_by_code.get(code, 0)
+                            if fq >= oq:
+                                _ccnl_notice_sub_remove(code)
+                            break
+
+            # state 갱신
+            state = _load_closing_buy_state()
+            if state and state.get("orders"):
+                orders = []
+                for o in state["orders"]:
+                    c = str(o.get("code", "")).zfill(6)
+                    order_qty = int(o.get("order_qty", o.get("qty", 0)))
+                    filled = min(order_qty, max(0, _closing_filled_by_code.get(c, 0)))
+                    remain = max(0, order_qty - filled)
+                    o2 = dict(o)
+                    o2["filled_qty"] = filled
+                    o2["remain_qty"] = remain
+                    orders.append(o2)
+                _save_closing_buy_state(state["codes"], state.get("code_info") or {}, orders)
+                _save_closing_filled()
+        except Exception as e:
+            logger.warning(f"{ts_prefix()} [체결통보] 파싱 오류: {e}")
+
+
+def _load_closing_buy_state_by_date(yymmdd: str) -> dict | None:
+    """지정일 closing_buy_state 로드."""
+    path = TOP_RANK_OUT_DIR / f"closing_buy_state_{yymmdd}.json"
+    if not path.exists():
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        logger.warning(f"{ts_prefix()} [종가매수] state 로드 실패 ({yymmdd}): {e}")
+        return None
+
+
+def _load_closing_buy_state() -> dict | None:
+    """당일 closing_buy_state 로드."""
+    path = _closing_buy_state_path()
+    if not path.exists():
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        logger.warning(f"{ts_prefix()} [종가매수] state 로드 실패: {e}")
+        return None
+
+
+def _run_closing_buy_retry_on_startup() -> None:
+    """15:20~15:30 재시작 시 미처리 주문 재시도."""
+    if not CLOSE_BUY:
+        return
+    now = datetime.now(KST).time()
+    if not (dtime(15, 20) <= now < dtime(15, 31)):
+        return
+    state = _load_closing_buy_state()
+    if not state or not state.get("codes"):
+        return
+    orders = state.get("orders") or []
+    ordered_codes = {o["code"] for o in orders if o.get("status") == "ordered"}
+    pending = [c for c in state["codes"] if c not in ordered_codes]
+    if not pending:
+        return
+    global _closing_codes, _closing_code_info
+    _closing_codes.clear()
+    _closing_codes.extend(pending)
+    _closing_code_info.clear()
+    _closing_code_info.update(state.get("code_info") or {})
+    # 재시작 시 15:20 첫 틱 복원: JSON → WSS parquet(보조)
+    loaded_first = _load_exp_first_tick(codes=state["codes"])
+    if loaded_first:
+        _closing_exp_first_tick.update(loaded_first)
+        logger.info(f"{ts_prefix()} [종가매수] 첫틱 복원 {len(loaded_first)}건")
+    _notify(f"{ts_prefix()} [종가매수] 재시작 감지 → 미처리 {len(pending)}건 재주문 시도", tele=True)
+    _run_closing_buy_orders()
+    # 주문 후 state 갱신 (방금 결과 반영)
+    new_placed = [(o["code"], o.get("name", ""), o.get("qty", 0), o.get("limit_up", 0)) for o in _closing_buy_placed]
+    merged = {o["code"]: o for o in orders}
+    for code, name, qty, limit_up in new_placed:
+        merged[code] = {"code": code, "name": name, "order_qty": qty, "limit_up": limit_up, "status": "ordered", "filled_qty": 0, "remain_qty": qty}
+    for c in pending:
+        if c not in merged or merged[c].get("status") != "ordered":
+            nm = (state.get("code_info") or {}).get(c, {}).get("name") or code_name_map.get(c, c)
+            merged[c] = {"code": c, "name": nm, "status": "skipped", "reason": "재시도후미체결", "order_qty": 0, "filled_qty": 0, "remain_qty": 0}
+    _save_closing_buy_state(state["codes"], state.get("code_info") or {}, list(merged.values()))
+
+
+def _get_close_from_kis_api(client, code: str, use_today: bool) -> float:
+    """KIS API로 당일종가(use_today=True) 또는 전일종가(use_today=False) 조회."""
+    try:
+        resp = client.inquire_price(code)
+        if use_today:
+            # 15:40~16:00: 당일 종가 (장 마감 후 stck_clpr 또는 stck_prpr이 당일종가)
+            val = resp.get("stck_clpr") or resp.get("stck_prpr") or 0
+        else:
+            # 08:30~08:40: 전일 종가
+            val = resp.get("stck_prdy_clpr") or resp.get("prdy_clpr") or 0
+        return float(str(val or 0).replace(",", "") or 0)
+    except Exception:
+        return 0.0
+
+
+def _get_prev_close_from_1d(codes: list[str]) -> dict[str, float]:
+    """1d parquet에서 전일종가 조회. 최신 날짜=전일 데이터이므로 close 사용. code -> prev_close. (15:20 상한가 산정용)"""
+    path = SCRIPT_DIR / "data" / "1d_data" / "kis_1d_unified_parquet_DB.parquet"
+    if not path.exists():
+        return {}
+    try:
+        df = pd.read_parquet(str(path), columns=["date", "symbol", "close"])
+        if df.empty or "close" not in df.columns:
+            return {}
+        df["symbol"] = df["symbol"].astype(str).str.zfill(6)
+        df["close"] = pd.to_numeric(df["close"], errors="coerce").fillna(0)
+        latest = df["date"].max()
+        sub = df[(df["date"] == latest) & (df["symbol"].isin(c.zfill(6) for c in codes))]
+        return dict(zip(sub["symbol"], sub["close"].astype(float)))
+    except Exception as e:
+        logger.warning(f"{ts_prefix()} [종가매수] 1d parquet 로드 실패: {e}")
+        return {}
+
+
+_closing_buy_prepared: list[dict] = []   # 15:19 사전 준비된 주문 데이터
+_closing_buy_prepare_done: bool = False  # 사전 준비 완료 플래그
+_closing_acct_clients: dict[str, "KisClient"] = {}  # 15:19 사전 초기화된 계좌 클라이언트
+
+
+def _prepare_closing_buy_orders() -> None:
+    """15:19 종가매수 사전 준비: 종목선정 + 계좌별 수량계산 + 주문 데이터 생성 (주문 발송 안 함).
+
+    Phase 4-4: 다중 계좌 순회 — 모든 활성 계좌에 대해 종목별 주문 준비.
+    각 계좌의 가용 현금(주문가능금액 - exclude_cash)을 기준으로 수량 산출.
+    """
+    global _closing_buy_prepare_done
+    if not CLOSE_BUY or not _closing_codes or _closing_buy_prepare_done:
+        return
+    _closing_buy_prepare_done = True
+    _closing_buy_prepared.clear()
+    try:
+        accounts = _iter_enabled_accounts(trade_only=True)
+        if not accounts:
+            logger.warning(f"{ts_prefix()} [종가매수준비] 활성 계좌 없음")
+            return
+
+        # 가격 조회용 클라이언트 (메인 계좌)
+        client = _top_client or _init_top_client()
+        n = len(_closing_codes)
+        FEE_RATE = 0.00015
+
+        prev_close_1d = _get_prev_close_from_1d(_closing_codes)
+        if prev_close_1d:
+            _notify(f"{ts_prefix()} [종가매수준비] 1d parquet 전일종가 {len(prev_close_1d)}건 로드")
+
+        # 종목별 전일종가·상한가 사전 조회
+        code_prices: dict[str, dict] = {}
+        for code in _closing_codes:
+            info = _closing_code_info.get(code, {})
+            prev_close = info.get("prev_close") or 0
+            if prev_close <= 0 and prev_close_1d:
+                prev_close = prev_close_1d.get(code.zfill(6)) or prev_close_1d.get(code) or 0
+            if prev_close <= 0:
+                try:
+                    resp = client.inquire_price(code)
+                    prev_close = float(str(resp.get("stck_prdy_clpr") or resp.get("prdy_clpr") or 0).replace(",", "") or 0)
+                except Exception:
+                    prev_close = 0
+            if prev_close <= 0:
+                logger.warning(f"{ts_prefix()} [종가매수준비] {code} 전일종가 없음, 스킵")
+                continue
+            code_prices[code] = {
+                "prev_close": prev_close,
+                "limit_up": calc_limit_up_price(prev_close),
+                "name": info.get("name", code_name_map.get(code, code)),
+                "prdy_ctrt": float(info.get("prdy_ctrt", _last_prdy_ctrt.get(code, 0.0))),
+            }
+
+        # 계좌별 주문 준비
+        for acct in accounts:
+            cano = acct["cano"]
+            acnt = acct.get("acnt_prdt_cd", "01") or "01"
+            alias = acct.get("alias", acct["account_id"])
+
+            # 계좌별 가용 현금 조회
+            try:
+                acct_client = _init_account_client(acct)
+                avail_cash = _get_account_available_cash(acct_client, acct)
+            except Exception as e:
+                logger.warning(f"{ts_prefix()} [종가매수준비] {alias} 잔고조회 실패: {e}")
+                # 폴백: max_invest 사용
+                max_inv = float(str(acct.get("max_invest", "0") or 0).replace("_", "") or 0)
+                avail_cash = max(0, max_inv) if max_inv > 0 else 0
+
+            _acct_max_inv = float(str(acct.get("max_invest", "0") or 0).replace("_", "") or 0)
+            _notify(
+                f"{ts_prefix()} [종가매수준비] {alias} 가용현금={int(avail_cash):,}원 "
+                f"(max_invest={int(_acct_max_inv):,}, 적용액={int(avail_cash):,})"
+            )
+
+            if avail_cash <= 0:
+                logger.info(f"{ts_prefix()} [종가매수준비] {alias} 가용현금=0 → 스킵")
+                continue
+
+            cash_per = max(0, avail_cash / n) * 0.995
+
+            for code, cp in code_prices.items():
+                limit_up = cp["limit_up"]
+                qty = int(cash_per // limit_up)
+                if qty <= 0:
+                    continue
+                _closing_buy_prepared.append({
+                    "code": code, "name": cp["name"], "qty": qty,
+                    "limit_up": limit_up, "prev_close": cp["prev_close"],
+                    "cano": cano, "acnt": acnt,
+                    "account_id": acct["account_id"], "alias": alias,
+                    "prdy_ctrt": cp["prdy_ctrt"],
+                })
+
+        # 클라이언트 사전 초기화 (15:20 주문 시 즉시 사용)
+        _closing_acct_clients.clear()
+        for acct in accounts:
+            try:
+                _closing_acct_clients[acct["cano"]] = _init_account_client(acct)
+            except Exception as e:
+                logger.warning(f"{ts_prefix()} [종가매수준비] {acct.get('alias','')} 클라이언트 생성 실패: {e}")
+
+        _notify(
+            f"{ts_prefix()} [종가매수준비] {len(_closing_buy_prepared)}건 사전 준비 완료 "
+            f"({len(accounts)}계좌 × {len(code_prices)}종목, 클라이언트 {len(_closing_acct_clients)}개 캐시, 15:20:00 정시 일괄 발송 대기)",
+            tele=True,
+        )
+    except Exception as e:
+        logger.warning(f"{ts_prefix()} [종가매수준비] 전체 실패: {e}")
+
+
+def _run_closing_buy_orders() -> None:
+    """15:20:00 사전 준비된 주문을 즉시 일괄 발송.
+
+    Phase 4-4: 계좌별 클라이언트를 생성하여 주문. prep에 account_id/cano 포함.
+    """
+    global _closing_buy_placed
+    if not CLOSE_BUY or not _closing_codes:
+        return
+    _closing_buy_placed.clear()
+
+    # 사전 준비 안 된 경우 즉시 준비 (폴백)
+    if not _closing_buy_prepared:
+        _prepare_closing_buy_orders()
+
+    if not _closing_buy_prepared:
+        _notify(f"{ts_prefix()} [종가매수] 사전 준비 데이터 없음 → 스킵")
+        return
+
+    try:
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        # 사전 캐시된 클라이언트 사용, 없으면 폴백
+        acct_clients = _closing_acct_clients if _closing_acct_clients else {}
+        if not acct_clients:
+            # 폴백: 즉석 생성 (사전 준비 안 된 경우)
+            for acct in _iter_enabled_accounts():
+                try:
+                    acct_clients[acct["cano"]] = _init_account_client(acct)
+                except Exception as e:
+                    logger.warning(f"{ts_prefix()} [종가매수] {acct.get('alias','')} 클라이언트 생성 실패: {e}")
+        fallback_client = _top_client or _init_top_client()
+
+        tr_id = "TTTC0802U"
+        ord_dvsn = "01"  # 15:20 종가 동시호가 시장가
+        FEE_RATE = 0.00015
+
+        def _send_one(prep):
+            code = prep["code"]
+            client = acct_clients.get(prep["cano"], fallback_client)
+            ord_unpr = "0"  # 시장가
+            body = {"CANO": prep["cano"], "ACNT_PRDT_CD": prep["acnt"], "PDNO": code,
+                    "ORD_DVSN": ord_dvsn, "ORD_QTY": str(prep["qty"]), "ORD_UNPR": ord_unpr}
+            url = f"{client.cfg.base_url}/uapi/domestic-stock/v1/trading/order-cash"
+            headers = client._headers(tr_id=tr_id)
+            headers["content-type"] = "application/json"
+            # hashkey 생략 (KIS 공식: 선택사항)
+            t0 = time.time()
+            r = requests.post(url, headers=headers, data=json.dumps(body), timeout=10)
+            r.raise_for_status()
+            j = r.json()
+            elapsed = time.time() - t0
+            if str(j.get("rt_cd")) != "0":
+                raise RuntimeError(f"종가매수 실패: {j.get('msg1')} raw={j}")
+            try:
+                _ccnl_notice_sub_add(code)
+            except Exception:
+                pass
+            return prep, j, elapsed
+
+        # 10건씩 배치 (KIS API 초당 10건 제한)
+        batches = [_closing_buy_prepared[i:i+10] for i in range(0, len(_closing_buy_prepared), 10)]
+        ledger_records = []  # ledger 후처리용
+
+        for batch_idx, batch in enumerate(batches):
+            if batch_idx > 0:
+                time.sleep(1.0)  # 다음 배치는 1초 후
+            with ThreadPoolExecutor(max_workers=len(batch)) as executor:
+                futures = {executor.submit(_send_one, p): p for p in batch}
+                for fut in as_completed(futures):
+                    prep = futures[fut]
+                    code = prep["code"]
+                    alias = prep.get("alias", prep.get("account_id", ""))
+                    try:
+                        prep, j, elapsed = fut.result()
+                        out = j.get("output") or {}
+                        ordno = str(out.get("ODNO") or out.get("odno") or "").strip()
+                        qty = prep["qty"]
+                        limit_up = prep["limit_up"]
+                        name = prep["name"]
+                        cano = prep["cano"]
+                        acnt = prep["acnt"]
+                        amount = limit_up * qty
+                        fee_est = int(amount * FEE_RATE)
+                        amount_net = amount - fee_est
+                        _closing_buy_placed.append({
+                            "name": name, "code": code, "qty": qty, "limit_up": limit_up, "amount_net": amount_net,
+                            "ordno": ordno, "cano": cano, "acnt": acnt,
+                            "account_id": prep.get("account_id", "main"), "alias": alias,
+                        })
+                        acct_tag = f"[{alias}]" if alias else ""
+                        # 주문 완료 즉시 로그 (체결통보보다 먼저 기록되도록)
+                        _notify(
+                            f"{ts_prefix()} [종가매수주문]{acct_tag} 종목명={name} | 주문유형=시장가 | 수량={qty} | "
+                            f"금액={amount_net:,} (상한가*수량-수수료) | {elapsed:.3f}s"
+                        )
+                        ledger_records.append({
+                            "code": code, "name": name, "limit_up": float(limit_up),
+                            "qty": qty, "ordno": ordno, "acct_tag": acct_tag,
+                            "prdy_ctrt": float(prep.get("prdy_ctrt", 0.0)),
+                            "prev_close": prep.get("prev_close", 0), "alias": alias,
+                        })
+                    except Exception as e:
+                        logger.warning(f"{ts_prefix()} [종가매수실패] {code} {alias}: {e}")
+
+        # ledger 기록 (주문 완료 후 일괄)
+        for rec in ledger_records:
+            _append_ledger(
+                order_type="buy_order",
+                code=rec["code"], name=rec["name"],
+                buy_price=0,
+                order_qty=rec["qty"],
+                reason="종가매수_주문(15:20)",
+                ord_no=rec["ordno"],
+                ord_dvsn="01(시장가)",
+                prdy_ctrt=rec["prdy_ctrt"],
+                note=f"상한가={rec['limit_up']} 전일종가={rec['prev_close']} 계좌={rec['alias']}",
+                cano_alias=rec["alias"],
+                stck_prpr=_last_stck_prpr.get(rec["code"], 0.0),
+            )
+        if _closing_buy_placed:
+            _notify(f"{ts_prefix()} [종가매수주문완료] {len(_closing_buy_placed)}건")
+        # 주문 결과 state 저장
+        order_records = []
+        for o in _closing_buy_placed:
+            order_records.append({
+                "code": o["code"], "name": o["name"],
+                "order_qty": o["qty"], "limit_up": o["limit_up"], "ordno": o.get("ordno", ""),
+                "status": "ordered", "filled_qty": 0, "remain_qty": o["qty"]
+            })
+        for code in _closing_codes:
+            if code not in {x["code"] for x in _closing_buy_placed}:
+                info = _closing_code_info.get(code, {})
+                nm = info.get("name") or code_name_map.get(code, code)
+                order_records.append({
+                    "code": code, "name": nm,
+                    "order_qty": 0, "limit_up": 0, "status": "skipped",
+                    "filled_qty": 0, "remain_qty": 0, "reason": "전일종가없음 또는 수량0"
+                })
+        _save_closing_buy_state(list(_closing_codes), dict(_closing_code_info), order_records)
+    except Exception as e:
+        logger.warning(f"{ts_prefix()} [종가매수] 전체 실패: {e}")
+
+
+def _run_morning_extra_closing_buy() -> None:
+    """
+    08:30~08:40 시간외 종가: 전일 미체결 종목에 ORD_DVSN=05(장전시간외종가) 추가 매수. 가격 미입력(전일종가 자동매칭).
+
+    remain 계산 우선순위:
+      1) 시작잔고(_startup_balance_map): 실제 보유수량으로 filled 역산
+         → remain = max(0, order_qty - startup_held)
+      2) _get_closing_filled_for_remain(state): 체결통보+잔고조회 병합
+      3) JSON state remain_qty 마지막 fallback
+    추가 보호:
+      - _str1_sell_state sold=True 종목 스킵 (이미 매도 완료)
+      - 이미 보유수량 >= 주문수량이면 스킵 (전량 체결 간주)
+    """
+    global _morning_extra_closing_done
+    if not MORNING_EXTRA_CLOSING_PR_BUY or _morning_extra_closing_done:
+        return
+    try:
+        from datetime import timedelta
+        yesterday = (datetime.now(KST) - timedelta(days=1)).strftime("%y%m%d")
+        state = _load_closing_buy_state_by_date(yesterday)
+        if not state or not state.get("orders"):
+            _morning_extra_closing_done = True
+            logger.info(f"{ts_prefix()} [08:30시간외종가] 전일 closing_buy_state 없음 → 스킵")
+            return
+
+        # ── 체결수량 계산: 병합된 filled_map 사용 (체결통보 + 잔고조회) ────────
+        filled_map = _get_closing_filled_for_remain(state)
+
+        # ── 시작잔고: 이미 보유 중인 실제 수량 ──────────────────────────────
+        # _startup_balance_map은 main 블록에서 이미 취득했으나, 전역 접근 불가
+        # → _get_balance_holdings() 재사용 (시간외종가 시점에 다시 조회하는 게 더 정확)
+        try:
+            live_balance = _get_balance_holdings()
+        except Exception:
+            live_balance = {}
+
+        # ── Str1 매도 완료 종목 집합 ─────────────────────────────────────────
+        with _str1_sell_state_lock:
+            sold_codes = {c for c, st in _str1_sell_state.items() if st.get("sold")}
+
+        to_order: list[dict] = []
+        skip_lines: list[str] = []
+        for o in state["orders"]:
+            code = str(o.get("code", "")).zfill(6)
+            if not code:
+                continue
+            name = o.get("name", code_name_map.get(code, code))
+            order_qty = int(o.get("order_qty", o.get("qty", 0)))
+            if order_qty <= 0:
+                continue
+
+            # 이미 매도 완료된 종목 스킵
+            if code in sold_codes:
+                skip_lines.append(f"  {name}({code}) → 매도완료(sold=True), 매수 스킵")
+                continue
+
+            # remain 계산 — 실제 보유수량 우선
+            if live_balance:
+                lb_val = live_balance.get(code, {})
+                held = lb_val.get("qty", 0) if isinstance(lb_val, dict) else lb_val
+                # 이미 전량 보유 중이면 체결 완료로 간주
+                if held >= order_qty:
+                    skip_lines.append(f"  {name}({code}) → 잔고보유={held} >= 주문={order_qty}, 전량체결 간주")
+                    continue
+                remain = max(0, order_qty - held)
+            else:
+                # 잔고조회 실패 시 filled_map 사용
+                filled = max(
+                    int(o.get("filled_qty", 0)),
+                    filled_map.get(code, 0),
+                )
+                remain = max(0, order_qty - filled)
+                if remain <= 0:
+                    remain = max(0, order_qty - int(o.get("filled_qty", 0)))
+
+            if remain <= 0:
+                skip_lines.append(f"  {name}({code}) → 잔여수량=0, 스킵")
+                continue
+
+            o2 = dict(o)
+            o2["remain_qty"] = remain
+            lb_val2 = live_balance.get(code, {}) if live_balance else {}
+            o2["actual_held"] = lb_val2.get("qty", 0) if isinstance(lb_val2, dict) else (lb_val2 if lb_val2 else -1)
+            to_order.append(o2)
+
+        # ── 스킵 내역 출력 ────────────────────────────────────────────────────
+        if skip_lines:
+            _notify(f"{ts_prefix()} [08:30시간외종가] 제외 {len(skip_lines)}건:\n" + "\n".join(skip_lines))
+
+        if not to_order:
+            _morning_extra_closing_done = True
+            _notify(f"{ts_prefix()} [08:30시간외종가] 추가 매수 대상 없음")
+            return
+
+        _morning_extra_closing_done = True  # 1회만 실행 (이중주문 방지)
+
+        cfg = _read_cfg() or load_config(str(CONFIG_PATH))
+        cano = str(cfg.get("cano", "")).strip()
+        acnt = str(cfg.get("acnt_prdt_cd", "01")).strip() or "01"
+        if not cano:
+            logger.warning(f"{ts_prefix()} [08:30시간외종가] config cano 없음")
+            return
+        client = _top_client or _init_top_client()
+        code_info = state.get("code_info") or {}
+
+        # [DISABLED 2026-04-02] 상한가 종목 장전시간외종가 매수 비활성화
+        # 상한가 종목은 매도 물량이 안 나오다가 하락 시 손실 위험 → 매수 로직 비활성화
+        _notify(f"{ts_prefix()} [08:30시간외종가] 매수 비활성화 (상한가 매수 전략 중단) — {len(to_order)}건 스킵")
+        # for o in to_order:
+        #     code    = str(o["code"]).zfill(6)
+        #     remain  = int(o.get("remain_qty", 0))
+        #     held    = int(o.get("actual_held", -1))
+        #     info    = code_info.get(code, {})
+        #     name    = o.get("name", info.get("name", code))
+        #     if remain <= 0:
+        #         continue
+        #     # KIS API에서 전일종가 실시간 조회 (저장값 대신 최신 값 사용)
+        #     prev_close = 0.0
+        #     for _attempt in range(3):
+        #         prev_close = _get_close_from_kis_api(client, code, use_today=False)
+        #         if prev_close > 0:
+        #             break
+        #         time.sleep(1)
+        #     if prev_close <= 0:
+        #         prev_close = _get_prev_close_from_1d([code]).get(code, 0)
+        #     if prev_close <= 0:
+        #         logger.warning(f"{ts_prefix()} [08:30시간외종가] {code} 전일종가 조회 실패(API+1d폴백) → 스킵")
+        #         continue
+        #     held_txt = f" (잔고보유={held})" if held >= 0 else ""
+        #     try:
+        #         _buy_order_cash(client, cano, acnt, "TTTC0802U", code, remain, prev_close, ord_dvsn="05")
+        #         _notify(
+        #             f"{ts_prefix()} [08:30시간외종가_매수] {name}({code})"
+        #             f"  수량={remain}{held_txt}  전일종가={prev_close:,.0f}  ORD_DVSN=05(장전시간외종가)",
+        #             tele=True,
+        #         )
+        #     except Exception as e:
+        #         logger.warning(f"{ts_prefix()} [08:30시간외종가실패] {code}: {e}")
+        #         _notify(f"{ts_prefix()} [08:30시간외종가실패] {name}({code}) {e}", tele=True)
+    except Exception as e:
+        logger.warning(f"{ts_prefix()} [08:30시간외종가] 실패: {e}")
+
+
+_morning_extra_closing_done = False
+_afternoon_extra_closing_done = False
+_morning_extra_logged_done = False
+_afternoon_extra_logged_done = False
+_sell_state_supplement_done = False
+
+# ── 잔고조회 스케줄러 (Phase 2-2) ──
+_closing_balance_1531_done = False
+_closing_balance_1558_done = False
+_overtime_balance_checked: set[str] = set()
+# 장중 매수/매도 주문 후 체결 대기 중 1분마다 잔고조회
+_pending_order_balance_last_ts: float = 0.0
+
+
+def _run_closing_balance_verification(label: str) -> None:
+    """REST API 잔고조회로 체결 결과 검증 + _closing_filled_by_code 갱신."""
+    state = _load_closing_buy_state()
+    if not state or not state.get("orders"):
+        return
+    try:
+        for acct in _iter_enabled_accounts(trade_only=True):
+            cano = str(acct.get("cano", "")).strip()
+            acnt = str(acct.get("acnt_prdt_cd", "01")).strip() or "01"
+            if not cano:
+                continue
+            client = _top_client or _init_top_client()
+            out1, _, _, _ = _get_balance_page(client, cano, acnt, "TTTC8434R")
+            rows = out1 if isinstance(out1, list) else ([out1] if isinstance(out1, dict) else [])
+            hold_map = {}
+            for row in rows:
+                c = str(row.get("pdno", "") or "").strip().zfill(6)
+                if c:
+                    hold_map[c] = int(float(str(row.get("hldg_qty", 0) or 0).replace(",", "") or 0))
+
+            changes = []
+            for o in state["orders"]:
+                code = str(o.get("code", "")).zfill(6)
+                order_qty = int(o.get("order_qty", o.get("qty", 0)))
+                old_filled = _closing_filled_by_code.get(code, 0)
+                held = hold_map.get(code, 0)
+                new_filled = min(order_qty, held)
+                if new_filled > old_filled:
+                    _closing_filled_by_code[code] = new_filled
+                    name = o.get("name", code_name_map.get(code, code))
+                    changes.append(f"{name}({code}) {old_filled}→{new_filled}주")
+            _save_closing_filled()
+
+            if changes:
+                msg = f"{ts_prefix()} [{label}] 잔고검증 체결 반영({cano[-4:]}): {', '.join(changes)}"
+                _notify(msg, tele=True)
+            else:
+                logger.info(f"{ts_prefix()} [{label}] 잔고검증 완료({cano[-4:]}) — 변동 없음")
+
+            # ── 잔고에 있지만 미구독/미등록 종목 자동 감지 + 구독 추가 ──
+            _new_codes_for_sub = []
+            for row in rows:
+                c = str(row.get("pdno", "") or "").strip().zfill(6)
+                hq = int(float(str(row.get("hldg_qty", 0) or 0).replace(",", "") or 0))
+                if not c or hq <= 0:
+                    continue
+                if c not in codes:
+                    bp = float(str(row.get("pchs_avg_pric", 0) or 0).replace(",", "") or 0)
+                    nm = str(row.get("prdt_name", "") or code_name_map.get(c, c)).strip()
+                    _new_codes_for_sub.append(c)
+                    with _str1_sell_state_lock:
+                        if c not in _str1_sell_state:
+                            _str1_sell_state[c] = {
+                                "sold": False, "sell_reason": "", "qty": hq,
+                                "sell_price": 0.0, "sell_time": "", "ordno": "",
+                                "pnl": 0.0, "ret_pct": 0.0,
+                                "buy_price": bp, "name": nm,
+                                "opening_call_auction_ordered": False, "balance_qty": hq,
+                                "source": f"잔고검증_{label}",
+                            }
+                    logger.info(f"{ts_prefix()} [{label}] 미구독 보유종목 감지: {nm}({c}) qty={hq} bp={bp:,.0f}")
+            if _new_codes_for_sub:
+                _ensure_code_structs(_new_codes_for_sub)
+                with _lock:
+                    _base_codes.update(_new_codes_for_sub)
+                _trigger_ws_rebuild()
+                _notify(f"{ts_prefix()} [{label}] 미구독 보유종목 {len(_new_codes_for_sub)}건 구독 추가: "
+                        f"{', '.join(_new_codes_for_sub)}", tele=True)
+    except Exception as e:
+        logger.warning(f"{ts_prefix()} [{label}] 잔고검증 실패: {e}")
+
+
+def _get_closing_filled_for_remain(state: dict) -> dict[str, int]:
+    """
+    체결 수량 병합: in-memory + persisted. 미매수(remain) 계산용.
+    순수 읽기 함수 — 잔고조회는 _run_closing_balance_verification 스케줄러에서 수행.
+    """
+    persisted = _load_closing_filled()
+    merged = dict(persisted)
+    for k, v in _closing_filled_by_code.items():
+        c = str(k).zfill(6)
+        merged[c] = max(merged.get(c, 0), v)
+    # 즉시 잔고조회 제거 — 이 함수는 _closing_filled_by_code를 읽기만 하는 순수 함수.
+    # 잔고조회는 별도 스케줄러(_run_closing_balance_verification)에서 지정 시간에만 실행.
+    return merged
+
+
+def _run_afternoon_extra_closing_buy() -> None:
+    """15:40~16:00 시간외 종가: 당일 15:30 미매수 종목에 ORD_DVSN=06(장후시간외종가) 매수. 가격 미입력(당일종가 자동매칭)."""
+    global _afternoon_extra_closing_done
+    if not CLOSE_BUY or _afternoon_extra_closing_done:
+        return
+    try:
+        state = _load_closing_buy_state()
+        if not state or not state.get("orders"):
+            _afternoon_extra_closing_done = True
+            return
+        filled_map = _get_closing_filled_for_remain(state)
+        to_order = []
+        for o in state["orders"]:
+            order_qty = int(o.get("order_qty", o.get("qty", 0)))
+            filled = min(order_qty, max(
+                int(o.get("filled_qty", 0)),
+                filled_map.get(str(o.get("code", "")).zfill(6), 0)
+            ))
+            remain = max(0, order_qty - filled)
+            if remain <= 0:
+                remain = max(0, order_qty - filled)
+            if remain > 0:
+                o2 = dict(o)
+                o2["remain_qty"] = remain
+                o2["filled_qty"] = filled
+                to_order.append(o2)
+        if not to_order:
+            _afternoon_extra_closing_done = True
+            return
+        _afternoon_extra_closing_done = True
+        client = _top_client or _init_top_client()
+        tr_id = "TTTC0802U"
+        code_info = state.get("code_info") or {}
+        for acct in _iter_enabled_accounts(trade_only=True):
+            cano = str(acct.get("cano", "")).strip()
+            acnt = str(acct.get("acnt_prdt_cd", "01")).strip() or "01"
+            if not cano:
+                continue
+            for o in to_order:
+                code = o["code"]
+                remain = int(o.get("remain_qty", 0))
+                if remain <= 0:
+                    continue
+                info = code_info.get(code, {})
+                today_close = _get_close_from_kis_api(client, code, use_today=True)
+                if today_close <= 0:
+                    continue
+                name = o.get("name", info.get("name", code))
+                try:
+                    _buy_order_cash(client, cano, acnt, tr_id, code, remain, today_close, ord_dvsn="06")
+                    _notify(f"{ts_prefix()} [15:40시간외종가_매수 주문] {name}({code}) 수량={remain} 당일종가={today_close:,.0f} (ORD_DVSN=06 장후시간외종가) 계좌={cano[-4:]}")
+                except Exception as e:
+                    logger.warning(f"{ts_prefix()} [15:40시간외종가실패] {code}: {e}")
+    except Exception as e:
+        logger.warning(f"{ts_prefix()} [15:40시간외종가] 실패: {e}")
+
+
+_overtime_order_done: bool = False  # 16:00 1회 주문 완료 플래그
+
+
+def _run_overtime_buy_orders() -> None:
+    """
+    16:00~18:00 시간외 단일가.
+    - 16:00:00: 미체결 종목 ORD_DVSN=07 주문 1회 발송 (상한가 가격)
+    - 16:10~17:50: 체결 확인만 수행 (추가 주문 없음)
+    """
+    global _overtime_order_done
+    if not CLOSE_BUY:
+        return
+
+    now_t = datetime.now(KST).time()
+    state = _load_closing_buy_state()
+    if not state or not state.get("orders"):
+        return
+
+    filled_map = _get_closing_filled_for_remain(state)
+
+    # 미체결 종목 파악
+    unfilled = []
+    for o in state["orders"]:
+        if o.get("status") != "ordered":
+            continue
+        code = str(o.get("code", "")).zfill(6)
+        order_qty = int(o.get("order_qty", o.get("qty", 0)))
+        filled = min(order_qty, max(
+            int(o.get("filled_qty", 0)),
+            filled_map.get(code, 0)
+        ))
+        remain = max(0, order_qty - filled)
+        if remain > 0:
+            o["remain_qty"] = remain
+            o["filled_qty"] = filled
+            unfilled.append(o)
+
+    # 16:00:00 — 1회만 주문 발송
+    if not _overtime_order_done and now_t < dtime(16, 1):
+        _overtime_order_done = True
+        if not unfilled:
+            _notify(f"{ts_prefix()} [시간외단일가] 16:00 미체결 종목 없음 → 주문 스킵")
+            return
+        # [DISABLED 2026-04-02] 상한가 종목 시간외단일가 매수 비활성화
+        # 상한가 종목은 매도 물량이 안 나오다가 하락 시 손실 위험 → 매수 로직 비활성화
+        logger.info(f"{ts_prefix()} [시간외단일가] 매수 비활성화 (상한가 매수 전략 중단) — {len(unfilled)}건 스킵")
+        # try:
+        #     client = _top_client or _init_top_client()
+        #     tr_id = "TTTC0802U"
+        #     # 1) 주문 데이터 사전 준비 (상한가 조회 등)
+        #     order_items = []
+        #     for o in unfilled:
+        #         code = o["code"]
+        #         remain = int(o.get("remain_qty", 0))
+        #         if remain <= 0:
+        #             continue
+        #         limit_up = o.get("limit_up") or 0
+        #         if limit_up <= 0:
+        #             prev_close = _get_close_from_kis_api(client, code, use_today=False)
+        #             if prev_close <= 0:
+        #                 name = o.get("name", code_name_map.get(code, code))
+        #                 _notify(f"{ts_prefix()} [시간외단일가스킵] {name}({code}) 전일종가 조회 실패")
+        #                 continue
+        #             limit_up = calc_limit_up_price(prev_close)
+        #         name = o.get("name", code_name_map.get(code, code))
+        #         order_items.append({"code": code, "name": name, "remain": remain, "limit_up": limit_up})
+        #
+        #     # 2) 다중계좌 + 10건 단위 배치 발송
+        #     for acct in _iter_enabled_accounts(trade_only=True):
+        #         cano = str(acct.get("cano", "")).strip()
+        #         acnt = str(acct.get("acnt_prdt_cd", "01")).strip() or "01"
+        #         if not cano:
+        #             continue
+        #         ok_list, fail_list = [], []
+        #         for idx, item in enumerate(order_items):
+        #             if idx > 0 and idx % 10 == 0:
+        #                 time.sleep(1.0)  # KIS REST API 10건/초 제한 준수
+        #             try:
+        #                 _buy_order_cash(client, cano, acnt, tr_id,
+        #                                 item["code"], item["remain"], item["limit_up"], ord_dvsn="07")
+        #                 ok_list.append(item)
+        #             except Exception as e:
+        #                 fail_list.append((item, str(e)))
+        #                 logger.warning(f"{ts_prefix()} [시간외단일가실패] {item['code']}: {e}")
+        #
+        #         # 3) 통합 결과 출력
+        #         lines = [f"{ts_prefix()} [시간외단일가주문] {len(ok_list)}건 발송완료 ({len(order_items)}건 중) 계좌={cano[-4:]}"]
+        #         for it in ok_list:
+        #             lines.append(f"  {it['name']}({it['code']}) 수량={it['remain']} 상한가={it['limit_up']:,.0f} (ORD_DVSN=07)")
+        #         for it, err in fail_list:
+        #             lines.append(f"  [실패] {it['name']}({it['code']}) {it['remain']}주: {err}")
+        #         _notify("\n".join(lines), tele=True)
+        # except Exception as e:
+        #     _notify(f"{ts_prefix()} [시간외단일가] 전체 실패: {e}")
+        #     logger.warning(f"{ts_prefix()} [시간외단일가] 실패: {e}")
+    else:
+        # 16:10~17:50: 체결 확인만 수행 (추가 주문 없음)
+        if unfilled:
+            names = [f"{o.get('name', o['code'])}({o['code']}) 잔량={o.get('remain_qty', 0)}" for o in unfilled]
+            _notify(f"{ts_prefix()} [시간외단일가] 미체결 확인 {len(unfilled)}건: {', '.join(names)}")
+        else:
+            _notify(f"{ts_prefix()} [시간외단일가] 전량 체결 완료")
+
+
+def _log_closing_result_after_window(window_label: str, yymmdd: str | None = None) -> None:
+    """시간 종료 후 주문내역·결과를 로그로 출력. filled는 체결통보+persisted 병합 사용."""
+    target_date = yymmdd or today_yymmdd
+    state = _load_closing_buy_state_by_date(target_date) if target_date != today_yymmdd else _load_closing_buy_state()
+    if not state or not state.get("orders"):
+        return
+    orders = state.get("orders") or []
+    code_info = state.get("code_info") or {}
+    filled_map = _get_closing_filled_for_remain(state) if target_date == today_yymmdd else _load_closing_filled(target_date)
+    lines = [f"{ts_prefix()} [{window_label} 종료] 주문내역·결과"]
+    for o in orders:
+        code = str(o.get("code", "")).zfill(6)
+        name = o.get("name", code_info.get(code, {}).get("name", code))
+        ord_q = int(o.get("order_qty", o.get("qty", 0)))
+        filled = min(ord_q, max(int(o.get("filled_qty", 0)), filled_map.get(code, 0))) if filled_map else int(o.get("filled_qty", 0))
+        remain = max(0, ord_q - filled)
+        status = o.get("status", "unknown")
+        lines.append(f"  {name}({code}) 주문수량={ord_q} 매수수량={filled} 미매수={remain} status={status}")
+    lines.append(f"  (체결통보 기반 _closing_filled_by_code 반영)")
+    msg = "\n".join(lines)
+    _notify(msg)
+    logger.info(msg.replace("\n", " | "))
+
+
+def _log_closing_order_aggregation(slot_label: str, state: dict | None = None) -> None:
+    """주문/매수/미매수 합계(종목수 포함). 개별 종목은 생략, 10분마다 추가주문 결과 요약용."""
+    s = state or _load_closing_buy_state()
+    if not s or not s.get("orders"):
+        return
+    orders = s.get("orders") or []
+    filled_map = _get_closing_filled_for_remain(s)
+    total_ord, total_fill, total_remain = 0, 0, 0
+    n_order_items, n_filled_items, n_remain_items = 0, 0, 0
+    for o in orders:
+        code = str(o.get("code", "")).zfill(6)
+        ord_q = int(o.get("order_qty", o.get("qty", 0)))
+        filled = min(ord_q, max(int(o.get("filled_qty", 0)), filled_map.get(code, 0)))
+        remain = max(0, ord_q - filled)
+        total_ord += ord_q
+        total_fill += filled
+        total_remain += remain
+        if ord_q > 0:
+            n_order_items += 1
+        if filled > 0:
+            n_filled_items += 1
+        if remain > 0:
+            n_remain_items += 1
+    agg_title = "매수 집계" if "단일가" in slot_label else "종가매수 집계"
+    msg = (
+        f"{ts_prefix()} [{slot_label}] {agg_title} "
+        f"총 {len(orders)}종목 | 주문 {n_order_items}종목 {total_ord}개 | 매수 {n_filled_items}종목 {total_fill}개 | 미매수 {n_remain_items}종목 {total_remain}개"
+    )
+    sys.stdout.write("\n")
+    _notify(msg)
+    logger.info(msg)
+    sys.stdout.write("\n")
+    sys.stdout.flush()
+
+
+def _run_closing_buy_filled_notify() -> None:
+    """15:30:40 종가매수 결과 통합 통보. 체결통보(H0STCNI0) 기반 주문/체결/미체결."""
+    global _closing_buy_filled_done
+    if _closing_buy_filled_done or not _closing_buy_placed:
+        return
+    try:
+        total_ord, total_filled, total_remain = 0, 0, 0
+        table_rows: list[dict] = []
+        for o in _closing_buy_placed:
+            c = str(o.get("code", "")).zfill(6)
+            ord_q = int(o.get("qty", 0))
+            filled = min(ord_q, _closing_filled_by_code.get(c, 0))
+            remain = max(0, ord_q - filled)
+            total_ord += ord_q
+            total_filled += filled
+            total_remain += remain
+            table_rows.append({
+                "종목명": o.get("name", c),
+                "코드": c,
+                "주문": str(ord_q),
+                "체결": str(filled),
+                "미체결": str(remain),
+            })
+        print(f"\n{ts_prefix()} [15:30:40 종가매수 결과]")
+        if table_rows:
+            print_table(
+                table_rows,
+                columns=["종목명", "코드", "주문", "체결", "미체결"],
+                align={"종목명": "left", "코드": "left", "주문": "right", "체결": "right", "미체결": "right"},
+            )
+        print(f"  합계: 주문={total_ord} 체결={total_filled} 미체결={total_remain}\n")
+        # 텔레그램 전송 (stdout 이중 출력 방지: tmsg 직접 호출)
+        tele_lines = [f"[15:30:40 종가매수 결과]"]
+        for r in table_rows:
+            tele_lines.append(f"  {r['종목명']}({r['코드']}) 주문={r['주문']} 체결={r['체결']} 미체결={r['미체결']}")
+        tele_lines.append(f"  합계: 주문={total_ord} 체결={total_filled} 미체결={total_remain}")
+        if tmsg is not None:
+            try:
+                tmsg("\n".join(tele_lines), "-t")
+            except Exception:
+                pass
+        _closing_buy_filled_done = True
+    except Exception as e:
+        logger.warning(f"{ts_prefix()} [종가매수체결알림] 실패: {e}")
+
+
+def _persist_subscription_codes(all_codes: list[str]) -> None:
+    cfg = _read_sub_cfg()
+    cfg["wss_subscribe_date"] = today_yymmdd
+    cfg["wss_subscribe_codes"] = sorted(set(all_codes))
+    # 탑 랭킹으로 추가된 종목도 별도 저장 (재시작 시 복원용)
+    cfg["wss_top_added_codes"] = sorted(_top_added_codes) if "_top_added_codes" in globals() else []
+    try:
+        save_config(cfg, str(SUB_CFG_PATH))
+    except Exception:
+        pass
+
+
+def _load_prev_closing_codes() -> list[str]:
+    """연도별 거래장부 parquet에서 직전 종가매수 종목코드 로드.
+    reason에 '종가매수'를 포함하는 행 중 가장 마지막 날짜의 code를 추출.
+    없으면 빈 리스트 → CODE_TEXT 폴백.
+    """
+    if not AUTO_CODE_FROM_PREV_CLOSING:
+        return []
+    try:
+        now = datetime.now(KST)
+        for year in [now.strftime("%Y"), str(int(now.strftime("%Y")) - 1)]:
+            path = LEDGER_DIR / f"trade_ledger_{year}.parquet"
+            if not path.exists():
+                continue
+            df = pd.read_parquet(path)
+            closing = df[df["reason"].astype(str).str.contains("종가매수", na=False)]
+            if closing.empty:
+                continue
+            last_date = closing["date"].max()
+            last_day = closing[closing["date"] == last_date]
+            codes = last_day["code"].astype(str).str.zfill(6).unique().tolist()
+            if codes:
+                logger.info(
+                    f"[codes] 거래장부({last_date}) 종가매수 {len(codes)}개 로드: {codes}"
+                )
+                return codes
+    except Exception as e:
+        logger.warning(f"[codes] 거래장부 parquet 로드 실패: {e}")
+    return []
+
+
+def _load_morning_target_codes() -> list[str]:
+    """당일 아침 전일 상한가 종목을 정확하게 선정.
+    1) Select_Tr_target_list_symulation_pdy_ctrt.py 실행 → CSV 갱신
+    2) Select_Tr_target_list.csv에서 마지막 날짜 + group=ST 종목 추출
+    3) 실패 시 _load_prev_closing_codes() fallback
+    """
+    import subprocess as _sp
+
+    csv_path = Path("/home/ubuntu/Stoc_Kis/symulation/Select_Tr_target_list.csv")
+    script_path = Path("/home/ubuntu/Stoc_Kis/symulation/Select_Tr_target_list_symulation_pdy_ctrt.py")
+
+    # ── 1) CSV 갱신: 스크립트 실행 ──
+    try:
+        logger.info(f"{ts_prefix()} [morning_target] Select_Tr_target_list 스크립트 실행 중...")
+        result = _sp.run(
+            [sys.executable, str(script_path)],
+            capture_output=True, text=True, timeout=120,
+            cwd=str(script_path.parent),
+        )
+        if result.returncode != 0:
+            logger.warning(f"[morning_target] 스크립트 실행 실패 (rc={result.returncode}): {result.stderr[:300]}")
+        else:
+            logger.info(f"{ts_prefix()} [morning_target] 스크립트 실행 완료")
+    except Exception as e:
+        logger.warning(f"[morning_target] 스크립트 실행 예외: {e}")
+
+    # ── 2) CSV 읽기 → 마지막 날짜 + group=ST + 500원 이상 필터 ──
+    try:
+        if not csv_path.exists():
+            raise FileNotFoundError(f"CSV 없음: {csv_path}")
+        df = pd.read_csv(csv_path, dtype=str, encoding="utf-8-sig")
+        if df.empty or "date" not in df.columns or "symbol" not in df.columns:
+            raise ValueError("CSV가 비어 있거나 필수 컬럼 누락")
+
+        last_date = df["date"].max()
+        last_day = df[df["date"] == last_date]
+        raw_codes = last_day["symbol"].str.strip().str.zfill(6).unique().tolist()
+        logger.info(f"{ts_prefix()} [morning_target] ① CSV({last_date}) 전일 상한가: {len(raw_codes)}종목")
+
+        # group=ST 필터링 (모듈 레벨 초기화 전이므로 직접 KRX_code.csv 로드)
+        krx_path = Path("/home/ubuntu/Stoc_Kis/data/admin/symbol_master/KRX_code.csv")
+        st_set = set()
+        if krx_path.exists():
+            krx_df = pd.read_csv(krx_path, dtype=str, usecols=["code", "group"])
+            krx_df["code"] = krx_df["code"].str.strip().str.zfill(6)
+            krx_df["group"] = krx_df["group"].str.strip().str.upper()
+            st_set = set(krx_df.loc[krx_df["group"] == "ST", "code"])
+        if st_set:
+            st_codes = [c for c in raw_codes if c in st_set]
+        else:
+            st_codes = raw_codes  # KRX 데이터 없으면 전체 통과
+        logger.info(f"{ts_prefix()} [morning_target] ② ST 필터: {len(raw_codes)} → {len(st_codes)}종목")
+
+        # 단가 500원 이상 필터 (CSV close 컬럼)
+        close_map: dict[str, float] = {}
+        last_day_c = last_day.copy()
+        last_day_c["_code6"] = last_day_c["symbol"].str.strip().str.zfill(6)
+        for _, row in last_day_c.iterrows():
+            try:
+                close_map[row["_code6"]] = float(row.get("close", 0) or 0)
+            except (ValueError, TypeError):
+                close_map[row["_code6"]] = 0.0
+
+        price_filtered = [c for c in st_codes if close_map.get(c, 0) >= 500]
+        excluded_price = [c for c in st_codes if close_map.get(c, 0) < 500]
+        if excluded_price:
+            # 종목명 매핑 (code_name_map이 아직 없을 수 있으므로 CSV name 사용)
+            name_map_tmp = dict(zip(last_day_c["_code6"], last_day["name"].str.strip())) if "name" in last_day.columns else {}
+            excl_detail = ", ".join(
+                f"{name_map_tmp.get(c, c)}({c})={int(close_map.get(c, 0))}원"
+                for c in excluded_price
+            )
+            logger.info(f"{ts_prefix()} [morning_target] ③ 500원 미만 제외: {excl_detail}")
+        logger.info(f"{ts_prefix()} [morning_target] ③ 500원 필터: {len(st_codes)} → {len(price_filtered)}종목")
+
+        # 종목명 매핑 (code_name_map이 아직 없을 수 있으므로 CSV name 사용)
+        name_map = dict(zip(last_day_c["_code6"], last_day["name"].str.strip())) if "name" in last_day.columns else {}
+        names = [name_map.get(c, c) for c in price_filtered]
+        logger.info(
+            f"{ts_prefix()} [morning_target] ④ 최종: {len(price_filtered)}종목 {names}"
+        )
+        if price_filtered:
+            return price_filtered
+    except Exception as e:
+        logger.warning(f"[morning_target] CSV 읽기 실패: {e}")
+
+    # ── 3) fallback: 기존 거래장부 기반 ──
+    logger.info("[morning_target] fallback → _load_prev_closing_codes()")
+    return _load_prev_closing_codes()
+
+
+def _load_nxt_target_codes_pre() -> set[str]:
+    """NXT 프리마켓 대상: 전일 상한가 CSV 중 ST종목 + 단가 500원 이상 + 보유종목.
+
+    필터 순서:
+    1) CSV 최신 날짜 전일 상한가 종목 로드
+    2) KRX_code.csv group=ST 필터 (시장구분)
+    3) 단가 500원 이상 필터 (CSV close 컬럼)
+    4) 보유종목 무조건 추가 (방어 목적)
+    """
+    global _nxt_target_codes, _nxt_target_info
+    _nxt_target_info.clear()
+    try:
+        csv_path = Path("/home/ubuntu/Stoc_Kis/symulation/Select_Tr_target_list.csv")
+        upper_codes: set[str] = set()
+        if csv_path.exists():
+            df = pd.read_csv(csv_path, dtype=str, encoding="utf-8-sig")
+            if not df.empty and "symbol" in df.columns:
+                last_date = df["date"].max() if "date" in df.columns else None
+                if last_date:
+                    df = df[df["date"] == last_date]
+                raw_codes = df["symbol"].str.strip().str.zfill(6).unique().tolist()
+                logger.info(f"{ts_prefix()} [nxt] ① CSV({last_date}) 전일 상한가: {len(raw_codes)}종목")
+
+                # ── ST + NXT 필터 (KRX_code.csv group=ST, nxt=Y) ──
+                krx_path = Path("/home/ubuntu/Stoc_Kis/data/admin/symbol_master/KRX_code.csv")
+                st_set = set()
+                nxt_set = set()
+                if krx_path.exists():
+                    krx_cols = ["code", "group"]
+                    # nxt 컬럼이 있으면 함께 로드
+                    try:
+                        _test_df = pd.read_csv(krx_path, dtype=str, nrows=0)
+                        if "nxt" in _test_df.columns:
+                            krx_cols.append("nxt")
+                    except Exception:
+                        pass
+                    krx_df = pd.read_csv(krx_path, dtype=str, usecols=krx_cols)
+                    krx_df["code"] = krx_df["code"].str.strip().str.zfill(6)
+                    krx_df["group"] = krx_df["group"].str.strip().str.upper()
+                    st_set = set(krx_df.loc[krx_df["group"] == "ST", "code"])
+                    if "nxt" in krx_df.columns:
+                        krx_df["nxt"] = krx_df["nxt"].str.strip().str.upper()
+                        nxt_set = set(krx_df.loc[krx_df["nxt"] == "Y", "code"])
+                if st_set:
+                    st_codes = [c for c in raw_codes if c in st_set]
+                else:
+                    logger.warning("[nxt] KRX_code에 group 컬럼 없음 → 전체 통과")
+                    st_codes = list(raw_codes)
+                logger.info(f"{ts_prefix()} [nxt] ② ST 필터: {len(raw_codes)} → {len(st_codes)}종목")
+
+                # NXT 적격 필터
+                if nxt_set:
+                    before_nxt = len(st_codes)
+                    st_codes = [c for c in st_codes if c in nxt_set]
+                    if before_nxt != len(st_codes):
+                        logger.info(f"{ts_prefix()} [nxt] ②-1 NXT 적격 필터: {before_nxt} → {len(st_codes)}종목")
+                else:
+                    logger.warning("[nxt] KRX_code에 nxt 컬럼 없음 → NXT 필터 스킵")
+
+                # ── 단가 500원 이상 필터 (CSV close 컬럼) ──
+                # close 컬럼에서 종목별 종가 매핑
+                df["_code6"] = df["symbol"].str.strip().str.zfill(6)
+                close_map: dict[str, float] = {}
+                for _, row in df.iterrows():
+                    try:
+                        close_map[row["_code6"]] = float(row.get("close", 0) or 0)
+                    except (ValueError, TypeError):
+                        close_map[row["_code6"]] = 0.0
+
+                price_filtered = [c for c in st_codes if close_map.get(c, 0) >= 500]
+                excluded_price = [c for c in st_codes if close_map.get(c, 0) < 500]
+                if excluded_price:
+                    excl_detail = ", ".join(
+                        f"{code_name_map.get(c, c)}({c})={int(close_map.get(c, 0))}원"
+                        for c in excluded_price
+                    )
+                    logger.info(f"{ts_prefix()} [nxt] ③ 500원 미만 제외: {excl_detail}")
+                logger.info(f"{ts_prefix()} [nxt] ③ 500원 필터: {len(st_codes)} → {len(price_filtered)}종목")
+
+                upper_codes = set(price_filtered)
+
+                # CSV에서 종목별 정보 추출
+                for c in upper_codes:
+                    row = df[df["_code6"] == c].iloc[0] if c in df["_code6"].values else None
+                    if row is not None:
+                        try:
+                            # 표시용 퍼센트: CSV 생성기(str3)가 "해당 date에 tdy_ctrt≥0.28인 종목"을
+                            # 다음 거래일 대상으로 저장하므로, 전일(=해당 date)의 상한가 판정에 쓰이는 값은
+                            # tdy_ctrt 다. (pdy_ctrt는 그 전날 ratio라 오해를 유발함)
+                            pdy_ctrt = float(row.get("tdy_ctrt", 0)) * 100 if row.get("tdy_ctrt") else 0
+                            close = float(row.get("close", 0)) if row.get("close") else 0
+                        except (ValueError, TypeError):
+                            pdy_ctrt, close = 0, 0
+                        _nxt_target_info[c] = {
+                            "name": code_name_map.get(c, c), "pdy_close": close,
+                            "pdy_ctrt": pdy_ctrt, "source": "상한가",
+                        }
+                    else:
+                        _nxt_target_info[c] = {"name": code_name_map.get(c, c), "source": "상한가"}
+        else:
+            logger.info("[nxt] Select_Tr_target_list.csv 없음")
+
+        # 보유종목 추가 (필터 없이 무조건 포함 — 방어 목적)
+        held_added = _nxt_held_codes - upper_codes
+        for c in held_added:
+            _nxt_target_info[c] = {"name": code_name_map.get(c, c), "source": "보유"}
+
+        result = upper_codes | _nxt_held_codes
+        logger.info(f"{ts_prefix()} [nxt] ④ 최종 프리마켓 대상: {len(result)}종목 "
+                     f"(상한가+ST+500원={len(upper_codes)} + 보유={len(held_added)})")
+        _nxt_target_codes = result
+        return result
+    except Exception as e:
+        logger.warning(f"[nxt] 프리마켓 대상 로드 실패: {e}")
+        return set()
+
+
+def _refresh_nxt_target_codes_after() -> set[str]:
+    """NXT 애프터마켓 대상: 당일 prdy_ctrt >= 29.5% + ST종목 + 500원 이상.
+    재시작 시 _last_prdy_ctrt가 비어있으면 프리마켓 대상(전일 상한가)으로 폴백.
+    """
+    global _nxt_target_codes, _nxt_target_info
+    try:
+        candidates = {c for c, v in _last_prdy_ctrt.items() if v >= 29.5}
+        if not candidates:
+            # 폴백: 재시작 시 _last_prdy_ctrt가 초기화되어 비어있을 수 있음
+            # → 프리마켓 대상(전일 상한가 CSV)으로 대체
+            logger.info(f"{ts_prefix()} [nxt] 당일 상한가 정보 없음 → 전일 상한가 CSV로 폴백")
+            return _load_nxt_target_codes_pre()
+        # ST + NXT 필터 (KRX_code.csv group=ST, nxt=Y)
+        krx_path = Path("/home/ubuntu/Stoc_Kis/data/admin/symbol_master/KRX_code.csv")
+        st_set = set()
+        nxt_set = set()
+        if krx_path.exists():
+            krx_cols = ["code", "group"]
+            try:
+                _test_df = pd.read_csv(krx_path, dtype=str, nrows=0)
+                if "nxt" in _test_df.columns:
+                    krx_cols.append("nxt")
+            except Exception:
+                pass
+            krx_df = pd.read_csv(krx_path, dtype=str, usecols=krx_cols)
+            krx_df["code"] = krx_df["code"].str.strip().str.zfill(6)
+            krx_df["group"] = krx_df["group"].str.strip().str.upper()
+            st_set = set(krx_df.loc[krx_df["group"] == "ST", "code"])
+            if "nxt" in krx_df.columns:
+                krx_df["nxt"] = krx_df["nxt"].str.strip().str.upper()
+                nxt_set = set(krx_df.loc[krx_df["nxt"] == "Y", "code"])
+        if st_set:
+            upper_codes = candidates & st_set
+        else:
+            upper_codes = candidates
+        # NXT 적격 필터
+        if nxt_set:
+            before_nxt = len(upper_codes)
+            upper_codes = upper_codes & nxt_set
+            if before_nxt != len(upper_codes):
+                logger.info(f"{ts_prefix()} [nxt] 애프터 NXT 적격 필터: {before_nxt} → {len(upper_codes)}종목")
+        else:
+            logger.warning("[nxt] KRX_code에 nxt 컬럼 없음 → NXT 필터 스킵")
+        # 500원 이상 필터 (_last_stck_prpr 사용)
+        before_price = len(upper_codes)
+        upper_codes = {c for c in upper_codes if _last_stck_prpr.get(c, 0) >= 500}
+        if before_price != len(upper_codes):
+            logger.info(f"{ts_prefix()} [nxt] 애프터 500원 필터: {before_price} → {len(upper_codes)}종목")
+
+        # _nxt_target_info 갱신
+        _nxt_target_info.clear()
+        for c in upper_codes:
+            _nxt_target_info[c] = {"name": code_name_map.get(c, c), "source": "상한가"}
+
+        # 보유종목 추가 (방어 목적)
+        held_added = _nxt_held_codes - upper_codes
+        for c in held_added:
+            _nxt_target_info[c] = {"name": code_name_map.get(c, c), "source": "보유"}
+
+        result = upper_codes | _nxt_held_codes
+        logger.info(f"{ts_prefix()} [nxt] 애프터마켓 대상 갱신: {len(result)}종목 "
+                     f"(상한가 {len(upper_codes)} + 보유 {len(held_added)})")
+        _nxt_target_codes = result
+        return result
+    except Exception as e:
+        logger.warning(f"[nxt] 애프터마켓 대상 갱신 실패: {e}")
+        return set()
+
+
+_loaded_top_added: list[str] = []  # config에서 복원한 top_added (초기화 전 임시 저장)
+
+def _load_codes_from_cfg(base_codes: list[str]) -> list[str]:
+    """TOP5_ADD=True → config 우선 복원, False → CODE_TEXT 원본으로 시작."""
+    global _loaded_top_added
+
+    # ── TOP5_ADD=False → 항상 CODE_TEXT 원본으로 시작 (config 복원 안 함) ──
+    if not TOP5_ADD:
+        _loaded_top_added = []
+        logger.info(
+            f"[codes] TOP5_ADD=False → CODE_TEXT base({len(base_codes)}개)로 시작"
+        )
+        return list(base_codes)
+
+    # ── TOP5_ADD=True → 기존 로직: config 우선 복원 ──
+    now_t = datetime.now(KST).time()
+
+    # 09:00 이전 시작 → config 초기화, CODE_TEXT 원본으로 시작
+    if now_t < dtime(9, 0):
+        logger.info(
+            f"[codes] 09:00 이전 시작 → config 초기화, CODE_TEXT base({len(base_codes)}개)로 시작"
+        )
+        _loaded_top_added = []
+        return list(base_codes)
+
+    # 09:00 이후 시작 (재시작) → 당일 config 복원
+    cfg = _read_sub_cfg()
+
+    cfg_date = str(cfg.get("wss_subscribe_date") or "")
+    cfg_codes = cfg.get("wss_subscribe_codes")
+    cfg_top_added = cfg.get("wss_top_added_codes", [])
+
+    if isinstance(cfg_codes, list) and cfg_codes:
+        norm = _normalize_code_list(cfg_codes)
+        if norm:
+            _loaded_top_added = [c for c in cfg_top_added if c in set(norm)]
+            if cfg_date == today_yymmdd:
+                # 당일 재시작 → config 그대로 복원
+                return norm
+            else:
+                # 날짜 변경 → CODE_TEXT base만 사용 (이전 날짜 종목 제거)
+                logger.info(
+                    f"[codes] 날짜 변경 → CODE_TEXT base({len(base_codes)}개)로 초기화"
+                )
+                _loaded_top_added = []
+                return list(base_codes)
+    return base_codes
+
+
+def _code_name_map() -> dict[str, str]:
+    try:
+        sdf = load_symbol_master()
+        sdf["code"] = sdf["code"].astype(str).str.zfill(6)
+        return dict(zip(sdf["code"], sdf["name"].astype(str)))
+    except Exception:
+        return {}
+
+
+_morning_target_codes = _load_morning_target_codes()
+if _morning_target_codes:
+    _code_text_codes = _morning_target_codes
+else:
+    _code_text_codes = _parse_codes(CODE_TEXT)
+    logger.info(f"[codes] morning_target 없음 → CODE_TEXT 폴백({len(_code_text_codes)}개)")
+codes = _load_codes_from_cfg(_code_text_codes)
+if not codes:
+    raise RuntimeError("CODE_TEXT에서 종목코드를 찾지 못했습니다.")
+code_name_map = _code_name_map()
+# code → market 매핑 (KOSPI/KOSDAQ) — 사이드카/써킷 마켓 전파용
+try:
+    _sdf_mkt = load_symbol_master()
+    _sdf_mkt["code"] = _sdf_mkt["code"].astype(str).str.zfill(6)
+    _code_market_map = dict(zip(_sdf_mkt["code"], _sdf_mkt["market"].astype(str)))
+    logger.info(f"[codes] code_market_map 로드: {len(_code_market_map)}종목")
+    del _sdf_mkt
+except Exception as _e:
+    logger.warning(f"[codes] code_market_map 로드 실패: {_e}")
+logger.info(f"[codes] count={len(codes)} codes={codes}")
+_codes_lock = threading.RLock()
+# base_codes = morning_target 종목 (하루 종일 보호, top30에 의한 해제 방지)
+_base_codes = set(_morning_target_codes) if _morning_target_codes else set(_code_text_codes)
+logger.info(f"[codes] base={len(_base_codes)}개 (보호, morning_target), top_added(복원)={len(_loaded_top_added)}개")
+_persist_subscription_codes(codes)
+
+
+def _chunks(lst: list[str], n: int):
+    for i in range(0, len(lst), n):
+        yield lst[i : i + n]
+
+
+# =============================================================================
+# 시간대별 저장 스위치
+# =============================================================================
+SAVE_REAL_REGULAR = False     # 정규장 실시간체결 저장
+SAVE_EXP_REGULAR = False      # 정규장 예상체결 저장
+SAVE_REAL_OVERTIME = False    # 시간외 실시간체결 저장
+SAVE_EXP_OVERTIME = False     # 시간외 예상체결 저장
+
+_flags_lock = threading.RLock()
+
+# =============================================================================
+# 운영 모드(시간대별 구독 스케줄)
+# =============================================================================
+class RunMode(Enum):
+    PREOPEN_WAIT = auto()
+    NXT_PRE = auto()          # 08:00~08:50 NXT 프리마켓
+    PREOPEN_EXP = auto()
+    REGULAR_REAL = auto()
+    CLOSE_EXP = auto()
+    CLOSE_REAL = auto()
+    OVERTIME_EXP = auto()
+    OVERTIME_REAL = auto()
+    NXT_AFTER = auto()        # 15:40~20:00 NXT 애프터마켓
+    STOP = auto()
+    EXIT = auto()
+
+_mode_lock = threading.RLock()
+_current_mode: RunMode | None = None
+_ws_rebuild_event = threading.Event()
+_kws_lock = threading.RLock()
+_active_kws = None
+
+
+def _trigger_ws_rebuild():
+    """종목 변경 시 즉시 동적 구독/해제 적용 (재연결 없이)."""
+    def _do():
+        now = datetime.now(KST)
+        with _kws_lock:
+            if _active_kws is not None:
+                desired = _desired_subscription_map(now)
+                _apply_subscriptions(_active_kws, desired)
+        # a2 예상체결가 구독도 갱신
+        _a2_apply_subscriptions(now)
+
+    t = threading.Thread(target=_do, daemon=True)
+    t.start()
+    t.join(timeout=5.0)
+    if t.is_alive():
+        logger.warning(f"{ts_prefix()} [ws] _trigger_ws_rebuild timeout(5s) — 구독 갱신 지연, 다음 주기 재시도")
+        # 소켓은 닫지 않음 — 데이터 수신은 정상이므로 구독 갱신만 지연될 뿐
+
+    # ── [주석] 재연결 방식 (동적 구독 문제 시 아래 주석 해제, 위 블록 주석 처리) ──
+    # _ws_rebuild_event.set()
+    # if _get_mode() == RunMode.CLOSE_REAL:
+    #     return
+    # with _kws_lock:
+    #     if _active_kws is not None:
+    #         _notify(
+    #             f"{ts_prefix()} [ws] 종목 변경 감지 → WS 재연결 "
+    #             f"(구독 {len(codes)}종목 전체 재등록)"
+    #         )
+    #         _request_ws_close(_active_kws)
+
+
+END_TIME = dtime(20, 1)     # NXT 애프터마켓 20:00 종료 + 1분 여유
+_end_time_reached = False   # 종료 시도 시 True (WS 지연 종료 시 병합 판단용)
+_regular_real_seen: set[str] = set()
+_close_force_stopped = False          # 15:30 유예시간 후 강제 구독 중단 1회 로그용
+_last_overtime_buy_min: int = -1  # 마지막 실행 분(minute) - 10분당 1회
+_ccnl_early_add_date: date | None = None  # 08:30 구독 추가한 날짜 (1일 1회)
+_overtime_real_seen: set[str] = set()
+_overtime_real_active = False
+_overtime_real_started_ts: float = 0.0   # 체결가 전환 시점 (타임아웃용)
+_overtime_real_last_progress_ts: float = 0.0  # 마지막 진행상황 출력 시각
+OVERTIME_REAL_TIMEOUT = 180              # 180초 내 전 종목 미수신 시 강제 복귀
+OVERTIME_REAL_PROGRESS_INTERVAL = 10     # 체결가 수신 중 진행상황 출력 간격(초)
+_last_overtime_real_slot: datetime | None = None
+_vi_delayed_codes: set[str] = set()   # VI 발동 의심 종목 (09:00~09:02 예상체결 유지)
+_vi_delay_until: datetime | None = None  # VI 지연 종료 시각 (09:02:00)
+_last_prdy_ctrt: dict[str, float] = {c: 0.0 for c in codes}
+_last_mkop_cls_code: dict[str, str] = {}  # code -> new_mkop_cls_code (종목상태, WS 수신값)
+_last_trid_per_code: dict[str, str] = {}  # code → 마지막 수신 tr_id
+_last_stck_prpr: dict[str, float] = {}  # code -> 최근 체결가 (모니터링용)
+_nxt_target_codes: set[str] = set()    # NXT 프리/애프터마켓 대상 종목 (전일 상한가 + ST + 500원↑)
+_nxt_held_codes: set[str] = set()      # NXT 프리마켓 보유종목 (07:58 잔고조회)
+_nxt_target_info: dict[str, dict] = {} # code -> {name, pdy_close, pdy_ctrt, source}
+_subscribed: dict[str, set[str]] = {}
+
+def calc_mode(now: datetime) -> RunMode:
+    t = now.time()
+    if t < dtime(8, 0):
+        return RunMode.PREOPEN_WAIT
+    if dtime(8, 0) <= t < dtime(8, 50):
+        return RunMode.NXT_PRE
+    if dtime(8, 50) <= t < dtime(9, 0):
+        return RunMode.PREOPEN_EXP
+    if dtime(9, 0) <= t < dtime(15, 20):
+        return RunMode.REGULAR_REAL
+    if dtime(15, 20) <= t < dtime(15, 30):
+        return RunMode.CLOSE_EXP
+    if dtime(15, 30) <= t < dtime(15, 40):
+        return RunMode.CLOSE_REAL
+    if dtime(15, 40) <= t < dtime(16, 0):
+        return RunMode.CLOSE_REAL    # 시간외종가 매매 구간 — NXT 진입 전
+    if dtime(16, 0) <= t < dtime(20, 0):
+        return RunMode.NXT_AFTER
+    if t >= dtime(20, 0):
+        return RunMode.EXIT
+    return RunMode.EXIT
+
+# NXT 애프터마켓 조기 종료 플래그 (NXT_AFTER 진입 시 대상 없으면 설정)
+_nxt_after_early_exit: bool = False
+
+def _log_mode_transition(prev: RunMode | None, cur: RunMode) -> None:
+    sys.stdout.write("\n")  # 제자리 출력 줄바꿈
+    if cur == RunMode.PREOPEN_WAIT:
+        _notify(f"{ts_prefix()} 장 개시전까지 대기/", tele=True)
+    elif cur == RunMode.NXT_PRE:
+        lines = [f"{ts_prefix()} NXT 프리마켓 시작 (08:00~08:50): {len(_nxt_target_codes)}종목 모니터링 시작"]
+        upper = [c for c in sorted(_nxt_target_codes) if _nxt_target_info.get(c, {}).get("source") == "상한가"]
+        held = [c for c in sorted(_nxt_target_codes) if _nxt_target_info.get(c, {}).get("source") == "보유"]
+        if upper:
+            lines.append(f"  ▶ 전일 상한가(ST+500원↑): {len(upper)}종목")
+            for c in upper:
+                info = _nxt_target_info.get(c, {})
+                name = info.get("name", code_name_map.get(c, c))
+                pdy_ctrt = info.get("pdy_ctrt")
+                pdy_close = info.get("pdy_close")
+                detail = f"  - {name}({c})"
+                if pdy_close:
+                    detail += f" 전일종가 {int(pdy_close):,}"
+                if pdy_ctrt:
+                    detail += f" ({'+' if pdy_ctrt >= 0 else ''}{pdy_ctrt:.1f}%)"
+                lines.append(detail)
+        if held:
+            lines.append(f"  ▶ 보유종목: {len(held)}종목")
+            for c in held:
+                name = _nxt_target_info.get(c, {}).get("name", code_name_map.get(c, c))
+                lines.append(f"  - {name}({c})")
+        _notify("\n".join(lines), tele=True)
+    elif cur == RunMode.PREOPEN_EXP:
+        _sub_names = [code_name_map.get(c, c) for c in codes]
+        _notify(f"{ts_prefix()} 08:50 예상체결가 구독 시작: {len(codes)}종목 {_sub_names}", tele=True)
+    elif cur == RunMode.REGULAR_REAL:
+        _sub_names = [code_name_map.get(c, c) for c in codes]
+        _notify(f"{ts_prefix()} 09:00 예상체결가 구독 중지 -> 실시간 체결가 구독 시작: {len(codes)}종목 {_sub_names}", tele=True)
+    elif cur == RunMode.CLOSE_EXP:
+        pass  # _switch_to_closing_codes()에서 메시지 출력 완료 (tele 포함)
+    elif cur == RunMode.CLOSE_REAL:
+        _notify(f"{ts_prefix()} 15:30 종가 체결가 구독 전환")
+    elif cur == RunMode.OVERTIME_EXP:
+        if prev == RunMode.OVERTIME_REAL:
+            _notify(f"{ts_prefix()} [시간외] 체결가 수신 완료 → 예상체결가 복귀")
+        else:
+            _notify(f"{ts_prefix()} [시간외] 예상체결가 구독 시작", tele=True)
+    elif cur == RunMode.OVERTIME_REAL:
+        _notify(f"{ts_prefix()} [시간외] 예상체결가 → 체결가 전환")
+    elif cur == RunMode.NXT_AFTER:
+        global _nxt_after_early_exit
+        if not _nxt_target_codes:
+            _refresh_nxt_target_codes_after()  # 재시작 시 대상 자동 갱신
+        if not _nxt_target_codes and NXT_AFTER_EARLY_EXIT:
+            _nxt_after_early_exit = True
+            _notify(f"{ts_prefix()} NXT 애프터마켓: 모니터링 대상 0종목 → 조기 종료 진행", tele=True)
+            return
+        lines = [f"{ts_prefix()} NXT 애프터마켓 시작 (16:00~20:00): {len(_nxt_target_codes)}종목 모니터링 시작"]
+        upper = [c for c in sorted(_nxt_target_codes) if _nxt_target_info.get(c, {}).get("source") != "보유"]
+        held = [c for c in sorted(_nxt_target_codes) if _nxt_target_info.get(c, {}).get("source") == "보유"]
+        if upper:
+            lines.append(f"  ▶ 당일 상한가(nxt=Y): {len(upper)}종목")
+            for c in upper:
+                name = _nxt_target_info.get(c, {}).get("name", code_name_map.get(c, c))
+                lines.append(f"  - {name}({c})")
+        if held:
+            lines.append(f"  ▶ 보유종목: {len(held)}종목")
+            for c in held:
+                name = _nxt_target_info.get(c, {}).get("name", code_name_map.get(c, c))
+                lines.append(f"  - {name}({c})")
+        _notify("\n".join(lines), tele=True)
+    elif cur == RunMode.STOP:
+        _notify(f"{ts_prefix()} 모든 구독 종료")
+    elif cur == RunMode.EXIT:
+        pass  # EXIT 순서는 scheduler_loop에서 직접 제어
+
+def _get_mode() -> RunMode:
+    with _mode_lock:
+        return _current_mode or calc_mode(datetime.now(KST))
+
+def _notify_overtime_single_price_final() -> None:
+    """18:00 시간외 단일가(16:00~18:00) 마감 시 당일 해당 구분장 거래 총 내역 통보."""
+    if not CLOSE_BUY:
+        return
+    s = _load_closing_buy_state()
+    if not s or not s.get("orders"):
+        return
+    orders = s.get("orders") or []
+    filled_map = _get_closing_filled_for_remain(s)
+    total_ord, total_fill, total_remain = 0, 0, 0
+    n_order_items, n_filled_items, n_remain_items = 0, 0, 0
+    remain_detail = []
+    for o in orders:
+        code = str(o.get("code", "")).zfill(6)
+        ord_q = int(o.get("order_qty", o.get("qty", 0)))
+        filled = min(ord_q, max(int(o.get("filled_qty", 0)), filled_map.get(code, 0)))
+        remain = max(0, ord_q - filled)
+        total_ord += ord_q
+        total_fill += filled
+        total_remain += remain
+        if ord_q > 0:
+            n_order_items += 1
+        if filled > 0:
+            n_filled_items += 1
+        if remain > 0:
+            n_remain_items += 1
+            name = o.get("name") or (s.get("code_info") or {}).get(code, {}).get("name") or code_name_map.get(code, code)
+            remain_detail.append(f"{name}({code}) {remain}주")
+    msg = (
+        f"{ts_prefix()} [시간외 단일가 16:00~18:00 마감] 당일 거래 총 내역\n"
+        f"총 {len(orders)}종목 | 주문 {n_order_items}종목 {total_ord}개 | 매수 {n_filled_items}종목 {total_fill}개 | 미매수 {n_remain_items}종목 {total_remain}개"
+    )
+    if remain_detail:
+        msg += "\n미매수: " + ", ".join(remain_detail)
+    _notify(msg, tele=True)
+
+
+def _final_summary() -> str:
+    with _lock:
+        saved_rows = _written_rows
+        saved_codes = sum(1 for c in codes if _total_counts.get(c, 0) > 0)
+    try:
+        size_mb = FINAL_PARQUET_PATH.stat().st_size / (1024 * 1024)
+    except Exception:
+        size_mb = -1.0
+    return (
+        f"{ts_prefix()} [최종] saved_codes={saved_codes}종목 "
+        f"saved_rows={saved_rows} file={FINAL_PARQUET_PATH.name} size_mb={size_mb:.2f}"
+    )
+
+_last_strategy_swap_ts: float = 0.0
+
+
+def _check_strategy_swap() -> None:
+    """config.json의 strategy_swap.status == 'requested' 이면 전략 모듈 리로드."""
+    global _last_strategy_swap_ts
+    now_ts = time.time()
+    if now_ts - _last_strategy_swap_ts < 1.0:  # 최소 1초 간격
+        return
+    _last_strategy_swap_ts = now_ts
+    try:
+        cfg = _read_cfg()
+        if not cfg:
+            return
+        swap = cfg.get("strategy_swap")
+        if not swap or not isinstance(swap, dict):
+            return
+        if swap.get("status") != "requested":
+            return
+        module_name = swap.get("module", "ws_realtime_tr_str1")
+        import importlib
+        mod = importlib.import_module(module_name)
+        importlib.reload(mod)
+        # 리로드된 함수를 글로벌에 반영
+        global check_opening_call_auction_sell, check_opening_call_auction_cancel, check_realtime_sell, calc_sell_pnl
+        check_opening_call_auction_sell = getattr(mod, "check_opening_call_auction_sell", check_opening_call_auction_sell)
+        check_opening_call_auction_cancel = getattr(mod, "check_opening_call_auction_cancel", check_opening_call_auction_cancel)
+        check_realtime_sell = getattr(mod, "check_realtime_sell", check_realtime_sell)
+        calc_sell_pnl = getattr(mod, "calc_sell_pnl", calc_sell_pnl)
+        # config에 적용 완료 기록
+        cfg["strategy_swap"] = {
+            "status": "applied",
+            "module": module_name,
+            "timestamp": datetime.now(KST).isoformat(),
+        }
+        save_config(cfg, str(CONFIG_PATH))
+        msg = f"{ts_prefix()} [전략교체] {module_name} 리로드 적용 완료"
+        _notify(msg, tele=True)
+        logger.info(msg)
+    except Exception as e:
+        logger.warning(f"{ts_prefix()} [전략교체] 실패: {e}")
+        try:
+            cfg2 = _read_cfg()
+            if cfg2:
+                cfg2["strategy_swap"] = {
+                    "status": f"failed: {e}",
+                    "module": cfg.get("strategy_swap", {}).get("module", ""),
+                    "timestamp": datetime.now(KST).isoformat(),
+                }
+                save_config(cfg2, str(CONFIG_PATH))
+        except Exception:
+            pass
+
+
+# ── 외부 주문 주입 (Phase 4-3) ───────────────────────────────────────────────
+_last_external_order_ts: float = 0.0
+
+
+def _check_external_orders() -> None:
+    """config.json의 external_orders 배열 모니터링 → 주문 실행.
+
+    external_orders 각 항목 구조:
+      no, target, order(1=매수/2=매도), symbol, qty, amount,
+      target_price(0=시장가, "상한가"/"하한가" 키워드 가능), ord_type, result, target_qty, remain_qty
+
+    ord_type (생략 시 auto):
+      auto/""    : target_price=0→시장가(01), target_price>0→지정가(00)
+      pre_market : 장전시간외종가(05), 08:30~08:40, 전일종가 자동체결
+      post_market: 장후시간외종가(06), 15:40~16:00, 당일종가 자동체결
+      overtime   : 시간외단일가(07), 16:00~18:00, target_price 필수
+
+    result 진행: "" → "접수" → "주문완료" → 삭제
+    """
+    global _last_external_order_ts
+    now_ts = time.time()
+    if now_ts - _last_external_order_ts < 1.0:
+        return
+    _last_external_order_ts = now_ts
+
+    try:
+        cfg = _read_cfg()
+        if not cfg:
+            return
+        # no_sell_codes 변경 감지 (매 사이클)
+        _refresh_no_sell_from_cfg(cfg)
+        ext_orders = cfg.get("external_orders")
+        if not ext_orders or not isinstance(ext_orders, list):
+            return
+
+        changed = False
+        completed_indices: list[int] = []
+
+        for idx, order in enumerate(ext_orders):
+            if not isinstance(order, dict):
+                continue
+            result = str(order.get("result", "")).strip()
+
+            # ── 접수 단계: 빈 result → "접수" ──
+            if result == "":
+                order["result"] = "접수"
+                changed = True
+                sym = str(order.get("symbol", "")).strip()
+                ot = str(order.get("ord_type", "")).strip()
+                ot_desc = f" [{ot}]" if ot else ""
+                logger.info(f"{ts_prefix()} [외부주문] config raw: {order}")
+                _notify(f"{ts_prefix()} [외부주문] #{order.get('no',idx+1)} 접수: "
+                        f"{'매수' if order.get('order')==1 else '매도'} {sym}{ot_desc}", tele=True)
+                continue  # 다음 루프에서 실행
+
+            # ── 실행 단계: "접수" → 주문 실행 → "주문완료" ──
+            if result == "접수":
+                _exec_external_order(cfg, order, idx)
+                changed = True
+                continue
+
+            # ── 완료 정리: "주문완료" → 삭제 대기 (다음 사이클) ──
+            if result == "주문완료":
+                completed_indices.append(idx)
+
+        # 완료 항목 삭제 (역순)
+        if completed_indices:
+            for i in sorted(completed_indices, reverse=True):
+                ext_orders.pop(i)
+            changed = True
+
+        # 빈 배열이면 키 자체 제거
+        if not ext_orders:
+            if "external_orders" in cfg:
+                del cfg["external_orders"]  # type: ignore[arg-type]
+                changed = True
+
+        if changed:
+            save_config(cfg, str(CONFIG_PATH))
+
+    except Exception as e:
+        logger.warning(f"{ts_prefix()} [외부주문] 처리 오류: {e}")
+
+
+def _exec_external_order(cfg: dict, order: dict, idx: int) -> None:
+    """external_orders 단일 항목 실행.
+
+    Phase 4-4: target 필드로 대상 계좌 지정. "all"이면 전체 계좌에 주문.
+
+    ord_type 옵션 (생략 시 auto):
+      auto / ""  : target_price=0 → 시장가(01), target_price>0 → 지정가(00)
+      pre_market : 장전시간외종가(05), 08:30~08:40, 전일종가 자동체결, 가격 미입력
+      post_market: 장후시간외종가(06), 15:40~16:00, 당일종가 자동체결, 가격 미입력
+      overtime   : 시간외단일가(07), 16:00~18:00, target_price 필수
+
+    target_price 특수 키워드:
+      "상한가" : REST API로 해당 종목 상한가 조회 → 지정가(00) 주문
+      "하한가" : REST API로 해당 종목 하한가 조회 → 지정가(00) 주문
+    """
+    logger.info(f"{ts_prefix()} [외부주문] 실행 시작 #{order.get('no',idx+1)}: {order}")
+    sym = str(order.get("symbol", "")).strip()
+    order_type = int(order.get("order", 0))  # 1=매수, 2=매도
+    qty = int(order.get("qty", 0) or 0)
+    amount = float(order.get("amount", 0) or 0)
+    raw_target_price = order.get("target_price", 0)
+    # "상한가"/"하한가" 키워드 지원 — 종목코드 확정 후 실제 가격 조회
+    _price_keyword = str(raw_target_price).strip() if isinstance(raw_target_price, str) else ""
+    target_price = 0.0 if _price_keyword in ("상한가", "하한가") else float(raw_target_price or 0)
+    target = order.get("target", "all")
+    ord_type = str(order.get("ord_type", "")).strip().lower()
+
+    if order_type not in (1, 2):
+        order["result"] = f"failed: order={order_type} 잘못된 주문유형"
+        return
+
+    # ── 종목코드 변환 ──
+    codes_resolved = _parse_codes(sym)
+    if not codes_resolved:
+        order["result"] = f"failed: '{sym}' 종목 못찾음"
+        logger.warning(f"{ts_prefix()} [외부주문] 종목 못찾음: {sym}")
+        return
+    code = codes_resolved[0]
+
+    # ── "상한가"/"하한가" 키워드 → 실제 가격 조회 ──
+    if _price_keyword in ("상한가", "하한가"):
+        try:
+            _any_acct = next(iter(_iter_enabled_accounts()), None)
+            if _any_acct:
+                _pc = _init_account_client(_any_acct)
+                _resp = _pc.inquire_price(code)
+                if _price_keyword == "상한가":
+                    target_price = float(str(_resp.get("stck_mxpr") or 0).replace(",", "") or 0)
+                else:
+                    target_price = float(str(_resp.get("stck_llam") or 0).replace(",", "") or 0)
+                if target_price <= 0:
+                    order["result"] = f"failed: {_price_keyword} 조회 실패"
+                    return
+                logger.info(f"{ts_prefix()} [외부주문] {code} {_price_keyword}={target_price:,.0f}")
+        except Exception as e:
+            order["result"] = f"failed: {_price_keyword} 조회 오류: {e}"
+            return
+
+    # ── 수량 계산 (amount 지정 시 현재가 기준으로 qty 산출) ──
+    if qty <= 0 and amount > 0:
+        price_ref = _last_stck_prpr.get(code, 0)
+        if price_ref <= 0:
+            ema = _ema_state.get(code, {})
+            price_ref = ema.get(3, 0) or 0
+        if price_ref > 0:
+            qty = int(amount / price_ref)
+        if qty <= 0:
+            order["result"] = f"failed: 수량 산출 불가 (price_ref={price_ref:.0f})"
+            return
+
+    if qty <= 0:
+        order["result"] = "failed: qty=0"
+        return
+
+    order["target_qty"] = qty
+    order["remain_qty"] = qty
+
+    # ── 대상 계좌 결정 (Phase 4-4) ──
+    all_accounts = _iter_enabled_accounts()
+    target_accounts = _resolve_target_accounts(target, all_accounts)
+    if not target_accounts:
+        order["result"] = "failed: 대상 계좌 없음"
+        return
+
+    # ── ord_dvsn / price_val 결정 ──
+    _ORD_TYPE_MAP = {
+        "pre_market": ("05", "장전시간외종가"),
+        "post_market": ("06", "장후시간외종가"),
+        "overtime": ("07", "시간외단일가"),
+    }
+    if ord_type in _ORD_TYPE_MAP:
+        ord_dvsn, ord_label = _ORD_TYPE_MAP[ord_type]
+        # 05/06은 가격 미입력, 07은 target_price 필수
+        if ord_dvsn == "07" and target_price <= 0:
+            order["result"] = f"failed: 시간외단일가(07)는 target_price 필수"
+            return
+        price_val = target_price if ord_dvsn == "07" else 0
+    else:
+        # auto (기본): target_price=0 → 시장가(01), target_price>0 → 지정가(00)
+        if ord_type and ord_type != "auto":
+            logger.warning(f"{ts_prefix()} [외부주문] 미인식 ord_type='{ord_type}' → auto 처리")
+        ord_dvsn = "01" if target_price == 0 else "00"
+        ord_label = "시장가" if ord_dvsn == "01" else "지정가"
+        price_val = target_price if target_price > 0 else 0
+
+    # ── 주문 가능 시간 체크 (장 시간 외이면 대기) ──
+    _now_hm = datetime.now(KST).strftime("%H%M")
+    _ORD_TIME_WINDOW = {
+        "05": ("0830", "0840", "장전시간외종가(05)는 08:30~08:40"),
+        "06": ("1540", "1600", "장후시간외종가(06)는 15:40~16:00"),
+        "07": ("1600", "1800", "시간외단일가(07)는 16:00~18:00"),
+        "00": ("0830", "1530", "지정가(00)는 08:30~15:30(동시호가 포함)"),
+        "01": ("0900", "1530", "시장가(01)는 09:00~15:30(장중)"),
+    }
+    if ord_dvsn in _ORD_TIME_WINDOW:
+        _t_start, _t_end, _t_desc = _ORD_TIME_WINDOW[ord_dvsn]
+        if _now_hm < _t_start or _now_hm >= _t_end:
+            # 아직 시간이 안 됐으면 "접수" 상태 유지 → 다음 사이클에서 재시도
+            order["result"] = "접수"
+            if not order.get("_time_wait_logged"):
+                logger.info(f"{ts_prefix()} [외부주문] 시간 대기 중: {_t_desc} (현재={_now_hm})")
+                order["_time_wait_logged"] = True
+            return
+
+    name = _code_name_map().get(code, code)
+    action = "매수" if order_type == 1 else "매도"
+    success_count = 0
+    total_ordered_qty = 0
+
+    for acct in target_accounts:
+        cano = acct["cano"]
+        acnt = acct.get("acnt_prdt_cd", "01") or "01"
+        alias = acct.get("alias", acct["account_id"])
+        try:
+            client = _init_account_client(acct)
+
+            if order_type == 1:  # 매수
+                tr_id = "TTTC0802U"
+                j = _buy_order_cash(client, cano, acnt, tr_id, code, qty, price_val, ord_dvsn)
+            else:  # 매도
+                j = _sell_order_cash(client, cano, acnt, code, qty, price_val, ord_dvsn)
+
+            ordno = j.get("output", {}).get("ODNO", "")
+            success_count += 1
+            total_ordered_qty += qty
+
+            price_desc = ord_label if price_val == 0 else f"{price_val:,.0f}"
+            msg = (f"{ts_prefix()} [외부주문] #{order.get('no',idx+1)} [{alias}] 접수 완료: "
+                   f"{action} {name}({code}) qty={qty} {ord_label}({ord_dvsn}) price={price_desc} ordno={ordno}")
+            _notify(msg, tele=True)
+            logger.info(msg)
+
+            try:
+                _ext_is_market = ord_dvsn == "01"
+                _ext_order_type = "buy_order" if order_type == 1 else "sell_order"
+                _ext_reason = f"external_{action}주문"
+                _append_ledger(
+                    order_type=_ext_order_type,
+                    code=code, name=name,
+                    buy_price=0 if (_ext_is_market and order_type == 1) else (price_val if order_type == 1 else 0),
+                    sell_price=0 if (_ext_is_market and order_type == 2) else (price_val if order_type == 2 else 0),
+                    order_qty=qty,
+                    ord_no=ordno,
+                    ord_dvsn=f"{ord_dvsn}({ord_label})",
+                    note=f"계좌={alias}",
+                    cano_alias=alias,
+                    stck_prpr=_last_stck_prpr.get(code, 0.0),
+                    reason=_ext_reason,
+                )
+            except Exception:
+                pass
+
+        except Exception as e:
+            logger.warning(f"{ts_prefix()} [외부주문] #{order.get('no',idx+1)} [{alias}] 실패: {e}")
+
+    if success_count > 0:
+        order["result"] = "주문완료"
+        order["remain_qty"] = 0
+        # no_sell 옵션: 매수 성공 시 매도 금지 목록에 자동 추가
+        if order_type == 1 and order.get("no_sell"):
+            _add_no_sell_code(sym.zfill(6), source="external_order")
+    else:
+        order["result"] = f"failed: {len(target_accounts)}계좌 전부 실패"
+
+
+def _run_exit_shutdown(reason: str) -> None:
+    """프로그램 종료 프로세스 (EXIT 또는 NXT 조기 종료 시 공통 실행)."""
+    global _end_time_reached
+    # ① 마지막 단일가 결과 집계 출력
+    try:
+        _log_closing_order_aggregation("17:50단일가")
+    except Exception:
+        pass
+    # ② 시간외 단일가 마감 총 거래 내역 통보
+    try:
+        _notify_overtime_single_price_final()
+    except Exception as e:
+        logger.warning(f"{ts_prefix()} [시간외단일가 마감통보] {e}")
+    # ③ 구독 종료 + WS 닫기
+    sys.stdout.write("\n")
+    _notify(f"{ts_prefix()} 시간외 체결가 구독 종료")
+    with _kws_lock:
+        if _active_kws is not None:
+            _request_ws_close(_active_kws)
+    time.sleep(1.0)
+    # ④ 버퍼 flush + parts 병합
+    _flush_part_buffer("shutdown", force_full=True)
+    _merge_parts_to_final()
+    # ⑤ 거래장부 연도별 parquet 갱신
+    _append_daily_ledger_to_yearly()
+    time.sleep(1.0)
+    # ⑥ 최종 요약
+    _notify(_final_summary())
+    time.sleep(1.0)
+    # ⑦ 프로그램 종료 안내
+    _notify(f"{ts_prefix()} {reason}로 프로그램 종료", tele=True)
+    _end_time_reached = True
+    _stop_event.set()
+
+
+def scheduler_loop():
+    global _current_mode, _last_rebuild_ts, _last_no_data_warn_ts
+    global _overtime_real_active, _overtime_real_last_progress_ts, _vi_delayed_codes, _vi_delay_until, _last_overtime_real_slot
+    global _end_time_reached, _active_kws
+    logger.info(f"{ts_prefix()} [scheduler] started")
+    while not _stop_event.is_set():
+        try:
+            now = datetime.now(KST)
+            # 07:50~08:00 NXT 프리마켓 준비: 전일 상한가 + nxt=Y 종목 로드 (1일 1회)
+            if dtime(7, 50) <= now.time() < dtime(8, 0):
+                today = now.date()
+                if getattr(scheduler_loop, '_nxt_pre_loaded_date', None) != today:
+                    scheduler_loop._nxt_pre_loaded_date = today
+                    try:
+                        _load_nxt_target_codes_pre()
+                    except Exception as e:
+                        logger.warning(f"{ts_prefix()} [nxt] 프리마켓 준비 실패: {e}")
+            # 15:30~15:40 NXT 애프터마켓 준비: 당일 상한가 종목 갱신 (1일 1회)
+            if dtime(15, 30) <= now.time() < dtime(15, 40):
+                if getattr(scheduler_loop, '_nxt_after_loaded_date', None) != now.date():
+                    scheduler_loop._nxt_after_loaded_date = now.date()
+                    try:
+                        _refresh_nxt_target_codes_after()
+                    except Exception as e:
+                        logger.warning(f"{ts_prefix()} [nxt] 애프터마켓 준비 실패: {e}")
+            # 08:29:59 체결통보 구독: 08:30 이전 연결 시 ccnl_notice 미구독 → 구독 추가 (1일 1회)
+            if dtime(8, 29, 59) <= now.time() < dtime(8, 30, 5):
+                global _ccnl_early_add_date
+                today = now.date()
+                if _ccnl_early_add_date != today:
+                    if _kws_a2 is not None:
+                        # a2에서 체결통보 구독
+                        _a2_subscribe_ccnl_notice()
+                        _ccnl_early_add_date = today
+                        _notify(f"{ts_prefix()} [체결통보] 08:29:59 a2 WSS 구독 추가", tele=True)
+                    else:
+                        with _kws_lock:
+                            if _active_kws is not None and "ccnl_notice" not in _subscribed:
+                                acc_key = _get_ccnl_notice_tr_key()
+                                if acc_key:
+                                    _ccnl_early_add_date = today
+                                    _notify(f"{ts_prefix()} [체결통보] 08:29:59 구독 추가: tr_key={acc_key!r}", tele=True)
+                                    _send_subscribe(_active_kws, ccnl_notice, [acc_key], "1")  # noqa: F405
+                                    _subscribed["ccnl_notice"] = {acc_key}
+                                else:
+                                    warn_msg = f"{ts_prefix()} [체결통보] 08:29:59 구독 스킵: my_htsid 미설정!"
+                                    logger.warning(warn_msg)
+                                    _notify(warn_msg, tele=True)
+            # 08:30~08:40 시간외 종가: 전일 미매수 종목 추가 매수 (ORD_DVSN=02)
+            if dtime(8, 30) <= now.time() < dtime(8, 41):
+                try:
+                    _run_morning_extra_closing_buy()
+                except Exception as e:
+                    logger.warning(f"{ts_prefix()} [08:30시간외종가] {e}")
+            # 08:30~08:40 종료 후 주문내역·결과 로그
+            if dtime(8, 41) <= now.time() < dtime(8, 42):
+                global _morning_extra_logged_done
+                if not _morning_extra_logged_done:
+                    try:
+                        yesterday = (now - timedelta(days=1)).strftime("%y%m%d")
+                        _log_closing_result_after_window("08:30~08:40", yesterday)
+                        _morning_extra_logged_done = True
+                    except Exception as e:
+                        logger.warning(f"{ts_prefix()} [08:30시간외종가 로그] {e}")
+            # 08:42~08:57 매도 상태 보충: 시작잔고에서 누락된 포지션 재탐색 (1회)
+            if dtime(8, 42) <= now.time() < dtime(8, 58):
+                global _sell_state_supplement_done
+                if (not _sell_state_supplement_done
+                        and _morning_extra_closing_done
+                        and not _str1_sell_state
+                        and STR1_SELL_ENABLED and CLOSE_BUY):
+                    try:
+                        fresh_balance = _get_balance_holdings()
+                        if fresh_balance:
+                            _fb_detail = ", ".join(f"{code_name_map.get(c,c)}({c})" for c in sorted(fresh_balance.keys()))
+                            logger.info(f"{ts_prefix()} [str1_sell] 시작잔고 누락 보충: "
+                                        f"{len(fresh_balance)}종목 발견 → [{_fb_detail}]")
+                            _notify(f"{ts_prefix()} [str1_sell] 시작잔고 누락 보충: "
+                                    f"{len(fresh_balance)}종목 [{_fb_detail}]", tele=True)
+                            _load_str1_sell_state_on_startup(fresh_balance)
+                            _trigger_ws_rebuild()
+                        _sell_state_supplement_done = True
+                    except Exception as e:
+                        logger.warning(f"{ts_prefix()} [str1_sell] 매도 상태 보충 실패: {e}")
+            # 07:58 잔고조회 → NXT 프리마켓 보유종목 파악
+            if dtime(7, 58) <= now.time() < dtime(7, 59):
+                try:
+                    hold_map = _run_balance_0758()
+                    if hold_map:
+                        global _nxt_held_codes
+                        _nxt_held_codes = set(hold_map.keys())
+                        logger.info(f"{ts_prefix()} [잔고0758] NXT 보유종목: {len(_nxt_held_codes)}종목 "
+                                    f"{[code_name_map.get(c, c) for c in sorted(_nxt_held_codes)]}")
+                except Exception as e:
+                    logger.warning(f"{ts_prefix()} [잔고0758] {e}")
+            # 08:58 계좌잔고조회 1회 (lock 밖에서 실행, HTTP 호출 있음)
+            if dtime(8, 58) <= now.time() < dtime(8, 59):
+                try:
+                    _run_balance_0858()
+                except Exception as e:
+                    logger.warning(f"{ts_prefix()} [잔고0858] {e}")
+            # 08:59:50~09:00:10 동시호가 주문현황 정리 1회 (체결대기/취소요청/이상없음)
+            if dtime(8, 59, 50) <= now.time() < dtime(9, 0, 10):
+                try:
+                    _print_opening_call_auction_order_summary()
+                except Exception as e:
+                    logger.warning(f"{ts_prefix()} [장전주문현황] {e}")
+            # 09:00~15:20 주기적 매도 조건 체크 (15초마다, 틱 의존 없이 _last_prdy_ctrt 사용)
+            if dtime(9, 0) <= now.time() < dtime(15, 20):
+                try:
+                    _check_sell_by_prdy_ctrt_periodic()
+                except Exception as e:
+                    logger.warning(f"{ts_prefix()} [주기매도체크] {e}")
+            # 09:00~15:20 장중 잔고조회: 체결 대기 종목이 있으면 1분마다 잔고조회
+            if dtime(9, 0) <= now.time() < dtime(15, 20):
+                global _pending_order_balance_last_ts
+                if _ccnl_notice_sub_codes:
+                    now_ts_bal = time.time()
+                    if now_ts_bal - _pending_order_balance_last_ts >= 60.0:
+                        _pending_order_balance_last_ts = now_ts_bal
+                        try:
+                            _run_closing_balance_verification("장중_체결대기")
+                        except Exception as e:
+                            logger.warning(f"{ts_prefix()} [장중잔고조회] {e}")
+            # 15:19:30 일괄매도: 전일대비 20% 미만 또는 고가대비 -5% 초과 하락 종목 매도
+            if dtime(15, 19, 28) <= now.time() <= dtime(15, 19, 35):
+                try:
+                    _run_sell_1518()
+                except Exception as e:
+                    logger.warning(f"{ts_prefix()} [일괄매도] {e}")
+            # 15:19:00 종가매수 사전 준비 (종목선정 + 수량계산, 주문 미발송)
+            if dtime(15, 19, 0) <= now.time() <= dtime(15, 19, 5):
+                try:
+                    _prepare_closing_buy_orders()
+                except Exception as e:
+                    logger.warning(f"{ts_prefix()} [종가매수준비] {e}")
+            # 15:19:55 사전 구독 해제: 종가매매 전환 전 기존 정규장 구독을 해제하여 슬롯 확보
+            if dtime(15, 19, 55) <= now.time() <= dtime(15, 19, 58):
+                global _pre_unsub_closing_done
+                if not _pre_unsub_closing_done and _closing_codes:
+                    _pre_unsub_closing_done = True
+                    try:
+                        closing_set = set(_closing_codes)
+                        with _kws_lock:
+                            if _active_kws is not None:
+                                # 종가매매 대상 제외한 기존 종목 해제
+                                have_real = _subscribed.get("ccnl_krx", set())
+                                to_unsub = list(have_real - closing_set)
+                                if to_unsub:
+                                    for i in range(0, len(to_unsub), 10):
+                                        batch = to_unsub[i:i+10]
+                                        _send_subscribe(_active_kws, ccnl_krx, batch, "2")  # noqa: F405
+                                    _subscribed["ccnl_krx"] = have_real & closing_set
+                                    _notify(f"{ts_prefix()} [사전구독해제] 15:19:55 정규장 {len(to_unsub)}종목 해제 완료 (종가대상 {len(closing_set)}종목 유지)")
+                    except Exception as e:
+                        logger.warning(f"{ts_prefix()} [사전구독해제] {e}")
+            # 15:29:30 일시 확인: 예상체결가 첫 틱 대비 하락 시 종가매수 취소
+            if dtime(15, 29, 28) <= now.time() <= dtime(15, 29, 35):
+                try:
+                    _run_closing_exp_check_152930()
+                except Exception as e:
+                    logger.warning(f"{ts_prefix()} [종가매수-15:29:30] {e}")
+            # 15:29:50 취소 금액 재분배
+            if dtime(15, 29, 50) <= now.time() <= dtime(15, 29, 55):
+                try:
+                    _run_closing_cancel_redistribute()
+                except Exception as e:
+                    logger.warning(f"{ts_prefix()} [종가재분배] {e}")
+            # 15:30:40 실시간 체결 수신 완료 후 잔고조회로 주문 결과 메시지 (tele)
+            if dtime(15, 30, 40) <= now.time() < dtime(15, 31):
+                try:
+                    _run_closing_buy_filled_notify()
+                except Exception as e:
+                    logger.warning(f"{ts_prefix()} [종가매수체결알림] {e}")
+            # ── 잔고조회 스케줄러: 체결통보 누락분 보완 ──
+            # 15:31 — 종가 체결 결과 검증
+            if dtime(15, 31, 0) <= now.time() <= dtime(15, 31, 5):
+                global _closing_balance_1531_done
+                if not _closing_balance_1531_done:
+                    _closing_balance_1531_done = True
+                    try:
+                        _run_closing_balance_verification("15:31_종가체결")
+                    except Exception as e:
+                        logger.warning(f"{ts_prefix()} [잔고검증15:31] {e}")
+            # 15:58 — 시간외 종가 체결 결과 검증
+            if dtime(15, 58, 0) <= now.time() <= dtime(15, 58, 5):
+                global _closing_balance_1558_done
+                if not _closing_balance_1558_done:
+                    _closing_balance_1558_done = True
+                    try:
+                        _run_closing_balance_verification("15:58_시간외종가")
+                    except Exception as e:
+                        logger.warning(f"{ts_prefix()} [잔고검증15:58] {e}")
+            # 16:11, 16:21, ..., 18:01 — 시간외 단일가 10분 단위 체결 확인
+            if dtime(16, 11) <= now.time() < END_TIME:
+                global _overtime_balance_checked
+                minute = now.minute
+                if minute % 10 == 1 and now.second <= 5:
+                    slot_key = f"{now.hour:02d}:{minute:02d}"
+                    if slot_key not in _overtime_balance_checked:
+                        _overtime_balance_checked.add(slot_key)
+                        try:
+                            _run_closing_balance_verification(f"{slot_key}_시간외단일가")
+                        except Exception as e:
+                            logger.warning(f"{ts_prefix()} [잔고검증{slot_key}] {e}")
+            # 15:40~16:00 시간외 종가: 당일 미매수 종목에 당일종가(ORD_DVSN=02) 매수
+            if dtime(15, 40) <= now.time() < dtime(16, 1):
+                try:
+                    _run_afternoon_extra_closing_buy()
+                except Exception as e:
+                    logger.warning(f"{ts_prefix()} [15:40시간외종가] {e}")
+            # 15:40~16:00 종료 후 주문내역·결과 로그 (15:55에 출력 → 16:00 시간외단일가 진입 전 완료)
+            if dtime(15, 55) <= now.time() < dtime(15, 56):
+                global _afternoon_extra_logged_done
+                if not _afternoon_extra_logged_done:
+                    try:
+                        _log_closing_result_after_window("15:40~16:00")
+                        _afternoon_extra_logged_done = True
+                    except Exception as e:
+                        logger.warning(f"{ts_prefix()} [15:40시간외종가 로그] {e}")
+            # 16:00~18:00 시간외 단일가 매수: 10분 단위(16:00, 16:10, ... 17:50) 체결통보 반영 후 주문→직전 결과 출력
+            if dtime(16, 0) <= now.time() < END_TIME:
+                global _last_overtime_buy_min
+                minute = now.minute
+                second = now.second
+                if minute % 10 == 0 and minute != _last_overtime_buy_min:
+                    if (minute == 0 and second <= 2) or (minute > 0 and 1 <= second <= 3):  # 16:00:00 / 16:10:01 ...
+                        _last_overtime_buy_min = minute
+                        # 직전 슬롯 결과 출력 (16:00에는 이미 15:55에 출력했으므로 스킵)
+                        if minute > 0:
+                            prev_label = f"{now.hour:02d}:{(minute - 10) % 60:02d}단일가"
+                            _log_closing_order_aggregation(prev_label)
+                        try:
+                            _run_overtime_buy_orders()
+                        except Exception as e:
+                            logger.warning(f"{ts_prefix()} [시간외매수] {e}")
+            new_mode = calc_mode(now)
+            with _mode_lock:
+                old_mode = _current_mode
+                if old_mode != new_mode:
+                    _current_mode = new_mode
+                    _log_mode_transition(old_mode, new_mode)
+                    if new_mode == RunMode.CLOSE_REAL:
+                        _regular_real_seen.clear()
+                        global _close_force_stopped
+                        _close_force_stopped = False
+                    if new_mode == RunMode.OVERTIME_REAL:
+                        _overtime_real_seen.clear()
+                    # NXT 애프터마켓 조기 종료: 대상 0종목 → EXIT 프로세스 즉시 실행
+                    if new_mode == RunMode.NXT_AFTER and _nxt_after_early_exit:
+                        _run_exit_shutdown("NXT 대상 0종목 조기 종료")
+                        break
+                    if new_mode == RunMode.EXIT:
+                        _run_exit_shutdown("20:00 NXT 애프터마켓 종료")
+                        break
+
+                # ── VI 종목별 구독 관리: 09:00에 prdy_ctrt>=10% 종목만 예상체결 유지 ──
+                if dtime(9, 0) <= now.time() <= dtime(9, 0, 1) and not _vi_delayed_codes and _vi_delay_until is None:
+                    vi_suspects = {
+                        c: v for c, v in _last_prdy_ctrt.items()
+                        if v >= 10.0 and c in set(codes)
+                    }
+                    if vi_suspects:
+                        _vi_delayed_codes = set(vi_suspects.keys())
+                        _vi_delay_until = now.replace(hour=9, minute=2, second=0, microsecond=0)
+                        vi_names = [f"{code_name_map.get(c,c)}({c})={v:.1f}%" for c, v in vi_suspects.items()]
+                        normal_count = len(codes) - len(_vi_delayed_codes)
+                        _notify(
+                            f"{ts_prefix()} VI 급등 조건 → 종목별 구독 분리: "
+                            f"실시간체결 {normal_count}종목, 예상체결유지 {len(_vi_delayed_codes)}종목 "
+                            f"(대상: {', '.join(vi_names)})"
+                        )
+                if _vi_delay_until and now >= _vi_delay_until:
+                    if _vi_delayed_codes:
+                        vi_names = [f"{code_name_map.get(c,c)}({c})" for c in _vi_delayed_codes]
+                        _notify(
+                            f"{ts_prefix()} VI 지연 해제 → 전 종목 실시간체결 전환 "
+                            f"(해제: {', '.join(vi_names)})"
+                        )
+                    _vi_delayed_codes.clear()
+                    _vi_delay_until = None
+
+                if (dtime(16, 9, 59) <= now.time() < dtime(17, 50)
+                        and new_mode not in (RunMode.NXT_AFTER, RunMode.NXT_PRE)):
+                    # 마지막 의미 있는 슬롯: 17:49:59 (17:50 체결가 수신)
+                    # 17:50 이후에는 새 슬롯 전환 없이 예상체결가 유지 → 18:00 EXIT
+                    # NXT 모드에서는 OVERTIME 슬롯 전환 하지 않음
+                    total_min = now.hour * 60 + now.minute
+                    slot_min = ((total_min - 9) // 10) * 10 + 9
+                    slot = now.replace(hour=slot_min // 60, minute=slot_min % 60, second=59, microsecond=0)
+                    if now >= slot and _last_overtime_real_slot != slot:
+                        _last_overtime_real_slot = slot
+                        _overtime_real_active = True
+                        _overtime_real_started_ts = time.time()
+                        _overtime_real_last_progress_ts = 0.0
+                        _overtime_real_seen.clear()
+                        _current_mode = RunMode.OVERTIME_REAL
+                        _log_mode_transition(RunMode.OVERTIME_EXP, RunMode.OVERTIME_REAL)
+
+                if _overtime_real_active:
+                    ot_elapsed = time.time() - _overtime_real_started_ts
+                    seen_n = len(_overtime_real_seen)
+                    total_n = len(codes)
+                    if ot_elapsed >= OVERTIME_REAL_PROGRESS_INTERVAL and (
+                        time.time() - _overtime_real_last_progress_ts >= OVERTIME_REAL_PROGRESS_INTERVAL
+                    ):
+                        _overtime_real_last_progress_ts = time.time()
+                        sys.stdout.write("\n")
+                        _notify(f"{ts_prefix()} [시간외] 체결가 수신 중 {seen_n}/{total_n}종목...")
+                        sys.stdout.flush()
+                    if seen_n >= total_n:
+                        # 전 종목 수신 완료 → 예상체결가 복귀 + 내 주문 체결 결과 출력
+                        _overtime_real_active = False
+                        _overtime_real_seen.clear()
+                        _current_mode = RunMode.OVERTIME_EXP
+                        _log_mode_transition(RunMode.OVERTIME_REAL, RunMode.OVERTIME_EXP)
+                        exec_min = ((_last_overtime_real_slot.minute + 1) // 10) * 10 if _last_overtime_real_slot else now.minute
+                        slot_label = f"{now.hour:02d}:{exec_min:02d}단일가"
+                        _log_closing_order_aggregation(slot_label, _load_closing_buy_state())
+                    elif ot_elapsed >= OVERTIME_REAL_TIMEOUT:
+                        _overtime_real_active = False
+                        logger.info(
+                            f"{ts_prefix()} [시간외] 체결가 {OVERTIME_REAL_TIMEOUT}초 타임아웃: "
+                            f"{seen_n}/{total_n}종목 수신"
+                        )
+                        _overtime_real_seen.clear()
+                        _current_mode = RunMode.OVERTIME_EXP
+                        _log_mode_transition(RunMode.OVERTIME_REAL, RunMode.OVERTIME_EXP)
+                        exec_min = ((_last_overtime_real_slot.minute + 1) // 10) * 10 if _last_overtime_real_slot else now.minute
+                        slot_label = f"{now.hour:02d}:{exec_min:02d}단일가"
+                        _log_closing_order_aggregation(slot_label, _load_closing_buy_state())
+
+                with _kws_lock:
+                    if _active_kws is not None:
+                        # 사전구독해제 완료 후~종가전환 전 구간에서 재구독 방지
+                        if not (_pre_unsub_closing_done and new_mode == RunMode.REGULAR_REAL):
+                            desired = _desired_subscription_map(now)
+                            _apply_subscriptions(_active_kws, desired)
+                        # 15:30 종가 체결 전 종목 수신 완료 → WS 닫기
+                        if (new_mode == RunMode.CLOSE_REAL
+                                and not desired
+                                and len(_regular_real_seen) >= len(codes)):
+                            if not _close_force_stopped:
+                                _close_force_stopped = True
+                                _notify(
+                                    f"{ts_prefix()} 15:30 종가 체결 수신 완료 "
+                                    f"({len(_regular_real_seen)}/{len(codes)}종목), "
+                                    f"체결가 구독 해제, WS 연결은 유지 (체결통보 수신 지속)",
+                                    tele=True,
+                                )
+                                # WS를 닫지 않음 — 체결가 구독은 _apply_subscriptions(desired={})에서 해제됨
+                                # H0STCNI0 구독만 살아 있어 15:40 시간외종가 체결통보 수신 가능
+                                # watchdog 오판 방지: 장 마감 후 데이터 미수신은 정상
+                                globals()['_last_ingest_tick_ts'] = time.time()
+                        # 15:31 타임아웃 → 미수신 종목 있어도 구독 해제 (WS는 유지)
+                        elif (new_mode == RunMode.CLOSE_REAL
+                                and not desired
+                                and now.time() >= dtime(15, 31)):
+                            if not _close_force_stopped:
+                                _close_force_stopped = True
+                                _notify(
+                                    f"{ts_prefix()} 15:31 타임아웃: 종가 체결 "
+                                    f"{len(_regular_real_seen)}/{len(codes)}종목 수신, "
+                                    f"체결가 구독 해제, WS 연결은 유지 (체결통보 수신 지속)",
+                                    tele=True,
+                                )
+                                # watchdog 오판 방지: 장 마감 후 데이터 미수신은 정상
+                                globals()['_last_ingest_tick_ts'] = time.time()
+
+                # a2 예상체결가 구독 갱신 (a1 lock 밖에서 실행)
+                _a2_apply_subscriptions(now)
+
+                now_ts = time.time()
+                nt = now.time()
+                # "no data" 경고 억제 구간:
+                # - 15:20~15:31 예상체결가/종가 체결 수신 (데이터 간헐적 → 경고/재구독 무의미)
+                # - 15:31 이후 종가 수신 완료 후
+                # - 16:00~ 시간외 (거래 적음)
+                in_no_data_suppress = (
+                    nt >= dtime(15, 20)
+                    or _close_force_stopped
+                )
+                if _last_any_recv_ts > 0 and not in_no_data_suppress:
+                    idle_sec = now_ts - _last_any_recv_ts
+                    if idle_sec >= NO_DATA_WARN_SEC and (now_ts - _last_no_data_warn_ts) >= NO_DATA_WARN_SEC:
+                        sys.stdout.write("\n")
+                        _desired = _desired_subscription_map(now)
+                        _sub_info = ", ".join(
+                            f"{k.__name__}:{len(v)}" for k, v in _desired.items() if v
+                        )
+                        _notify(
+                            f"{ts_prefix()} {int(idle_sec)}초 데이터 미수신 → 재구독 시도 ({_sub_info})"
+                        )
+                        _last_no_data_warn_ts = now_ts
+                    if idle_sec >= NO_DATA_REBUILD_SEC and (now_ts - _last_rebuild_ts) >= NO_DATA_REBUILD_SEC:
+                        if _stop_event.is_set():
+                            continue  # 셧다운 중 재구독 시도 방지
+                        logger.warning(
+                            f"{ts_prefix()} [ws] no data for {int(idle_sec)}s -> resubscribe"
+                        )
+                        with _kws_lock:
+                            if _active_kws is not None:
+                                _apply_subscriptions(_active_kws, _desired_subscription_map(now), force=True)
+                        _last_rebuild_ts = now_ts
+            # ── 전략 모듈 핫스왑 체크 (0.5초 간격) ──
+            _check_strategy_swap()
+            # ── 외부 주문 주입 체크 (0.5초 간격) ──
+            _check_external_orders()
+            # ── 단일가 관찰 타임아웃 (15초 경과 시 확정) ──
+            if _single_price_observe:
+                _obs_now = time.time()
+                for _obs_code in list(_single_price_observe.keys()):
+                    _obs = _single_price_observe[_obs_code]
+                    _obs_elapsed = _obs_now - _obs["first_ts"]
+                    if _obs_elapsed >= 15:
+                        _single_price_observe.pop(_obs_code)
+                        _single_price_codes[_obs_code] = _obs["stat"]
+                        _obs_name = code_name_map.get(_obs_code, _obs_code)
+                        _obs_desc = "57(관리종목)" if _obs["stat"] == "57" else "59(단기과열)"
+                        _obs_msg = f"{ts_prefix()} [KRX조회] 30분 단일가 확정 {_obs_name}({_obs_code}) {_obs_desc} ({_obs['tick_count']}틱/{_obs_elapsed:.0f}초 관찰)"
+                        logger.info(_obs_msg)
+                        _notify(_obs_msg, tele=True)
+        except Exception as e:
+            logger.error(f"{ts_prefix()} [scheduler] unexpected error: {e}")
+            logger.error(traceback.format_exc())
+        time.sleep(0.5)
+    logger.info(f"{ts_prefix()} [scheduler] stopped")
+
+def _in_range(now_t: dtime, start: dtime, end: dtime) -> bool:
+    return (now_t >= start) and (now_t < end)
+
+def update_time_flags():
+    """
+    서울 로컬 시간 기준:
+      - 08:50~09:00: 예상체결(정규장) 저장 ON
+      - 09:00~15:20: 실시간체결(정규장) 저장 ON
+      - 15:20~15:30: 예상체결(정규장) 저장 ON
+      - 15:30~16:00: 실시간체결(정규장) 저장 ON
+      - 16:00~18:00: 시간외(단일가) 예상/체결 저장 ON
+    """
+    global SAVE_REAL_REGULAR, SAVE_EXP_REGULAR, SAVE_REAL_OVERTIME, SAVE_EXP_OVERTIME
+    now = datetime.now(KST)
+    nt = now.time()
+
+    if SAVE_MODE == "always":
+        save_real_regular = True
+        save_exp_regular = True
+        save_real_overtime = True
+        save_exp_overtime = True
+    else:
+        save_real_regular = _in_range(nt, dtime(9, 0), dtime(15, 20)) or _in_range(nt, dtime(15, 30), dtime(15, 31))
+        save_exp_regular = _in_range(nt, dtime(8, 50), dtime(9, 0)) or _in_range(nt, dtime(15, 20), dtime(15, 30))
+
+        save_overtime = _in_range(nt, dtime(16, 0), dtime(18, 0))
+        save_real_overtime = save_overtime
+        save_exp_overtime = save_overtime
+
+    with _flags_lock:
+        changed = (
+            (SAVE_REAL_REGULAR != save_real_regular) or
+            (SAVE_EXP_REGULAR != save_exp_regular) or
+            (SAVE_REAL_OVERTIME != save_real_overtime) or
+            (SAVE_EXP_OVERTIME != save_exp_overtime)
+        )
+        SAVE_REAL_REGULAR = save_real_regular
+        SAVE_EXP_REGULAR = save_exp_regular
+        SAVE_REAL_OVERTIME = save_real_overtime
+        SAVE_EXP_OVERTIME = save_exp_overtime
+
+    if changed:
+        logger.info(
+            "[flags] "
+            f"real_regular={SAVE_REAL_REGULAR} exp_regular={SAVE_EXP_REGULAR} "
+            f"real_overtime={SAVE_REAL_OVERTIME} exp_overtime={SAVE_EXP_OVERTIME}"
+        )
+
+def time_flag_loop():
+    logger.info("[timeflags] started")
+    while not _stop_event.is_set():
+        try:
+            update_time_flags()
+        except Exception as e:
+            logger.error(f"[timeflags] error: {e}")
+        time.sleep(1.0)
+    logger.info("[timeflags] stopped")
+
+# =============================================================================
+# 모니터링(콘솔 1줄)
+# - 요청 반영:
+#   * 맨 앞에 시간: [yymmdd_hhMMss]
+#   * 초당 카운트는 3자리 고정 제거 + 999 넘으면 0부터(=mod 1000)
+# =============================================================================
+_per_sec_counts = {c: 0 for c in codes}
+_total_counts = {c: 0 for c in codes}
+_since_save_rows = 0
+_since_save_counts = {c: 0 for c in codes}
+_last_print_ts = time.time()
+_last_full_status_ts = time.time()
+_written_rows = 0
+_last_status_line = ""
+_last_save_time = time.time()   # 마지막 스냅샷 저장 시각
+_last_any_recv_ts = 0.0
+_last_rebuild_ts = 0.0
+_last_no_data_warn_ts = 0.0
+# watchdog 용 heartbeat: ingest_loop 가 살아있는지 확인하기 위한 최종 tick 시각
+_last_ingest_tick_ts: float = 0.0
+
+def _fmt_now_prefix() -> str:
+    return datetime.now(KST).strftime(f"[%y%m%d_%H%M%S_{LOG_ID}]")
+
+def _reset_recv_counters(reason: str) -> None:
+    with _lock:
+        for c in _per_sec_counts:
+            _per_sec_counts[c] = 0
+        for c in _total_counts:
+            _total_counts[c] = 0
+        for c in _since_save_counts:
+            _since_save_counts[c] = 0
+        for c in _last_rest_req_ts:
+            _last_rest_req_ts[c] = 0.0
+        _rest_pending.clear()
+        global _since_save_rows, _last_any_recv_ts
+        _since_save_rows = 0
+        _last_any_recv_ts = 0.0
+    logger.info(f"{ts_prefix()} [recv] counters reset ({reason})")
+
+def _print_counts():
+    prefix = _fmt_now_prefix()
+    with _lock:
+        per_sec_total = sum(_per_sec_counts.values())
+        since_active = sum(1 for c in codes if _since_save_counts.get(c, 0) > 0)
+        total_codes = len(codes)
+    line = (
+        f"{prefix} (초당 수신건수 {per_sec_total:03d}건/초), "
+        f"(버퍼 {_part_buffer_rows}건/수신 종목 {since_active}개/구독 종목 {total_codes}개)"
+    )
+
+    width = shutil.get_terminal_size((120, 20)).columns
+    if len(line) > width - 1:
+        line = line[: width - 1]
+
+    global _last_status_line
+    _last_status_line = line
+    sys.stdout.write("\r\033[2K" + line)
+    sys.stdout.flush()
+    # ★ 제자리 출력은 stdout만, 로그 파일에는 기록하지 않음
+
+def _emit_save_done(rows: int) -> None:
+    # stdout: 현재 제자리 출력 오른쪽에 붙여서 한 줄로 종료
+    sys.stdout.write(f"=> [{LOG_ID}] [save] {rows} rows done\n")
+    sys.stdout.flush()
+    # 로그: save 정보만 기록 (제자리 출력 내용은 제외)
+    logger.info(f"{_fmt_now_prefix()} [save] {rows} rows done")
+
+## Phase 3-7: 수신건수 디버그 로그 제거 (광동(0/1255) 등)
+def _format_full_entries() -> list[str]:
+    return []  # 비활성화
+
+def _log_full_progress():
+    pass  # 비활성화
+
+# =============================================================================
+# 버퍼/Writer (flush는 워커에서만)
+# =============================================================================
+_lock = threading.RLock()
+_stop_event = threading.Event()
+_ingest_queue: "queue.Queue[tuple[pl.DataFrame, str, str, str | None, str]]" = queue.Queue()
+
+_part_buffer: list[pl.DataFrame] = []         # flush 전 임시 버퍼 (1000행 또는 1분마다 part로 저장)
+_part_buffer_lock = threading.RLock()          # flush와 append 동시 처리용
+_save_lock = threading.Lock()                  # _flush_part_buffer 동시 호출 방지
+_part_buffer_rows: int = 0                      # 버퍼 내 행 수 (표시용)
+_part_seq: int = 0                              # 당일 part 파일 순번 (파일명 중복 방지)
+
+# ── 종목별 기술적 지표 인메모리 상태 ──
+# EMA: {code: {period: float|None}}  – EMA 누적값 (None이면 첫 틱에 가격으로 초기화)
+_ema_state: dict[str, dict[int, float | None]] = {
+    c: {n: None for n in INDICATOR_MA_LINE} for c in codes
+}
+# BB용 raw price deque: {code: deque(maxlen=BB_PERIOD)} – 표준편차 계산에 사용
+_price_buf: dict[str, deque] = {
+    c: deque(maxlen=_IND_MAX_WINDOW) for c in codes
+}
+
+_last_recv_ts: dict[str, float] = {c: 0.0 for c in codes}
+_code_added_ts: dict[str, float] = {c: time.time() for c in codes}  # 종목별 추가 시점 (watchdog 3분 기준)
+_last_summary_ts = time.time()
+
+# ── 장중 미수신 감시 상태 ──
+_last_stale_check_ts: dict[str, float] = {}  # 종목별 마지막 REST 상태확인 시각
+_halted_codes: set[str] = set()               # 거래정지 확인된 종목
+_vi_active_codes: set[str] = set()            # VI 발동 확인된 종목
+_last_wss_recv_ts: dict[str, float] = {}     # WSS 전용 수신 시각 (REST 제외)
+_vi_cls_cache: dict[str, str] = {}            # code → 마지막 vi_cls_code (H0STMKO0)
+_vi_exp_sub_ts: dict[str, float] = {}         # VI 종목 예상체결가 구독 시작 시각
+_vi_stnd_prc: dict[str, float] = {}           # 종목별 VI기준가 (실시간체결 VI_STND_PRC)
+_vi_trigger_count: dict[str, int] = {}        # 종목별 VI 발동 횟수 (당일 누적)
+_vi_history: list[dict] = []                  # VI 발동 이력 [{code, name, vi_type, stnd_prc, price, time}, ...]
+# ── VI/마켓 이벤트 시각 추적 (parquet 저장용) ──
+_vi_start_ts: dict[str, str] = {}             # code → VI 발동 ISO timestamp
+_vi_end_ts: dict[str, str] = {}               # code → VI 해제 ISO timestamp
+_code_market_map: dict[str, str] = {}         # code → "KOSPI"/"KOSDAQ"
+_market_wide_event: dict[str, str] = {}       # "KOSPI"/"KOSDAQ" → 이벤트명
+_market_wide_mkop: dict[str, str] = {}        # "KOSPI"/"KOSDAQ" → mkop_cls_code
+_market_wide_start_ts: dict[str, str] = {}    # "KOSPI"/"KOSDAQ" → 발동 ISO timestamp
+_rest_fail_backoff: dict[str, int] = {}       # REST 500 에러 연속 횟수 (백오프용)
+_single_price_codes: dict[str, str] = {}       # code → iscd_stat ("57" or "59") 30분 단일가 매매 종목
+_single_price_pending: dict[str, str] = {}     # code → iscd_stat, 틱 확인 전 대기 종목
+_single_price_observe: dict[str, dict] = {}    # code → {"stat", "first_ts", "tick_count"} 정시 윈도우 관찰 중
+
+
+def _check_iscd_stat_krx(target_codes: list[str]) -> None:
+    """KRX_code_batch로 종목의 iscd_stat_cls_code를 조회하여 _single_price_pending 갱신.
+    57=관리종목, 59=단기과열 → 30분 단일가 후보 (틱 수신 후 확정)."""
+    if not target_codes:
+        return
+    try:
+        status_map = KRX_code_batch(target_codes)
+        for code, stat in status_map.items():
+            if stat in ("57", "59"):
+                if code not in _single_price_codes and code not in _single_price_pending:
+                    _single_price_pending[code] = stat
+                    name = code_name_map.get(code, code)
+                    desc = "57(관리종목)" if stat == "57" else "59(단기과열)"
+                    logger.info(f"[KRX조회] {name}({code}) iscd_stat={stat} ({desc}) → 30분 단일가 후보 (틱 확인 대기)")
+    except Exception as e:
+        logger.warning(f"[KRX조회] iscd_stat 조회 실패: {e}")
+
+
+_overwrite_events: list[dict[str, str]] = []
+
+_top_client: KisClient | None = None
+_price_client: KisClient | None = None
+_top_client_2: KisClient | None = None      # 계정2-syw_2 (한도 초과 시 fallback)
+_price_client_2: KisClient | None = None     # 계정2-syw_2 (한도 초과 시 fallback)
+_price_queue: "queue.Queue[str]" = queue.Queue()
+_last_rest_req_ts: dict[str, float] = {c: 0.0 for c in codes}
+_rest_req_count = 0
+_rest_req_second = int(time.time())
+_rest_pending: set[str] = set()
+_rest_queue: "queue.Queue[tuple[callable, tuple, dict, float, threading.Event, dict]]" = queue.Queue()
+_rest_last_sent_ts = 0.0
+_price_req_count = 0
+_price_req_second = int(time.time())
+
+
+# ── PRIMARY: 공통계정(계정1/메인) 클라이언트 ─────────────────────
+def _load_main_cfg() -> dict:
+    """config.json 루트의 메인 계정 appkey/appsecret을 읽어 반환."""
+    cfg = load_config(str(SCRIPT_DIR / "config.json"))
+    appkey = cfg.get("appkey")
+    appsecret = cfg.get("appsecret")
+    if not appkey or not appsecret:
+        raise ValueError("config.json 루트에 appkey/appsecret이 필요합니다.")
+    return {
+        "appkey": appkey,
+        "appsecret": appsecret,
+        "base_url": cfg.get("base_url") or DEFAULT_BASE_URL,
+        "custtype": cfg.get("custtype") or "P",
+        "market_div": cfg.get("market_div") or "J",
+    }
+
+
+def _init_top_client() -> KisClient:
+    a1 = _load_main_cfg()
+    return KisClient(KisConfig(
+        appkey=a1["appkey"], appsecret=a1["appsecret"],
+        base_url=a1["base_url"], custtype=a1["custtype"],
+        market_div=a1.get("market_div") or TOP_RANK_MARKET_DIV,
+        token_cache_path=str(SCRIPT_DIR / "kis_token_main.json"),
+    ))
+
+
+def _init_price_client() -> KisClient:
+    a1 = _load_main_cfg()
+    return KisClient(KisConfig(
+        appkey=a1["appkey"], appsecret=a1["appsecret"],
+        base_url=a1["base_url"], custtype=a1["custtype"],
+        market_div=a1["market_div"],
+        token_cache_path=str(SCRIPT_DIR / "kis_token_main.json"),
+    ))
+
+
+# ── FALLBACK: 계정2(syw_2) 클라이언트 (한도 초과 시) ─────────────
+def _load_syw2_cfg() -> dict:
+    """config.json → accounts.syw_2 키를 읽어 공통 설정과 병합하여 반환."""
+    cfg = load_config(str(SCRIPT_DIR / "config.json"))
+    acct = cfg.get("accounts", {}).get("syw_2", {})
+    if not acct.get("appkey") or not acct.get("appsecret"):
+        return {}
+    return {
+        "appkey": acct["appkey"],
+        "appsecret": acct["appsecret"],
+        "base_url": cfg.get("base_url") or DEFAULT_BASE_URL,
+        "custtype": cfg.get("custtype") or "P",
+        "market_div": cfg.get("market_div") or "J",
+    }
+
+
+def _init_top_client_2() -> KisClient | None:
+    a2 = _load_syw2_cfg()
+    if not a2:
+        return None
+    return KisClient(KisConfig(
+        appkey=a2["appkey"], appsecret=a2["appsecret"],
+        base_url=a2["base_url"], custtype=a2["custtype"],
+        market_div=a2.get("market_div") or TOP_RANK_MARKET_DIV,
+        token_cache_path=str(SCRIPT_DIR / "kis_token_syw2.json"),
+    ))
+
+
+def _init_price_client_2() -> KisClient | None:
+    a2 = _load_syw2_cfg()
+    if not a2:
+        return None
+    return KisClient(KisConfig(
+        appkey=a2["appkey"], appsecret=a2["appsecret"],
+        base_url=a2["base_url"], custtype=a2["custtype"],
+        market_div=a2["market_div"],
+        token_cache_path=str(SCRIPT_DIR / "kis_token_syw2.json"),
+    ))
+
+
+# ── 다중 계좌 순회 인프라 (Phase 4-4) ─────────────────────────────────────────
+from kis_utils import ConfigProxy, _detect_config_version, get_user_config, get_account_config  # noqa: E402
+
+
+def _iter_enabled_accounts(trade_only: bool = False) -> list[dict]:
+    """V2 config의 모든 활성 계좌를 순회하여 주문에 필요한 정보 반환.
+
+    반환 리스트 각 항목:
+      {
+        "account_id": "main" | "syw_2",
+        "alias": "a1" | "a2",
+        "appkey": ..., "appsecret": ..., "cano": ..., "acnt_prdt_cd": ...,
+        "exclude_cash": ..., "base_url": ...,
+        "token_cache_path": ..., "trade_enabled": bool,
+      }
+    trade_only=True 시 trade_enabled=False인 계좌 제외 (잔고조회/매수/매도 전용).
+    V1 config인 경우 메인 계좌 1개만 반환.
+    """
+    cfg = _read_cfg()
+    if not cfg:
+        return []
+    raw = cfg.get_raw() if isinstance(cfg, ConfigProxy) else cfg
+
+    # V1 → 메인 1건
+    if _detect_config_version(raw) < 2:
+        appkey = cfg.get("appkey", "")
+        if not appkey:
+            return []
+        return [{
+            "account_id": "main", "alias": "a1",
+            "appkey": appkey,
+            "appsecret": cfg.get("appsecret", ""),
+            "cano": cfg.get("cano", ""),
+            "acnt_prdt_cd": cfg.get("acnt_prdt_cd", "01"),
+            "exclude_cash": cfg.get("exclude_cash", "0"),
+            "max_invest": cfg.get("max_invest", "0"),
+            "base_url": cfg.get("base_url") or DEFAULT_BASE_URL,
+            "token_cache_path": str(SCRIPT_DIR / "kis_token_main.json"),
+        }]
+
+    # V2 → 모든 사용자의 모든 계좌
+    accounts: list[dict] = []
+    alias_idx = 0
+    for uid, user in raw.get("users", {}).items():
+        base_url = raw.get("base_url") or DEFAULT_BASE_URL
+        for aid, acfg in user.get("accounts", {}).items():
+            appkey = acfg.get("appkey", "")
+            cano = acfg.get("cano", "")
+            if not appkey or not cano:
+                continue
+            if acfg.get("enabled") is False:
+                continue
+            te = acfg.get("trade_enabled", True)
+            if trade_only and te is False:
+                continue
+            alias_idx += 1
+            token_name = "kis_token_main.json" if aid == "main" else f"kis_token_{aid}.json"
+            accounts.append({
+                "account_id": aid,
+                "alias": acfg.get("cano_alias") or f"a{alias_idx}",
+                "appkey": appkey,
+                "appsecret": acfg.get("appsecret", ""),
+                "cano": cano,
+                "acnt_prdt_cd": acfg.get("acnt_prdt_cd", "") or "01",
+                "exclude_cash": acfg.get("exclude_cash", "0"),
+                "max_invest": acfg.get("max_invest", "0"),
+                "base_url": base_url,
+                "token_cache_path": str(SCRIPT_DIR / token_name),
+                "trade_enabled": te,
+            })
+    # cano → alias 매핑 갱신 (체결통보 시 계좌 식별용)
+    for a in accounts:
+        _cano_alias_map[a["cano"]] = a["alias"]
+    return accounts
+
+
+def _init_account_client(acct: dict) -> KisClient:
+    """계좌 정보 dict로 KisClient 생성 + 토큰 확보."""
+    client = KisClient(KisConfig(
+        appkey=acct["appkey"],
+        appsecret=acct["appsecret"],
+        base_url=acct.get("base_url") or DEFAULT_BASE_URL,
+        custtype=acct.get("custtype") or "P",
+        market_div=acct.get("market_div") or "J",
+        token_cache_path=acct.get("token_cache_path", ""),
+    ))
+    client.ensure_token()
+    return client
+
+
+def _get_account_available_cash(client: KisClient, acct: dict) -> float:
+    """계좌의 투자가능금액 조회.
+    max_invest 설정 시: min(총평가-exclude, max_invest) - 보유평가
+    미설정 시: 주문가능금액 - exclude_cash (기존방식)
+    """
+    cano = acct["cano"]
+    acnt = acct.get("acnt_prdt_cd", "01") or "01"
+    exclude = float(str(acct.get("exclude_cash", "0") or 0).replace("_", "") or 0)
+    max_inv = float(str(acct.get("max_invest", "0") or 0).replace("_", "") or 0)
+    try:
+        hold_rows, out2, _, _ = _get_balance_page(client, cano, acnt, "TTTC8434R")
+        items = [out2] if isinstance(out2, dict) else (out2 if isinstance(out2, list) else [])
+        if not items:
+            return 0.0
+        ord_cash = float(str(items[0].get("prvs_rcdl_excc_amt", 0) or 0).replace(",", "") or 0)
+
+        if max_inv > 0:
+            tot_eval = float(str(items[0].get("tot_evlu_amt", 0) or 0).replace(",", "") or 0)
+            stock_eval = sum(
+                float(str(r.get("evlu_amt", 0) or 0).replace(",", "") or 0)
+                for r in (hold_rows or [])
+                if int(float(str(r.get("hldg_qty", 0) or 0).replace(",", "") or 0)) > 0
+            )
+            budget = min(tot_eval - exclude, max_inv)
+            investable = max(0.0, budget - stock_eval)
+            return min(investable, ord_cash)
+        else:
+            return max(0.0, ord_cash - exclude)
+    except Exception as e:
+        logger.warning(f"[multi-acct] {acct['account_id']} 잔고조회 실패: {e}")
+    return 0.0
+
+
+def _resolve_target_accounts(target, all_accounts: list[dict]) -> list[dict]:
+    """external_orders의 target 필드를 실제 계좌 리스트로 변환.
+
+    target:
+      "all"          → 전체 계좌
+      "a1"           → alias 매칭
+      ["a1", "a2"]   → 다중 alias 매칭
+      "main"         → account_id 매칭
+    """
+    if not all_accounts:
+        return []
+    if target is None or target == "all" or target == "":
+        return all_accounts
+    if isinstance(target, str):
+        target = [target]
+    if isinstance(target, list):
+        matched = []
+        for t in target:
+            t = str(t).strip()
+            for a in all_accounts:
+                if a["alias"] == t or a["account_id"] == t:
+                    if a not in matched:
+                        matched.append(a)
+        if not matched:
+            logger.warning(f"{ts_prefix()} [외부주문] target={target} 매칭 실패 → 주문 건너뜀")
+        return matched
+    return all_accounts
+
+
+def _is_rate_limit_error(e: Exception) -> bool:
+    """한도 초과/타임아웃 관련 에러인지 판별."""
+    msg = str(e).lower()
+    return any(kw in msg for kw in [
+        "egw00201",         # 초당 거래건수 초과
+        "max retries",      # 연결 타임아웃 (urllib3)
+        "connect timeout",  # 연결 타임아웃
+        "too many requests", "429",
+        "egw00202",         # 분당 거래건수 초과
+    ])
+
+
+def _fetch_current_price(client: KisClient, code: str) -> dict:
+    url = f"{client.cfg.base_url}/uapi/domestic-stock/v1/quotations/inquire-price"
+    headers = client._headers(tr_id="FHKST01010100")
+    params = {
+        "FID_COND_MRKT_DIV_CODE": client.cfg.market_div,
+        "FID_INPUT_ISCD": code,
+    }
+    r = requests.get(url, headers=headers, params=params, timeout=10)
+    r.raise_for_status()
+    j = r.json()
+    if str(j.get("rt_cd")) != "0":
+        raise RuntimeError(f"[현재가] 실패: {j.get('msg1')} raw={j}")
+    return j.get("output") or {}
+
+
+def _single_price_use_antc_now() -> bool:
+    """57/59 종목(30분 단일가): 실시간 창(XX:29:29~XX:00:05)이면 False, 그 외 예상체결 창이면 True."""
+    t = datetime.now(KST).time()
+    m, s = t.minute, t.second
+    real_window = (m in (29, 59) and s >= 29) or (m in (0, 30) and s < 6)
+    return not real_window
+
+
+def _enqueue_rest_price_row(code: str, output: dict, use_antc: bool | None = None) -> None:
+    # wss 컬럼과 맞춰 저장: 현재가/호가/거래량/상하한가
+    # ★ WSS 원본이 소문자이므로 동일하게 소문자 컬럼명 사용 (대소문자 불일치 → 중복 방지)
+    # use_antc: 57/59 종목 예상체결가 모드 시 antc_prce→stck_prpr, antc_vol→acml_vol 매핑
+    # None이면 _single_price_codes인 경우 현재 시간으로 자동 판단
+    if use_antc is None and code in _single_price_codes:
+        use_antc = _single_price_use_antc_now()
+    elif use_antc is None:
+        use_antc = False
+    if use_antc:
+        stck_prpr = output.get("antc_prce") or output.get("stck_prpr")
+        acml_vol = output.get("antc_vol") or output.get("acml_vol")
+    else:
+        stck_prpr = output.get("stck_prpr")
+        acml_vol = output.get("acml_vol")
+    row = {
+        "mksc_shrn_iscd": str(code).zfill(6),
+        "stck_prpr": stck_prpr,
+        "askp1": output.get("askp1"),
+        "bidp1": output.get("bidp1") or stck_prpr,   # REST에 bidp1 없으면 현재가 대체
+        "acml_vol": acml_vol,
+        "stck_mxpr": output.get("stck_mxpr"),
+        "stck_llam": output.get("stck_llam"),
+        # ── 매도 판단에 필요한 필드 추가 ──
+        "stck_oprc": output.get("stck_oprc"),
+        "stck_hgpr": output.get("stck_hgpr"),
+        "wghn_avrg_stck_prc": output.get("wghn_avrg_stck_prc"),
+        "prdy_ctrt": output.get("prdy_ctrt"),
+        # 장운영상태 컬럼 (WSS 데이터와 일관성 유지)
+        "new_mkop_cls_code": _market_wide_mkop.get(_code_market_map.get(code, ""), "") or _last_mkop_cls_code.get(code, ""),
+        "market_event": _market_wide_event.get(_code_market_map.get(code, ""), "") or _market_event.get(code, ""),
+        # VI 이벤트 컬럼
+        "vi_yn": "Y" if code in _vi_active_codes else "",
+        "vi_start_ts": _vi_start_ts.get(code, ""),
+        "vi_end_ts": _vi_end_ts.get(code, ""),
+    }
+    df = pl.DataFrame([row])
+    mode = _get_mode()
+    kind = "overtime_real" if mode in (RunMode.OVERTIME_EXP, RunMode.OVERTIME_REAL) else "regular_real"
+    recv_ts = datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S.%f")
+    _ingest_queue.put((df, "FHKST01010100", kind, "Y", recv_ts))
+
+
+def _rest_submit(func, *args, min_interval: float = 0.0, timeout: float = 30.0, **kwargs):
+    evt = threading.Event()
+    holder: dict = {}
+    _rest_queue.put((func, args, kwargs, min_interval, evt, holder))
+    if not evt.wait(timeout=timeout):
+        raise TimeoutError(f"[rest_submit] {func.__name__} 응답 없음 ({timeout}s timeout)")
+    if "error" in holder:
+        raise holder["error"]
+    return holder.get("result")
+
+
+def _rest_worker() -> None:
+    global _rest_req_count, _rest_req_second, _rest_last_sent_ts
+    logger.info(f"{ts_prefix()} [rest] worker started")
+    while not _stop_event.is_set():
+        try:
+            func, args, kwargs, min_interval, evt, holder = _rest_queue.get(timeout=0.5)
+        except queue.Empty:
+            continue
+        now = time.time()
+        now_sec = int(now)
+        if now_sec != _rest_req_second:
+            _rest_req_second = now_sec
+            _rest_req_count = 0
+        if _rest_req_count >= REST_MAX_PER_SEC:
+            sleep_sec = (now_sec + 1 - now) + REST_AFTER_WINDOW_DELAY
+            time.sleep(max(0.0, sleep_sec))
+            _rest_req_second = int(time.time())
+            _rest_req_count = 0
+        gap = now - _rest_last_sent_ts
+        if min_interval > 0 and gap < min_interval:
+            time.sleep(min_interval - gap)
+        try:
+            result = func(*args, **kwargs)
+            holder["result"] = result
+        except Exception as e:
+            holder["error"] = e
+        finally:
+            _rest_req_count += 1
+            _rest_last_sent_ts = time.time()
+            evt.set()
+    logger.info(f"{ts_prefix()} [rest] worker stopped")
+
+
+# REST 보충 정책
+_REST_OPEN_START    = dtime(9, 0)     # 개장 직후 적극 보충 시작
+_REST_OPEN_END      = dtime(9, 10)    # 개장 직후 적극 보충 종료 (최대)
+_REST_OPEN_INTERVAL = 1.0             # 개장 직후: 종목당 1초 간격
+_REST_VI_UNTIL      = dtime(9, 2)     # VI 발동 종목 REST 보충 제외 시한
+_REST_GRACE_SEC     = 30              # 시작/재시작 후 WSS warmup 대기 시간(초)
+
+# ── a2 WSS (예상체결가 + 체결통보 + 장운영정보 온디맨드) ────────────────────────
+_kws_a2 = None                         # a2 KISWebSocket 인스턴스
+_kws_a2_ready = threading.Event()      # a2 WSS 연결 완료 신호
+_a2_subscribed_codes: set[str] = set() # a2에서 구독 중인 예상체결가 종목
+_a2_ccnl_notice_done = False           # a2 체결통보 구독 완료 여부
+_a2_mkstatus_codes: set[str] = set()   # a2에서 H0STMKO0 일시 구독 중인 종목
+_a2_mkstatus_ts: dict[str, float] = {} # H0STMKO0 구독 시각 (타임아웃 자동 해제용)
+_A2_MKSTATUS_TIMEOUT = 30.0           # H0STMKO0 일시 구독 자동 해제 (30초)
+_A2_MKSTATUS_MAX = 5                  # H0STMKO0 동시 구독 상한
+
+def _init_a2_wss() -> None:
+    """a2 계좌 전용 WSS 연결 (예상체결가 전체 + 체결통보 H0STCNI0).
+    프로그램 시작 시 daemon 스레드로 실행. a2 인증이 안 된 경우 스킵.
+    """
+    global _kws_a2
+    if not _a2_approval_key:
+        logger.info(f"{ts_prefix()} [a2-wss] approval_key 없음 → a2 WSS 미사용")
+        return
+
+    # open_map을 비워서 초기 구독 없이 연결 (동적 구독만 사용)
+    saved_map = dict(ka.open_map)
+    ka.open_map.clear()
+    _kws_a2 = ka.KISWebSocket(api_url="", max_retries=9999, approval_key=_a2_approval_key)
+    ka.open_map.update(saved_map)  # a1 open_map 즉시 복원
+
+    def _a2_on_result(ws, tr_id, df, data_info):
+        """a2 WSS 수신 콜백: 예상체결가 + 체결통보 → 기존 처리 경로로 합류."""
+        trid = str(tr_id)
+        # TR_KIND 매핑 (a1과 동일한 구조로 ingest_queue에 전달)
+        _TR_KIND = {
+            "H0STANC0": ("regular_exp", "N"),
+            "H0STOAC0": ("overtime_exp", "N"),
+        }
+        if trid in _TR_KIND:
+            recv_ts = datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S.%f")
+            kind, is_real = _TR_KIND[trid]
+            # 컬럼명 소문자 통일 (a1 on_result과 동일)
+            df.columns = [str(c).strip().lower() for c in df.columns]
+            # kis_auth_llm은 pandas DataFrame 반환 → Polars 변환 필수 (ingest_loop은 Polars 기대)
+            df_pl = pl.from_pandas(df)
+            _ingest_queue.put((df_pl, trid, kind, is_real, recv_ts))
+        elif trid == "H0STCNI0":
+            # 체결통보: a1의 on_result 처리 경로 직접 호출 (ingest_queue 미경유)
+            on_result(ws, tr_id, df, data_info)
+        elif trid == "H0STMKO0":
+            # 장운영정보: 기존 처리 함수 직접 호출
+            _on_market_status_krx(df)
+
+    def _a2_on_system(rsp):
+        if rsp.isOk and rsp.tr_msg and "SUCCESS" in rsp.tr_msg:
+            if not _kws_a2_ready.is_set():
+                _kws_a2_ready.set()
+                logger.info(f"{ts_prefix()} [a2-wss] 연결 완료")
+                # ★ on_system은 asyncio 루프 내에서 호출됨 → send_request(run_coroutine_threadsafe)가
+                #   같은 루프에 코루틴을 넣어도 현재 콜백이 반환될 때까지 실행 안 됨 → timeout
+                #   → 별도 스레드에서 구독 요청
+                def _a2_initial_subscribe():
+                    time.sleep(1)  # ws 안정화 대기
+                    try:
+                        _a2_subscribe_ccnl_notice()
+                    except Exception as e:
+                        logger.warning(f"{ts_prefix()} [a2-wss] 체결통보 초기 구독 실패: {e}")
+                    try:
+                        _a2_apply_subscriptions(datetime.now(KST))
+                    except Exception as e:
+                        logger.warning(f"{ts_prefix()} [a2-wss] 예상체결가 초기 구독 실패: {e}")
+                threading.Thread(target=_a2_initial_subscribe, daemon=True).start()
+            return
+        if rsp.tr_msg:
+            msg = str(rsp.tr_msg)
+            if "not found" in msg.lower() or "ALREADY IN SUBSCRIBE" in msg:
+                logger.debug(f"{ts_prefix()} [a2-wss] system: {msg}")
+            else:
+                logger.info(f"{ts_prefix()} [a2-wss] system: tr_id={getattr(rsp, 'tr_id', '')} msg={msg}")
+
+    _kws_a2.on_system = _a2_on_system
+    logger.info(f"{ts_prefix()} [a2-wss] 연결 시작 (예상체결가 + 체결통보 전용)")
+    _kws_a2.start(_a2_on_result)  # blocking — daemon thread에서 호출
+
+def _a2_subscribe_ccnl_notice() -> None:
+    """a2 WSS에서 H0STCNI0 체결통보 구독. 연결 완료 후 1회 호출."""
+    global _a2_ccnl_notice_done
+    if _kws_a2 is None or _a2_ccnl_notice_done:
+        return
+    acc_key = _get_ccnl_notice_tr_key()
+    if not acc_key:
+        logger.warning(f"{ts_prefix()} [a2-wss] 체결통보 htsid 미설정 → H0STCNI0 구독 불가")
+        return
+    try:
+        _kws_a2.send_request(request=ccnl_notice, tr_type="1", data=acc_key)  # noqa: F405
+        _a2_ccnl_notice_done = True
+        logger.info(f"{ts_prefix()} [a2-wss] H0STCNI0 체결통보 구독 완료: tr_key={acc_key!r}")
+    except Exception as e:
+        logger.warning(f"{ts_prefix()} [a2-wss] H0STCNI0 체결통보 구독 실패: {e}")
+
+def _a2_wss_subscribe(code: str, tr_type: str) -> bool:
+    """a2 WSS로 예상체결가 구독/해제. 성공 시 True."""
+    if _kws_a2 is None:
+        return False
+    try:
+        _kws_a2.send_request(request=exp_ccnl_krx, tr_type=tr_type, data=code)  # noqa: F405
+        if tr_type == "1":
+            _a2_subscribed_codes.add(code)
+        else:
+            _a2_subscribed_codes.discard(code)
+        return True
+    except Exception as e:
+        name = code_name_map.get(code, code)
+        action = "구독" if tr_type == "1" else "해제"
+        logger.warning(f"{ts_prefix()} [a2-wss] exp_ccnl {action} 실패: {name}({code}) {e}")
+        return False
+
+def _a2_wss_subscribe_batch(request_func, code_list: list, tr_type: str = "1") -> bool:
+    """a2 WSS로 배치 구독/해제."""
+    if _kws_a2 is None or not code_list:
+        return False
+    try:
+        _kws_a2.send_request(request=request_func, tr_type=tr_type, data=code_list)
+        if request_func.__name__ in ("exp_ccnl_krx", "overtime_exp_ccnl_krx"):
+            for c in code_list:
+                if tr_type == "1":
+                    _a2_subscribed_codes.add(c)
+                else:
+                    _a2_subscribed_codes.discard(c)
+        return True
+    except Exception as e:
+        logger.warning(f"{ts_prefix()} [a2-wss] batch {request_func.__name__} 실패: {e}")
+        return False
+
+def _a2_mkstatus_subscribe(code: str) -> None:
+    """a2 WSS에서 H0STMKO0 일시 구독 (미수신 원인 확인용). 상한 초과 시 스킵."""
+    if _kws_a2 is None or code in _a2_mkstatus_codes:
+        return
+    # 타임아웃 만료분 먼저 정리
+    _a2_mkstatus_expire()
+    if len(_a2_mkstatus_codes) >= _A2_MKSTATUS_MAX:
+        return  # 동시 구독 상한 도달
+    try:
+        _kws_a2.send_request(request=market_status_krx, tr_type="1", data=code)  # noqa: F405
+        _a2_mkstatus_codes.add(code)
+        _a2_mkstatus_ts[code] = time.time()
+        name = code_name_map.get(code, code)
+        logger.info(f"{ts_prefix()} [a2-wss] H0STMKO0 일시 구독: {name}({code}) (현재 {len(_a2_mkstatus_codes)}개)")
+    except Exception as e:
+        logger.warning(f"{ts_prefix()} [a2-wss] H0STMKO0 구독 실패: {code} {e}")
+
+def _a2_mkstatus_unsubscribe(code: str) -> None:
+    """상태 확인 완료 후 H0STMKO0 해제."""
+    if _kws_a2 is None or code not in _a2_mkstatus_codes:
+        return
+    try:
+        _kws_a2.send_request(request=market_status_krx, tr_type="2", data=code)  # noqa: F405
+    except Exception as e:
+        logger.warning(f"{ts_prefix()} [a2-wss] H0STMKO0 해제 실패: {code} {e}")
+    _a2_mkstatus_codes.discard(code)
+    _a2_mkstatus_ts.pop(code, None)
+    name = code_name_map.get(code, code)
+    logger.debug(f"{ts_prefix()} [a2-wss] H0STMKO0 해제: {name}({code})")
+
+def _a2_mkstatus_expire() -> None:
+    """타임아웃 경과한 H0STMKO0 일시 구독 자동 해제."""
+    if not _a2_mkstatus_ts:
+        return
+    now = time.time()
+    expired = [c for c, ts in _a2_mkstatus_ts.items() if (now - ts) >= _A2_MKSTATUS_TIMEOUT]
+    for c in expired:
+        _a2_mkstatus_unsubscribe(c)
+
+def _a2_apply_subscriptions(now: datetime) -> None:
+    """a2 WSS 시간대별 예상체결가 구독 전환. scheduler_loop에서 주기 호출."""
+    if _kws_a2 is None:
+        return
+    t = now.time()
+    all_codes = set(codes)
+    desired: set[str] = set()
+
+    # 08:50~09:00: 장전 예상체결가 (전 종목)
+    if dtime(8, 50) <= t < dtime(9, 0):
+        desired = all_codes
+    # 09:00~15:20: VI + 57/59 예상체결가만 (나머지는 a1 실시간체결)
+    elif dtime(9, 0) <= t < dtime(15, 20):
+        vi_codes = (_vi_delayed_codes | _vi_active_codes) & all_codes
+        single_codes = (_single_price_codes.keys() | _single_price_pending.keys()) & all_codes
+        # 57/59: 실시간 체결 구간 제외
+        minute, second = t.minute, t.second
+        single_real_window = (
+            (minute in (29, 59) and second >= 29) or (minute in (0, 30) and second < 6)
+        )
+        single_exp = single_codes if not single_real_window else set()
+        desired = vi_codes | single_exp
+    # 15:20~15:30: 장마감 예상체결가 (전 종목)
+    elif dtime(15, 20) <= t < dtime(15, 30):
+        desired = all_codes
+
+    # 현재 구독과 비교하여 추가/해제
+    to_add = desired - _a2_subscribed_codes
+    to_remove = _a2_subscribed_codes - desired
+
+    if to_remove:
+        for c in list(to_remove):
+            _a2_wss_subscribe(c, "2")
+    if to_add:
+        for c in list(to_add):
+            _a2_wss_subscribe(c, "1")
+
+def _vi_exp_sub_add(code: str) -> None:
+    """VI 발동 종목에 예상체결가 구독 추가.
+    on_result 콜백(asyncio 이벤트 루프 내)에서 호출되므로,
+    _send_subscribe는 별도 스레드에서 실행하여 데드락 방지.
+    """
+    if code in _vi_exp_sub_ts:
+        return  # 이미 구독 중
+    _vi_exp_sub_ts[code] = time.time()
+    _vi_active_codes.add(code)
+    threading.Thread(target=_vi_exp_sub_worker, args=(code, "1"), daemon=True).start()
+
+def _vi_exp_sub_unsub(code: str) -> None:
+    """VI 해제 또는 타임아웃 → 예상체결가 구독 해제."""
+    _vi_exp_sub_ts.pop(code, None)
+    _vi_active_codes.discard(code)
+    _vi_exp_last_notify.pop(code, None)
+    threading.Thread(target=_vi_exp_sub_worker, args=(code, "2"), daemon=True).start()
+
+def _vi_exp_sub_worker(code: str, tr_type: str) -> None:
+    """별도 스레드에서 VI 예상체결가 구독/해제.
+    a2 WSS 우선 사용 (a1 슬롯 소비 없음, lock 경합 없음).
+    a2 미사용 시 a1 fallback.
+    """
+    action = "구독 추가" if tr_type == "1" else "구독 해제"
+    name = code_name_map.get(code, code)
+
+    # ── a2 WSS 경로 (우선) ──
+    if _a2_wss_subscribe(code, tr_type):
+        logger.info(f"{ts_prefix()} [VI감지] a2 예상체결가 {action}: {name}({code})")
+        return  # a2에서 처리 완료 — a1 실시간체결가는 건드리지 않음 (항상 유지)
+
+    # ── a1 fallback (a2 미사용 시) ──
+    label = (
+        "예상체결가 구독 추가 성공" if tr_type == "1"
+        else "예상체결가 구독 해제 성공"
+    )
+    mode = _get_mode()
+    with _kws_lock:
+        if _active_kws is not None:
+            try:
+                _send_subscribe(
+                    _active_kws, exp_ccnl_krx, [code], tr_type,  # noqa: F405
+                    label=label,
+                )
+                if tr_type == "1":
+                    _subscribed.setdefault("exp_ccnl_krx", set()).add(code)
+                else:
+                    _subscribed.get("exp_ccnl_krx", set()).discard(code)
+                # VI 해제 → 즉시 실시간체결가(H0STCNT0)로 전환 (a1 fallback에서만 필요)
+                if tr_type == "2" and code in set(codes):
+                    if mode == RunMode.REGULAR_REAL:
+                        _send_subscribe(_active_kws, ccnl_krx, [code], "1")  # noqa: F405
+                        logger.info(f"{ts_prefix()} [VI감지] 실시간체결가 즉시 전환: {name}({code})")
+            except Exception as e:
+                logger.warning(f"{ts_prefix()} [VI감지] exp_ccnl {action} 실패: {name}({code}) {e}")
+
+
+# ── VI REST 폴링 (FHPST01390000) — 전체 종목 VI 감지 ──
+_VI_POLL_INTERVAL = 7.0                     # VI 현황 폴링 간격(초)
+_VI_DURATION_SEC = 120                      # VI 발동~해제 기본 2분(120초)
+_vi_poll_active_codes: dict[str, float] = {}  # code -> 발동시각(epoch) — REST 폴링으로 감지된 VI
+
+_VI_POLL_API_URL = "/uapi/domestic-stock/v1/quotations/inquire-vi-status"
+_VI_POLL_TR_ID = "FHPST01390000"
+
+
+_vi_poll_last_ts: float = 0.0  # 마지막 VI 폴링 시각
+
+
+def _vi_poll_check() -> None:
+    """FHPST01390000 REST API로 전체 시장 VI 현황 1회 조회.
+    _price_watchdog_loop()에서 종목별 데이터 5초 미수신 시 호출됨.
+    발동 감지 시 해당 종목 예상체결가 구독, 발동시각+2분 후 실시간체결가로 전환.
+    """
+    global _vi_poll_last_ts
+    now = time.time()
+
+    # 최소 5초 간격 (중복 호출 방지)
+    if (now - _vi_poll_last_ts) < 5.0:
+        # 시간 경과 체크만 수행 (API 호출 없이)
+        _vi_poll_expire_check(now)
+        return
+    _vi_poll_last_ts = now
+
+    client = _price_client or _top_client
+    if client is None:
+        return
+
+    now_dt = datetime.now(KST)
+    t = now_dt.time()
+    if not (dtime(9, 0) <= t < dtime(15, 20)):
+        return
+
+    # ── 1) REST API 호출 ──
+    try:
+        today_str = now_dt.strftime("%Y%m%d")
+        url = f"{client.cfg.base_url}{_VI_POLL_API_URL}"
+        params = {
+            "FID_COND_SCR_DIV_CODE": "20139",
+            "FID_INPUT_ISCD": "",           # 전체 종목
+            "FID_MRKT_CLS_CODE": "0",       # 전체 시장
+            "FID_DIV_CLS_CODE": "0",        # 전체 방향
+            "FID_RANK_SORT_CLS_CODE": "0",  # 전체 VI종류
+            "FID_INPUT_DATE_1": today_str,
+            "FID_TRGT_CLS_CODE": "",
+            "FID_TRGT_EXLS_CLS_CODE": "",
+        }
+        headers = client._headers(tr_id=_VI_POLL_TR_ID)
+        headers["tr_cont"] = ""
+        r = client.session.get(url, headers=headers, params=params, timeout=10)
+        r.raise_for_status()
+        j = r.json()
+    except Exception as e:
+        logger.debug(f"{ts_prefix()} [VI폴링] API 호출 실패: {e}")
+        return
+
+    if str(j.get("rt_cd")) != "0":
+        return
+
+    output = j.get("output") or []
+
+    # ── 2) 현재 발동 중인 종목 추출 ──
+    active_now: dict[str, float] = {}  # code -> 발동시각(epoch)
+    for row in output:
+        vi_cls = str(row.get("vi_cls_code", "")).strip()
+        if vi_cls not in ("Y", "1", "2", "3"):
+            continue  # 해제된 건 스킵
+        code = str(row.get("mksc_shrn_iscd", "")).strip()
+        if not code:
+            continue
+        # 발동시각 파싱 (HHMMSS)
+        vi_hour_str = str(row.get("cntg_vi_hour", "")).strip()
+        if len(vi_hour_str) >= 6:
+            try:
+                vi_time = datetime.strptime(f"{today_str}{vi_hour_str[:6]}", "%Y%m%d%H%M%S")
+                vi_time = vi_time.replace(tzinfo=KST)
+                active_now[code] = vi_time.timestamp()
+            except ValueError:
+                active_now[code] = now
+        else:
+            active_now[code] = now
+
+    # ── 3) 신규 VI 발동 감지 → 예상체결가 구독 ──
+    for code, vi_ts in active_now.items():
+        if code not in _vi_poll_active_codes:
+            _vi_poll_active_codes[code] = vi_ts
+            name = code_name_map.get(code, code)
+            vi_time_str = datetime.fromtimestamp(vi_ts, tz=KST).strftime("%H:%M:%S")
+            vi_time_iso = datetime.fromtimestamp(vi_ts, tz=KST).strftime("%Y-%m-%d %H:%M:%S")
+            logger.info(f"{ts_prefix()} [VI폴링] VI 발동 감지: {name}({code}) 발동시각={vi_time_str}")
+            # VI 발동 시각 기록 (parquet 저장용)
+            _vi_start_ts[code] = vi_time_iso
+            _vi_end_ts.pop(code, None)
+            # 구독 종목이면 예상체결가로 전환
+            if code in set(codes):
+                _vi_exp_sub_add(code)
+            else:
+                logger.info(f"{ts_prefix()} [VI폴링] {name}({code}) 비구독종목 → 모니터링만")
+
+    # ── 4) REST 응답에서 사라진 종목(해제 확정) 처리 ──
+    for code in list(_vi_poll_active_codes):
+        if code not in active_now:
+            name = code_name_map.get(code, code)
+            logger.info(f"{ts_prefix()} [VI폴링] VI 해제 확인 (API 미포함): {name}({code})")
+            del _vi_poll_active_codes[code]
+            _vi_end_ts[code] = datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S")
+            if code in _vi_active_codes:
+                _vi_exp_sub_unsub(code)
+
+    # ── 5) 발동시각+2분 경과 체크 ──
+    _vi_poll_expire_check(now)
+
+
+def _vi_poll_expire_check(now: float) -> None:
+    """발동시각+2분 경과 종목 → 실시간체결가 복귀."""
+    for code in list(_vi_poll_active_codes):
+        vi_ts = _vi_poll_active_codes[code]
+        elapsed = now - vi_ts
+        if elapsed >= _VI_DURATION_SEC:
+            name = code_name_map.get(code, code)
+            logger.info(f"{ts_prefix()} [VI폴링] VI 해제 추정 ({elapsed:.0f}초 경과): {name}({code})")
+            del _vi_poll_active_codes[code]
+            _vi_end_ts[code] = datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S")
+            if code in _vi_active_codes:
+                _vi_exp_sub_unsub(code)
+
+
+# ── VI 발동 중 예상체결가 모니터링 ──
+_vi_exp_last_notify: dict[str, float] = {}  # 종목별 마지막 알림 시각 (초단위 스팸 방지)
+_VI_EXP_NOTIFY_INTERVAL = 10.0              # 같은 종목 알림 최소 간격(초)
+
+
+def _monitor_vi_exp_price(result, col_map: dict, code_col: str) -> None:
+    """
+    VI 발동 종목의 예상체결가 수신 시 가격 변동 모니터링.
+    VI기준가 대비 상승/하락 방향과 등락률을 알림.
+    """
+    if not _vi_active_codes or not code_col:
+        return
+
+    pr_col = col_map.get("stck_prpr") or col_map.get("antc_prce")
+    prdy_col = col_map.get("prdy_ctrt")
+    if not pr_col:
+        return
+
+    now_ts = time.time()
+    tmp = result.with_columns(
+        pl.col(code_col).cast(pl.Utf8).str.zfill(6).alias(code_col)
+    )
+
+    for df_code in tmp.partition_by(code_col, maintain_order=True):
+        code = str(df_code[code_col][0])
+        if code not in _vi_active_codes:
+            continue
+
+        # 스팸 방지: 일정 간격 이내면 스킵
+        last_t = _vi_exp_last_notify.get(code, 0.0)
+        if (now_ts - last_t) < _VI_EXP_NOTIFY_INTERVAL:
+            continue
+
+        try:
+            antc_prc = float(str(df_code[pr_col][-1]).replace(",", "") or 0)
+        except (ValueError, TypeError):
+            continue
+        if antc_prc <= 0:
+            continue
+
+        prdy_rt = 0.0
+        if prdy_col:
+            try:
+                prdy_rt = float(str(df_code[prdy_col][-1]).replace(",", "") or 0)
+            except (ValueError, TypeError):
+                pass
+
+        stnd_prc = _vi_stnd_prc.get(code, 0.0)
+        name = code_name_map.get(code, code)
+        cnt = _vi_trigger_count.get(code, 0)
+
+        # VI기준가 대비 변동률 계산
+        if stnd_prc > 0:
+            vi_diff_pct = (antc_prc - stnd_prc) / stnd_prc * 100
+            direction = "상승" if vi_diff_pct > 0 else "하락"
+            msg = (
+                f"{ts_prefix()} [VI모니터] {name}({code}) 예상체결가={antc_prc:,.0f}"
+                f"  VI기준가={stnd_prc:,.0f}({vi_diff_pct:+.2f}% {direction})"
+                f"  등락률={prdy_rt:+.2f}%  ({cnt}회차VI)"
+            )
+        else:
+            msg = (
+                f"{ts_prefix()} [VI모니터] {name}({code}) 예상체결가={antc_prc:,.0f}"
+                f"  등락률={prdy_rt:+.2f}%  ({cnt}회차VI)"
+            )
+        logger.info(msg)
+        _vi_exp_last_notify[code] = now_ts
+
+        # ── VI 매수/취소 판단 (예상체결가 vs 현재가) ──
+        cur_prc = _last_stck_prpr.get(code, 0.0)
+        if code in _vi_buy_pending:
+            _try_vi_buy_cancel(code, name, antc_prc, cur_prc)
+        else:
+            _try_vi_buy(code, name, antc_prc, cur_prc)
+
+
+# ── VI 발동 매수 (전략 판단: str1, 주문 실행: 여기) ─────────────────────────────
+# VI 매수 주문이 나간 종목 추적 (취소 로직용) — code → ordno
+_vi_buy_pending: dict[str, str] = {}
+
+def _try_vi_buy(code: str, name: str, antc_prce: float, stck_prpr: float) -> None:
+    """예상체결가 수신 시 VI 매수 시도 — 전략 판단은 str1에 위임."""
+    if code in _vi_buy_pending:
+        return  # 이미 주문 나간 상태
+    already_holding = code in _vi_positions and not _vi_positions[code].get("sold")
+    should_buy, reason = vi_buy_strategy(
+        antc_prce, stck_prpr, VI_TRADE_MODE, already_holding,
+    )
+    if not should_buy:
+        return
+    try:
+        cfg = _read_cfg() or load_config(str(CONFIG_PATH))
+        cano = str(cfg.get("cano", "")).strip()
+        acnt = str(cfg.get("acnt_prdt_cd", "01")).strip() or "01"
+        if not cano:
+            logger.warning(f"[VI매수] config cano 없음 → {code} 매수 스킵")
+            return
+        client = _top_client or _init_top_client()
+        buy_price = stck_prpr if stck_prpr > 0 else antc_prce
+        limit_up = calc_limit_up_price(buy_price)
+        # test_mode: 1주, run_mode: max_invest 기반 수량
+        accts = _iter_enabled_accounts(trade_only=True)
+        main_acct = accts[0] if accts else {}
+        max_inv = float(str(main_acct.get("max_invest", "0") or 0).replace("_", "") or 0)
+        if VI_TRADE_MODE == "test_mode":
+            qty = 1
+        else:
+            try:
+                vi_avail = _get_account_available_cash(client, main_acct)
+            except Exception:
+                vi_avail = max_inv
+            qty = max(1, int(vi_avail / buy_price)) if vi_avail > 0 else 1
+        j = _buy_order_cash(client, cano, acnt, "TTTC0802U", code, qty, limit_up, ord_dvsn="01")
+        out = j.get("output") or {}
+        ordno = str(out.get("ODNO") or out.get("odno") or "").strip()
+        now_ts = datetime.now(KST)
+        _vi_buy_pending[code] = ordno
+        _vi_positions[code] = {
+            "buy_price": buy_price, "buy_ts": now_ts,
+            "qty": qty, "highest": buy_price, "sold": False,
+            "name": name, "ordno": ordno,
+        }
+        with _str1_sell_state_lock:
+            _str1_sell_state[code] = {
+                "sold": False, "sell_reason": "", "qty": qty,
+                "sell_price": 0.0, "sell_time": "", "ordno": "",
+                "pnl": 0.0, "ret_pct": 0.0,
+                "buy_price": buy_price, "name": name,
+                "opening_call_auction_ordered": False, "balance_qty": qty,
+                "source": "vi",
+            }
+        _ensure_code_structs([code])
+        with _lock:
+            _base_codes.add(code)
+        mode_label = "테스트(1주)" if VI_TRADE_MODE == "test_mode" else "정상"
+        msg = (
+            f"{ts_prefix()} [VI매수] {name}({code}) 상한가 매수주문"
+            f"  수량={qty}  현재가={stck_prpr:,.0f}  예상체결가={antc_prce:,.0f}"
+            f"  상한가={limit_up:,.0f}  주문번호={ordno}  모드={mode_label}"
+        )
+        _notify(msg, tele=True)
+        logger.info(msg)
+        _append_ledger(
+            order_type="buy_order", code=code, name=name,
+            buy_price=buy_price, order_qty=qty, reason=f"{reason}_주문",
+            ord_no=ordno, stck_prpr=stck_prpr,
+        )
+    except Exception as e:
+        logger.error(f"[VI매수] {name}({code}) 매수 실패: {e}")
+
+
+def _try_vi_buy_cancel(code: str, name: str, antc_prce: float, stck_prpr: float) -> None:
+    """예상체결가 모니터링 중 취소 조건 충족 시 VI 매수 주문 취소."""
+    ordno = _vi_buy_pending.get(code)
+    if not ordno:
+        return
+    should_cancel, reason = vi_should_cancel(antc_prce, stck_prpr)
+    if not should_cancel:
+        return
+    try:
+        cfg = _read_cfg() or load_config(str(CONFIG_PATH))
+        cano = str(cfg.get("cano", "")).strip()
+        acnt = str(cfg.get("acnt_prdt_cd", "01")).strip() or "01"
+        client = _top_client or _init_top_client()
+        pos = _vi_positions.get(code, {})
+        qty = pos.get("qty", 0)
+        _cancel_order_generic(client, cano, acnt, ordno, code, qty, ord_dvsn="01")
+        _vi_buy_pending.pop(code, None)
+        _vi_positions.pop(code, None)
+        with _str1_sell_state_lock:
+            _str1_sell_state.pop(code, None)
+        msg = (
+            f"{ts_prefix()} [VI매수취소] {name}({code})"
+            f"  예상체결가={antc_prce:,.0f} ≤ 현재가={stck_prpr:,.0f}"
+            f"  주문번호={ordno}  사유={reason}"
+        )
+        _notify(msg, tele=True)
+        logger.info(msg)
+        _append_ledger(
+            order_type="buy_cancel", code=code, name=name,
+            buy_price=stck_prpr, order_qty=qty, reason=reason,
+            ord_no=ordno, stck_prpr=stck_prpr,
+        )
+    except Exception as e:
+        logger.error(f"[VI매수취소] {name}({code}) 취소 실패: {e}")
+
+
+# ── H0STMKO0 장운영정보 수신 처리 (VI/사이드카/서킷브레이크 감지) ──
+_mkstatus_sub_codes: set[str] = set()  # H0STMKO0 구독 중인 종목
+_last_mkop_event: dict[str, str] = {}  # code -> mkop_cls_code (장운영구분코드)
+_market_event: dict[str, str] = {}     # code -> 현재 장운영 이벤트 문자열 (VI/사이드카 등)
+
+# MKOP_CLS_CODE 주요 값 (KIS API H0STMKO0 PDF)
+_MKOP_SIDECAR_CODES = {"187", "388", "397", "398"}  # 사이드카 발동/해제/매수발동/매수해제
+_MKOP_CIRCUIT_CODES = {"174", "175", "182", "184", "185"}  # 서킷브레이크
+_MKOP_HALT_CODES = {"164"}  # 시장임시정지
+_MKOP_EVENT_NAMES = {
+    "187": "사이드카발동", "388": "사이드카레이트해제",
+    "397": "사이드카매수발동", "398": "사이드카매수해제",
+    "174": "서킷브레이크발동", "175": "서킷브레이크해제",
+    "182": "서킷브레이크장종동시마감", "184": "서킷브레이크개시", "185": "서킷브레이크해제",
+    "164": "시장임시정지",
+}
+# 서킷브레이크 발동 중 상태 판별용 (거래중단 → 동시호가 전환 감지)
+_CIRCUIT_BREAK_ACTIVE_EVENTS = {"서킷브레이크발동", "서킷브레이크개시"}
+_CIRCUIT_BREAK_ALL_EVENTS = {"서킷브레이크발동", "서킷브레이크개시", "서킷브레이크동시호가"}
+
+def _on_market_status_krx(result) -> None:
+    """H0STMKO0 장운영정보 수신 → 종목상태 갱신."""
+    if result is None or result.empty:
+        return
+    for _, row in result.iterrows():
+        code = str(row.get("mksc_shrn_iscd", "")).strip()
+        if not code:
+            continue
+        name = code_name_map.get(code, code)
+        trht_yn = str(row.get("trht_yn", "N")).strip().upper()
+        iscd_stat = str(row.get("iscd_stat_cls_code", "")).strip()
+
+        # 거래정지 감지
+        if trht_yn == "Y" and code not in _halted_codes:
+            _halted_codes.add(code)
+            _notify(
+                f"{ts_prefix()} [종목상태] {name}({code}) 거래정지 (H0STMKO0, trht_yn=Y)",
+                tele=True,
+            )
+
+        # 장운영구분코드 (mkop_cls_code) 감지 — 사이드카/서킷브레이크/임시정지
+        mkop = str(row.get("mkop_cls_code", "")).strip()
+        antc_mkop = str(row.get("antc_mkop_cls_code", row.get("ANTC_MKOP_CLS_CODE", ""))).strip()
+        # EXCH_CLS_CODE로 마켓 식별 (fallback: _code_market_map)
+        exch_cls = str(row.get("EXCH_CLS_CODE", "")).strip()
+        market = _code_market_map.get(code, "")
+        if exch_cls:
+            # EXCH_CLS_CODE 값 → 마켓 매핑 (실제 값 확인 후 조정 필요)
+            if exch_cls in ("1", "K"):
+                market = "KOSPI"
+            elif exch_cls in ("2", "Q"):
+                market = "KOSDAQ"
+            logger.debug(f"[장운영] {name}({code}) EXCH_CLS_CODE={exch_cls} → market={market}")
+
+        # ── ANTC_MKOP_CLS_CODE: 서킷브레이크 동시호가 전환 감지 ──
+        if antc_mkop == "311":
+            # 311=장전예상시작 → 서킷브레이크 진행 중이면 동시호가 단계 전환
+            cur_evt = _market_wide_event.get(market, "") if market else _market_event.get(code, "")
+            if cur_evt in _CIRCUIT_BREAK_ACTIVE_EVENTS:
+                auction_evt = "서킷브레이크동시호가"
+                _market_event[code] = auction_evt
+                if market:
+                    _market_wide_event[market] = auction_evt
+                    _market_wide_mkop[market] = "311"
+                msg = (f"{ts_prefix()} [장운영] {name}({code}) "
+                       f"antc_mkop=311 서킷브레이크 → 동시호가 전환")
+                logger.warning(msg)
+                _notify(msg, tele=True)
+
+        if mkop:
+            prev_mkop = _last_mkop_event.get(code, "")
+            if mkop != prev_mkop:
+                _last_mkop_event[code] = mkop
+                event_name = _MKOP_EVENT_NAMES.get(mkop)
+                if event_name:
+                    _market_event[code] = event_name
+                    msg = (f"{ts_prefix()} [장운영] {name}({code}) "
+                           f"mkop={mkop} ({event_name})")
+                    logger.warning(msg)
+                    _notify(msg, tele=True)
+                    # 사이드카/써킷 발동 → 마켓 전체 전파
+                    if mkop in ("187", "397", "174", "184", "164") and market:
+                        now_iso = datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S")
+                        _market_wide_event[market] = event_name
+                        _market_wide_mkop[market] = mkop
+                        _market_wide_start_ts[market] = now_iso
+                        logger.warning(f"{ts_prefix()} [장운영] 마켓전파: {market} ← {event_name} (발동시각={now_iso})")
+                elif mkop in ("112", "121", "129"):
+                    # 서킷브레이크 진행 중이면 동시호가 전환 (클리어하지 않음)
+                    cur_evt = _market_wide_event.get(market, "") if market else _market_event.get(code, "")
+                    if cur_evt in _CIRCUIT_BREAK_ACTIVE_EVENTS:
+                        auction_evt = "서킷브레이크동시호가"
+                        _market_event[code] = auction_evt
+                        if market:
+                            _market_wide_event[market] = auction_evt
+                            _market_wide_mkop[market] = mkop
+                        msg = (f"{ts_prefix()} [장운영] {name}({code}) "
+                               f"mkop={mkop} 서킷브레이크 → 동시호가 전환")
+                        logger.warning(msg)
+                        _notify(msg, tele=True)
+                    elif cur_evt in _CIRCUIT_BREAK_ALL_EVENTS:
+                        # 이미 동시호가 상태에서 112(종료) → 175/185 해제까지 유지
+                        logger.info(f"{ts_prefix()} [장운영] {name}({code}) mkop={mkop} (동시호가 유지)")
+                    else:
+                        # 서킷 아닌 일반 장운영 상태 변경
+                        _market_event.pop(code, None)
+                        logger.info(f"{ts_prefix()} [장운영] {name}({code}) mkop={mkop}")
+                # 사이드카/서킷브레이크 해제 시 이벤트 클리어
+                if mkop in ("175", "185", "388", "398"):
+                    _market_event.pop(code, None)
+                    # 마켓 전파 해제
+                    if market:
+                        _market_wide_event.pop(market, None)
+                        _market_wide_mkop.pop(market, None)
+                        _market_wide_start_ts.pop(market, None)
+                        logger.info(f"{ts_prefix()} [장운영] 마켓전파 해제: {market} (mkop={mkop})")
+
+        # iscd_stat 갱신 — H0STMKO0의 값은 KRX DB와 다를 수 있으므로 교차검증
+        if iscd_stat in ("57", "59") and code not in _single_price_codes and code not in _single_price_pending:
+            try:
+                krx_map = KRX_code_batch([code])
+                krx_stat = krx_map.get(code)
+                if krx_stat in ("57", "59"):
+                    _single_price_pending[code] = krx_stat
+                    desc = "57(관리종목)" if krx_stat == "57" else "59(단기과열)"
+                    logger.info(f"{ts_prefix()} [종목상태] {name}({code}) {desc} (H0STMKO0→KRX확인) → 30분 단일가 후보")
+                else:
+                    logger.info(
+                        f"{ts_prefix()} [종목상태] {name}({code}) "
+                        f"H0STMKO0 iscd_stat={iscd_stat} ≠ KRX({krx_stat}) → 무시"
+                    )
+            except Exception as e:
+                logger.warning(f"{ts_prefix()} [종목상태] {name}({code}) KRX 교차검증 실패: {e}")
+
+        # VI 발동/해제 감지 (vi_cls_code)
+        vi_cls = str(row.get("vi_cls_code", "")).strip()
+        if vi_cls:
+            prev_vi = _vi_cls_cache.get(code, "")
+            if vi_cls != prev_vi:
+                _vi_cls_cache[code] = vi_cls
+                if vi_cls == "Y":  # VI 발동 (H0STMKO0: Y=적용, N=미적용)
+                    cnt = _vi_trigger_count.get(code, 0) + 1
+                    _vi_trigger_count[code] = cnt
+                    _vi_exp_sub_add(code)
+                    # VI 발동 시각 기록 (parquet 저장용)
+                    _vi_start_ts[code] = datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S")
+                    _vi_end_ts.pop(code, None)
+                    msg = (f"{ts_prefix()} [VI발동] {name}({code}) "
+                           f"vi_cls={vi_cls} ({cnt}회차)")
+                    logger.warning(msg)
+                    _notify(msg, tele=True)
+                elif vi_cls == "N":  # VI 해제
+                    _vi_exp_sub_unsub(code)
+                    # VI 해제 시각 기록
+                    _vi_end_ts[code] = datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S")
+                    # H0STMKO0 일시구독 자동 해제 (a2)
+                    _a2_mkstatus_unsubscribe(code)
+                    msg = (f"{ts_prefix()} [VI해제] {name}({code}) "
+                           f"vi_cls={vi_cls}")
+                    logger.info(msg)
+                    _notify(msg, tele=True)
+                else:
+                    logger.info(f"{ts_prefix()} [VI상태] {name}({code}) vi_cls={vi_cls} (미정의값)")
+
+
+def _mkstatus_sub_add(codes_to_add: set[str]) -> None:
+    """보유종목에 대해 H0STMKO0 장운영정보 구독 추가."""
+    new_codes = codes_to_add - _mkstatus_sub_codes
+    if not new_codes:
+        return
+    with _kws_lock:
+        if _active_kws is not None:
+            try:
+                _send_subscribe(_active_kws, market_status_krx, list(new_codes), "1")  # noqa: F405
+                _mkstatus_sub_codes.update(new_codes)
+                names = [f"{code_name_map.get(c, c)}({c})" for c in new_codes]
+                logger.info(f"{ts_prefix()} [H0STMKO0] 장운영정보 구독 추가: {', '.join(names)}")
+            except Exception as e:
+                logger.warning(f"{ts_prefix()} [H0STMKO0] 구독 실패: {e}")
+
+
+def _mkstatus_sub_remove(codes_to_remove: set[str]) -> None:
+    """매도 완료 종목의 H0STMKO0 구독 해제."""
+    global _mkstatus_sub_codes
+    active = codes_to_remove & _mkstatus_sub_codes
+    if not active:
+        return
+    with _kws_lock:
+        if _active_kws is not None:
+            try:
+                _send_subscribe(_active_kws, market_status_krx, list(active), "2")  # noqa: F405
+                _mkstatus_sub_codes -= active
+                names = [f"{code_name_map.get(c, c)}({c})" for c in active]
+                logger.info(f"{ts_prefix()} [H0STMKO0] 장운영정보 구독 해제: {', '.join(names)}")
+            except Exception as e:
+                logger.warning(f"{ts_prefix()} [H0STMKO0] 해제 실패: {e}")
+
+
+def _handle_stale_check_result(code: str, output: dict) -> None:
+    """REST 상태확인(FHKST01010100) 결과로 종목 상태 판단 및 조치.
+
+    주의: REST API(FHKST01010100)의 iscd_stat_cls_code는 KRX code DB의 값과
+    **전혀 다른 의미**이므로 종목상태(상장폐지/관리종목 등) 판단에 사용하면 안 됨.
+    종목상태 판단은 KRX_code_batch (daily_KRX_code_DB) 기준으로만 수행할 것.
+    여기서는 temp_stop_yn, sltr_yn 등 명확한 필드만 사용.
+    """
+    name = code_name_map.get(code, code)
+    pr = output.get("stck_prpr", "")
+    vol = output.get("acml_vol", "")
+    temp_stop = str(output.get("temp_stop_yn", "N")).strip().upper()
+    sltr = str(output.get("sltr_yn", "N")).strip().upper()
+    mrkt_warn = str(output.get("mrkt_warn_cls_code", "")).strip()
+    invt_caful = str(output.get("invt_caful_yn", "N")).strip().upper()
+
+    def _status_notify(msg: str) -> None:
+        sys.stdout.write("\n")
+        _notify(msg)
+
+    # ── 장중 일시정지 (VI 등) → 유지 ──
+    if temp_stop == "Y":
+        if code not in _halted_codes:
+            _halted_codes.add(code)
+            _status_notify(f"{ts_prefix()} [종목상태] {name}({code}) 일시정지 중 (temp_stop_yn=Y)")
+        _enqueue_rest_price_row(code, output)
+        return
+
+    # ── 정리매매 → 해제 ──
+    if sltr == "Y":
+        if code not in _halted_codes:
+            _halted_codes.add(code)
+            _status_notify(f"{ts_prefix()} [종목상태] {name}({code}) 정리매매 (sltr_yn=Y) → 구독 해제")
+            removed = _remove_code_structs([code], force=True)
+            if removed:
+                _trigger_ws_rebuild()
+        return
+
+    # ── 거래 없음 → 09:10 전 유지, 이후 해제 ──
+    pr_val = str(pr).strip()
+    vol_val = str(vol).strip()
+    if not pr_val or pr_val == "0" or not vol_val or vol_val == "0":
+        now_t = datetime.now(KST).time()
+        if now_t >= dtime(9, 10) and code not in _halted_codes:
+            _halted_codes.add(code)
+            _status_notify(f"{ts_prefix()} [종목상태] {name}({code}) 거래 없음 (pr={pr_val}, vol={vol_val}) → 구독 해제")
+            removed = _remove_code_structs([code], force=True)
+            if removed:
+                _trigger_ws_rebuild()
+        return
+
+    # ── 투자위험/투자주의 → 유지 (1회 알람) ──
+    if mrkt_warn == "03" or invt_caful == "Y":
+        if code not in _halted_codes:
+            _halted_codes.add(code)
+            tag = "투자위험" if mrkt_warn == "03" else "투자주의"
+            _status_notify(f"{ts_prefix()} [종목상태] {name}({code}) {tag}")
+        _enqueue_rest_price_row(code, output)
+        return
+
+    # ── 정상: REST 보충만 수행 (57/59 자동 판정 없음, KIS API 조회결과 기반만 사용) ──
+    _halted_codes.discard(code)
+    _enqueue_rest_price_row(code, output)
+    pr_fmt = f"{float(str(pr).replace(',', '') or 0):,.0f}" if pr else "0"
+    logger.info(f"{ts_prefix()} [REST보충] {name}({code}) 현재가={pr_fmt}")
+
+
+def _is_vi_suspect(code: str, now_t) -> bool:
+    """09:00 직전 prdy_ctrt >= 10% 이면 VI 발동 가능 → 09:02까지 REST 제외."""
+    if now_t >= _REST_VI_UNTIL:
+        return False
+    return abs(_last_prdy_ctrt.get(code, 0.0)) >= 10.0
+
+
+def _price_watchdog_loop() -> None:
+    logger.info(f"{ts_prefix()} [price] watchdog started")
+    start_ts = time.time()
+    while not _stop_event.is_set():
+        mode = _get_mode()
+        if mode in (RunMode.PREOPEN_WAIT, RunMode.STOP, RunMode.EXIT):
+            time.sleep(0.5)
+            continue
+        now = time.time()
+        now_t = datetime.now(KST).time()
+        # 09:00 이전에는 REST 보충 안 함
+        if now_t < _REST_OPEN_START:
+            time.sleep(0.5)
+            continue
+
+        # --- 모드 판별 ---
+        wss_alive = (_last_any_recv_ts > 0 and (now - _last_any_recv_ts) < 5.0)
+        wss_ever  = (_last_any_recv_ts > 0)
+
+        # ================================================================
+        # (A) 개장 직후 09:00~09:10: 적극 REST 보충
+        #     - WSS 체결 데이터가 지연되므로 1초 간격으로 REST 보충
+        #     - 한 번이라도 WSS 실시간 체결을 받은 종목(=open가격 수신)은 제외
+        #     - VI 발동 의심 종목(prdy_ctrt >= 10%)은 09:02까지 제외
+        # ================================================================
+        if _REST_OPEN_START <= now_t < _REST_OPEN_END:
+            with _lock:
+                # 모든 종목이 WSS 수신 완료되면 개장 보충 조기 종료
+                all_received = all(
+                    _last_recv_ts.get(c, 0.0) > 0 for c in codes
+                )
+            if all_received:
+                # 모든 종목 open 가격 수신 완료 → 개장 보충 불필요, (B)로 진행
+                pass
+            else:
+                with _lock:
+                    for c in list(codes):
+                        # VI 발동 의심 종목 → 09:02까지 제외
+                        if _is_vi_suspect(c, now_t):
+                            continue
+                        last = _last_recv_ts.get(c, 0.0)
+                        if last > 0 and c not in _single_price_codes:
+                            continue  # 이미 WSS 체결 수신(=open 가격 확보) → skip (57/59는 장전 예상가일 수 있으므로 제외)
+                        if (now - _last_rest_req_ts.get(c, 0.0)) < _REST_OPEN_INTERVAL:
+                            continue
+                        _last_rest_req_ts[c] = now
+                        if c in _rest_pending:
+                            continue
+                        _rest_pending.add(c)
+                        try:
+                            _price_queue.put_nowait(c)
+                        except Exception:
+                            pass
+                time.sleep(0.5)
+                continue
+
+        # ================================================================
+        # (B) 09:10 이후 (또는 개장 보충 조기 종료): WSS 의존
+        #     - 시작/재시작 직후 warmup (30초) — WSS가 데이터 보내기 전 REST 폭탄 방지
+        #     - WSS 정상 → 한 번도 수신 안 한 종목만 REST
+        #     - WSS 5초+ 전체 미수신 → 연결 이상, 전 종목 REST
+        # ================================================================
+        if (now - start_ts) < _REST_GRACE_SEC:
+            time.sleep(0.5)
+            continue
+
+        # ── 정규장 시간 외에는 REST 보충/감시 안 함 ──
+        # 시간외(16:00~18:00)는 대부분 거래 없어 WSS 미수신이 정상
+        if not (dtime(9, 0) <= now_t <= dtime(15, 30)):
+            time.sleep(1.0)
+            continue
+
+        if wss_alive:
+            with _lock:
+                _nm = _code_name_map()
+                for c in list(codes):
+                    last = _last_recv_ts.get(c, 0.0)
+                    if last > 0:
+                        continue  # WSS 수신 이력 있으면 skip
+                    # ── WSS 한 번도 미수신 + 추가 시점부터 10분(600초) 경과 → 구독 해제 (TOP5_ADD=False면 스킵) ──
+                    if not TOP5_ADD:
+                        continue
+                    added_ts = _code_added_ts.get(c, start_ts)
+                    if (now - added_ts) >= 600.0:
+                        name = _nm.get(c, c)
+                        sys.stdout.write("\n")
+                        _notify(
+                            f"{ts_prefix()} [watchdog] WSS 미수신 10분 → 구독 해제: {name}({c})"
+                        )
+                        removed = _remove_code_structs([c], force=True)
+                        if removed:
+                            _top_added_codes.discard(c)
+                            _watchdog_removed_codes.add(c)
+                            _trigger_ws_rebuild()
+                        continue
+                    # ── 60초 간격 REST 상태확인 (거래중지/VI 즉시 판단) ──
+                    if (now - _last_rest_req_ts.get(c, start_ts)) < 60.0:
+                        continue
+                    _last_rest_req_ts[c] = now
+                    if c in _rest_pending:
+                        continue
+                    _rest_pending.add(c)
+                    try:
+                        _price_queue.put_nowait(("stale_check", c))
+                    except Exception:
+                        pass
+
+        # ================================================================
+        # (C) 장중 종목별 미수신 감시 (09:10~15:30)
+        #     - WSS 전용 시각(_last_wss_recv_ts)으로 stale 판단
+        #       (REST가 _last_recv_ts를 갱신해 WSS 미수신을 마스킹하는 문제 방지)
+        #     - WSS 한 번도 미수신 종목: STALE_CHECK_SEC(60초) 간격
+        #     - WSS 수신 이력 있는 종목: STALE_CHECK_INACTIVE_SEC(20초) 미수신 시만
+        #     - 거래정지 종목: STALE_CHECK_HALTED_SEC(300초) 간격
+        # ================================================================
+        if dtime(9, 10) <= now_t <= dtime(15, 30):
+            with _lock:
+                for c in list(codes):
+                    if c in _rest_pending:
+                        continue
+                    last_wss = _last_wss_recv_ts.get(c, 0.0)
+                    idle = (now - last_wss) if last_wss > 0 else (now - start_ts)
+                    # 상태별 재확인 간격 적용
+                    if c in _halted_codes:
+                        check_interval = STALE_CHECK_HALTED_SEC    # 300초
+                    elif last_wss > 0:
+                        # WSS 수신 이력 있음 → 비활성 구간
+                        check_interval = STALE_CHECK_INACTIVE_SEC  # 20초
+                    else:
+                        # WSS 한 번도 미수신 → 빈번하게 확인
+                        check_interval = STALE_CHECK_SEC           # 60초
+                    if idle < check_interval:
+                        continue
+                    last_check = _last_stale_check_ts.get(c, 0.0)
+                    if (now - last_check) < check_interval:
+                        continue
+                    _last_stale_check_ts[c] = now
+                    _rest_pending.add(c)
+                    try:
+                        _price_queue.put_nowait(("stale_check", c))
+                    except Exception:
+                        pass
+                    # 미수신 종목 → a2에서 H0STMKO0 일시 구독 (VI/사이드카/거래정지 확인)
+                    _a2_mkstatus_subscribe(c)
+
+            # H0STMKO0 일시 구독 타임아웃 자동 해제
+            _a2_mkstatus_expire()
+
+            # VI 예상체결가 구독 자동 해제 (150초 경과 — H0STMKO0 해제 통보 미수신 시 fallback)
+            # VI 발동~해제 통상 2:03~2:20초 → 150초(2분30초) 안전 마진
+            for c in list(_vi_exp_sub_ts):
+                if (now - _vi_exp_sub_ts[c]) >= 150:
+                    _vi_exp_sub_unsub(c)
+
+        if not wss_alive:
+            # WSS 5초 이상 전체 미수신 → VI 폴링 (전체 종목 VI 발동 여부 확인)
+            _vi_poll_check()
+            # WSS 5초 이상 전체 미수신 → 연결 이상, 종목별 60초 간격 REST 상태확인
+            with _lock:
+                for c in list(codes):
+                    last = _last_recv_ts.get(c, 0.0)
+                    if last > 0 and (now - last) < 5.0:
+                        continue
+                    if (now - _last_rest_req_ts.get(c, start_ts)) < 60.0:
+                        continue
+                    _last_rest_req_ts[c] = now
+                    if c in _rest_pending:
+                        continue
+                    _rest_pending.add(c)
+                    try:
+                        _price_queue.put_nowait(("stale_check", c))
+                    except Exception:
+                        pass
+        time.sleep(0.5)
+    logger.info(f"{ts_prefix()} [price] watchdog stopped")
+
+
+def _price_request_loop() -> None:
+    global _price_client, _price_client_2, _price_req_count, _price_req_second
+    try:
+        _price_client = _init_price_client()
+    except Exception as e:
+        logger.warning(f"{ts_prefix()} [price] init failed: {e}")
+        return
+    # 계정2(syw_2) fallback 초기화 (실패해도 기본 계정으로 계속)
+    if USE_FALLBACK_ACCOUNT:
+        try:
+            _price_client_2 = _init_price_client_2()
+            if _price_client_2:
+                logger.info(f"{ts_prefix()} [price] 계정2(syw_2) fallback 초기화 완료")
+        except Exception:
+            _price_client_2 = None
+    logger.info(f"{ts_prefix()} [price] request loop started")
+    last_req_ts = 0.0
+    while not _stop_event.is_set():
+        try:
+            item = _price_queue.get(timeout=0.5)
+        except queue.Empty:
+            continue
+
+        # ── 요청 타입 구분: 일반 가격 보충 vs 장중 상태확인 ──
+        is_stale_check = False
+        if isinstance(item, tuple) and len(item) == 2 and item[0] == "stale_check":
+            is_stale_check = True
+            code = item[1]
+        else:
+            code = item
+
+        now = time.time()
+        # 현재가 요청 초당 제한 (8건)
+        now_sec = int(now)
+        if now_sec != _price_req_second:
+            _price_req_second = now_sec
+            _price_req_count = 0
+        if _price_req_count >= 8:
+            sleep_sec = (now_sec + 1 - now) + REST_AFTER_WINDOW_DELAY
+            time.sleep(max(0.0, sleep_sec))
+            _price_req_second = int(time.time())
+            _price_req_count = 0
+        try:
+            output = _rest_submit(
+                _fetch_current_price,
+                _price_client,
+                code,
+            )
+            _price_req_count += 1
+            last_req_ts = time.time()
+            prev_fc = _rest_fail_backoff.pop(code, None)  # 성공 → 거래정지 의심 해제
+            if prev_fc:
+                name = code_name_map.get(code, code)
+                logger.info(f"{ts_prefix()} [price] REST 복구: {name}({code}) fc={prev_fc}→0")
+            _halted_codes.discard(code)
+            if is_stale_check:
+                _handle_stale_check_result(code, output)
+            else:
+                _enqueue_rest_price_row(code, output)
+                name = code_name_map.get(code, code)
+                pr = output.get("stck_prpr", "?")
+                logger.info(f"{ts_prefix()} [price] REST보충 {name}({code}) pr={pr}")
+        except Exception as e:
+            # ── 한도 초과 시 ──
+            if _is_rate_limit_error(e):
+                if USE_FALLBACK_ACCOUNT and _price_client_2:
+                    try:
+                        output = _rest_submit(_fetch_current_price, _price_client_2, code)
+                        _price_req_count += 1
+                        _rest_fail_backoff.pop(code, None)
+                        if is_stale_check:
+                            _handle_stale_check_result(code, output)
+                        else:
+                            _enqueue_rest_price_row(code, output)
+                            name = code_name_map.get(code, code)
+                            pr = output.get("stck_prpr", "?")
+                            logger.info(f"{ts_prefix()} [price] REST보충(계정2) {name}({code}) pr={pr}")
+                    except Exception as e2:
+                        logger.warning(f"{ts_prefix()} [price] fetch failed(계정2) code={code}: {e2}")
+                else:
+                    # fallback 미사용 → 한도 초과는 건너뜀
+                    name = code_name_map.get(code, code)
+                    logger.info(f"{ts_prefix()} [price] 한도 초과 → 건너뜀: {name}({code})")
+            else:
+                # ── 500 등 서버 에러 → 거래정지 의심 처리 ──
+                name = code_name_map.get(code, code)
+                fc = _rest_fail_backoff.get(code, 0) + 1
+                _rest_fail_backoff[code] = fc
+                if fc == 1:
+                    logger.warning(f"{ts_prefix()} [price] fetch failed {name}({code}): {e}")
+                elif fc == 2:
+                    # 2회 연속 500 + WSS 미수신 → 거래정지 의심, _halted_codes 등록
+                    if code not in _halted_codes:
+                        _halted_codes.add(code)
+                        _notify(
+                            f"{ts_prefix()} [price] ★ REST 500 연속 + WSS 미수신 "
+                            f"→ 거래정지 의심: {name}({code})"
+                        )
+                # _halted_codes 등록 후 → watchdog (C)에서 STALE_CHECK_HALTED_SEC(300초) 간격 적용
+                # 인증 오류일 때만 재초기화
+                err_str = str(e)
+                if "401" in err_str or "403" in err_str or "token" in err_str.lower():
+                    try:
+                        _price_client = _init_price_client()
+                        logger.info(f"{ts_prefix()} [price] client re-initialized")
+                    except Exception:
+                        pass
+        finally:
+            _rest_pending.discard(code)
+    logger.info(f"{ts_prefix()} [price] request loop stopped")
+
+def _fetch_fluctuation_top(client: KisClient, top_n: int = 10) -> list[dict]:
+    url = f"{client.cfg.base_url}/uapi/domestic-stock/v1/ranking/fluctuation"
+    headers = client._headers(tr_id="FHPST01700000")
+    params = {
+        "fid_cond_mrkt_div_code": client.cfg.market_div,
+        "fid_cond_scr_div_code": "20170",
+        "fid_input_iscd": "0000",
+        "fid_rank_sort_cls_code": "0",
+        "fid_input_cnt_1": "0",
+        "fid_prc_cls_code": "0",
+        "fid_input_price_1": "",
+        "fid_input_price_2": "",
+        "fid_vol_cnt": "",
+        "fid_trgt_cls_code": "0",
+        "fid_trgt_exls_cls_code": "0",
+        "fid_div_cls_code": "0",
+        "fid_rsfl_rate1": "",
+        "fid_rsfl_rate2": "",
+    }
+    r = requests.get(url, headers=headers, params=params, timeout=10)
+    r.raise_for_status()
+    j = r.json()
+    if str(j.get("rt_cd")) != "0":
+        raise RuntimeError(f"[등락률순위] 실패: {j.get('msg1')} raw={j}")
+    output = j.get("output") or []
+    if isinstance(output, dict):
+        output = [output]
+    if isinstance(output, list) and top_n > 0:
+        return output[:top_n]
+    return output
+
+
+def _ensure_code_structs(new_codes: list[str]) -> list[str]:
+    added = []
+    with _lock:
+        for c in new_codes:
+            if c in codes:
+                continue
+            codes.append(c)
+            added.append(c)
+            _per_sec_counts[c] = 0
+            _total_counts[c] = 0
+            _since_save_counts[c] = 0
+            _last_prdy_ctrt[c] = 0.0
+            _last_recv_ts[c] = 0.0
+            _last_rest_req_ts[c] = 0.0
+            _code_added_ts[c] = time.time()  # watchdog 3분 기준: 추가 시점부터 계산
+            _init_indicator_buf(c)
+        if added:
+            try:
+                code_name_map.update(_code_name_map())
+            except Exception:
+                pass
+            _persist_subscription_codes(codes)
+            # ── 새 종목 iscd_stat 조회 (KRX_code) → 57/59 단일가 판별 ──
+            _check_iscd_stat_krx(added)
+    return added
+
+
+# KRX group 필터 캐시 (group == "ST" 인 종목만 구독 대상)
+_krx_group_cache: dict[str, str] = {}
+
+
+def _load_krx_group_cache() -> None:
+    """KRX_code.csv에서 code→group 매핑을 로드한다."""
+    global _krx_group_cache
+    try:
+        krx_path = Path("/home/ubuntu/Stoc_Kis/data/admin/symbol_master/KRX_code.csv")
+        if not krx_path.exists():
+            logger.warning("[top] KRX_code.csv not found, group filter disabled")
+            return
+        df = pd.read_csv(krx_path, dtype=str, usecols=["code", "group"])
+        df["code"] = df["code"].str.strip().str.zfill(6)
+        df["group"] = df["group"].str.strip().str.upper()
+        _krx_group_cache = dict(zip(df["code"], df["group"]))
+        logger.info(f"[top] KRX group cache loaded: {len(_krx_group_cache)} entries")
+    except Exception as e:
+        logger.warning(f"[top] KRX group cache load failed: {e}")
+
+
+def _is_stock_group(code: str) -> bool:
+    """KRX group이 'ST'(일반 주식)인지 확인. 캐시 없으면 통과."""
+    if not _krx_group_cache:
+        return True  # 캐시 없으면 필터 미적용
+    return _krx_group_cache.get(code, "") == "ST"
+
+
+# 탑10 구독 추가/해제 이력 관리
+_top_added_codes: set[str] = set(_loaded_top_added)  # config에서 복원 또는 빈 set
+if _top_added_codes:
+    logger.info(f"[codes] top_added 복원: {sorted(_top_added_codes)}")
+_watchdog_removed_codes: set[str] = set()  # watchdog WSS 미수신으로 해제된 종목 (재추가 방지)
+_top_sub_log_path = TOP_RANK_OUT_DIR / f"wss_sub_add_top10_list_{today_yymmdd}.csv"
+_closing_codes: list[str] = []       # 15:19 선정된 종가매매 종목 (Select_Tr_target_list 조건)
+_closing_code_info: dict[str, dict] = {}  # code -> {prev_close, name} (매수 시 상한가 산정용)
+_balance_0758_done = False           # 07:58 잔고조회 1회 실행 플래그 (NXT 보유종목)
+_balance_0858_done = False           # 08:58 잔고조회 1회 실행 플래그
+_closing_buy_placed: list[dict] = [] # 15:20 주문 건 (15:30 체결 알림용)
+_closing_buy_filled_done = False     # 15:30 체결 메시지 1회 플래그
+# 15:20 예상체결가 모니터링: 첫 틱 가격·현재가 캐시, 취소/재주문 상태
+_closing_exp_first_tick: dict[str, float] = {}   # code -> 15:20 첫 예상체결가
+_closing_last_exp_price: dict[str, float] = {}   # code -> 최근 예상체결가
+_closing_last_bidp1: dict[str, float] = {}        # code -> 최근 매수 1호가
+_closing_last_askp1: dict[str, float] = {}        # code -> 최근 매도 1호가
+_closing_cancelled: set[str] = set()             # 취소된 종목 (재주문 대기)
+_closing_cancel_failed: set[str] = set()         # 3회 재시도 후 최종 실패 종목
+_closing_cancel_retry: dict[str, int] = {}       # code -> 취소 재시도 횟수
+_closing_last_action_ts: dict[str, float] = {}   # code -> 마지막 취소/재주문 시각
+_closing_152930_done = False                      # 15:29:30 일시 확인 실행 여부
+_pre_unsub_closing_done = False                   # 15:19:55 사전 구독 해제 실행 여부
+_closing_monitor_lock = threading.Lock()          # 모니터링 락
+
+
+def _to_float_closing(val) -> float:
+    try:
+        if isinstance(val, str):
+            val = val.replace(",", "")
+        return float(val)
+    except Exception:
+        return 0.0
+
+
+def _sub_monthly_log_path() -> Path:
+    """월별 구독 이력 CSV 경로: wss_subscription_log_YYMM.csv"""
+    yymm = datetime.now(KST).strftime("%y%m")
+    return TOP_RANK_OUT_DIR / f"wss_subscription_log_{yymm}.csv"
+
+
+def _log_subscription_event(code: str, name: str, sub_type: str, action: str) -> None:
+    """월별 구독 이력 CSV에 1행 추가.
+    sub_type: base / top30 / vi / str1_sell / closing 등
+    action: 시작 / 추가 / 해제
+    """
+    TOP_RANK_OUT_DIR.mkdir(parents=True, exist_ok=True)
+    now = datetime.now(KST)
+    log_path = _sub_monthly_log_path()
+    write_header = not log_path.exists()
+    try:
+        with open(log_path, "a", encoding="utf-8-sig") as f:
+            if write_header:
+                f.write("date,time,type,code,name,action\n")
+            f.write(f"{now.strftime('%Y-%m-%d')},{now.strftime('%H:%M:%S')},{sub_type},{code},{name},{action}\n")
+    except Exception as e:
+        logger.warning(f"[sub_log] monthly write failed: {e}")
+
+
+def _log_base_codes_on_startup() -> None:
+    """프로그램 시작 시 base_codes(morning target)를 월별 CSV에 기록."""
+    for c in sorted(_base_codes):
+        name = code_name_map.get(c, c)
+        _log_subscription_event(c, name, "base", "시작")
+    logger.info(f"[sub_log] base_codes {len(_base_codes)}종목 월별 CSV 기록 완료")
+
+
+def _log_top_sub_event(code: str, name: str, action: str) -> None:
+    """탑10 구독 추가/해제 이벤트를 CSV에 기록한다."""
+    TOP_RANK_OUT_DIR.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S")
+    write_header = not _top_sub_log_path.exists()
+    try:
+        with open(_top_sub_log_path, "a", encoding="utf-8-sig") as f:
+            if write_header:
+                f.write("time,code,name,action\n")
+            f.write(f"{ts},{code},{name},{action}\n")
+    except Exception as e:
+        logger.warning(f"[top] sub log write failed: {e}")
+    # 월별 CSV에도 기록
+    _log_subscription_event(code, name, "top30", "추가" if action == "추가" else "해제")
+
+
+def _remove_code_structs(remove_codes: list[str], force: bool = False) -> list[str]:
+    """종목을 구독 해제한다. force=False면 base_codes는 제거하지 않는다."""
+    removed = []
+    with _lock:
+        for c in remove_codes:
+            if not force and c in _base_codes:
+                continue
+            if c not in codes:
+                continue
+            codes.remove(c)
+            removed.append(c)
+            # 관련 자료구조 정리
+            _per_sec_counts.pop(c, None)
+            _total_counts.pop(c, None)
+            _since_save_counts.pop(c, None)
+            _last_recv_ts.pop(c, None)
+            _last_rest_req_ts.pop(c, None)
+            _last_prdy_ctrt.pop(c, None)
+            _code_added_ts.pop(c, None)
+            # _ema_state, _price_buf는 당일 모든 종목 유지 (구독 해제해도 pop 안 함)
+        if removed:
+            _persist_subscription_codes(codes)
+    return removed
+
+
+def _run_closing_exp_monitor_tick(result: pl.DataFrame, code_col: str, col_map: dict) -> None:
+    """
+    15:20~15:30 예상체결가 모니터링.
+
+    [15:20~15:29:30] 첫 틱·최근가 캐시만. 취소 없음.
+    [15:29:30] 처음 취소: 예상가 < 첫틱 시 취소. 단, 첫틱이 매수/매도 1호가 범위 내면 유지.
+    [15:29:30~15:30] 지속 모니터링: 예상가 < 첫틱 시 즉시 취소 (쿨다운 없음).
+    취소 후 가격 복귀(>=첫틱 또는 첫틱∈1호가) 시 재주문.
+    """
+    if not CLOSE_BUY or not _closing_codes or _get_mode() != RunMode.CLOSE_EXP:
+        return
+    # H0STANC0(예상체결) 스키마: stck_prpr만 반환
+    pr_col = col_map.get("stck_prpr") or col_map.get("antc_prce")
+    bid_col = col_map.get("bidp1")
+    ask_col = col_map.get("askp1")
+    if not pr_col:
+        return
+
+    now_kst = datetime.now(KST).time()
+    after_152930 = now_kst >= dtime(15, 29, 30)
+
+    placed_by_code = {o["code"]: o for o in _closing_buy_placed if o.get("qty", 0) > 0}
+    result = result.with_columns(
+        pl.col(code_col).cast(pl.Utf8).str.zfill(6).alias(code_col)
+    )
+    now_ts = time.time()
+    for df_code in result.partition_by(code_col, maintain_order=True):
+        code = str(df_code[code_col][0])
+        if code not in _closing_codes or code not in placed_by_code:
+            continue
+        row = df_code.row(-1, named=True)
+        try:
+            price = _to_float_closing(row.get(pr_col))
+        except Exception:
+            continue
+        if price <= 0:
+            continue
+        bidp1 = _to_float_closing(row.get(bid_col)) if bid_col else 0
+        askp1 = _to_float_closing(row.get(ask_col)) if ask_col else 0
+
+        with _closing_monitor_lock:
+            if code not in _closing_exp_first_tick:
+                _closing_exp_first_tick[code] = price
+                _save_exp_first_tick()  # 재시작 시 복원용 저장
+            first_tick = _closing_exp_first_tick[code]
+            _closing_last_exp_price[code] = price
+            _closing_last_bidp1[code] = bidp1
+            _closing_last_askp1[code] = askp1
+
+            o = placed_by_code.get(code, {})
+            ordno = str(o.get("ordno", "")).strip()
+            qty = int(o.get("qty", 0))
+            limit_up = _to_float_closing(o.get("limit_up", 0))
+
+            # 첫틱이 매수/매도 1호가 범위 내인지 (유지 조건)
+            first_tick_in_hoga = False
+            if bidp1 > 0 and askp1 > 0:
+                lo, hi = min(bidp1, askp1), max(bidp1, askp1)
+                first_tick_in_hoga = (lo - 1) <= first_tick <= (hi + 1)
+            elif bidp1 > 0 and abs(first_tick - bidp1) < 1:
+                first_tick_in_hoga = True
+            elif askp1 > 0 and abs(first_tick - askp1) < 1:
+                first_tick_in_hoga = True
+
+            # 예상가 < 첫틱 → 취소 조건. 단 첫틱∈1호가 범위면 유지
+            should_cancel = (price < first_tick) and not first_tick_in_hoga
+
+            if should_cancel and ordno and code not in _closing_cancelled and code not in _closing_cancel_failed:
+                # 15:29:30 이전에는 취소 안 함
+                if not after_152930:
+                    continue
+                # 15:29:30~15:30: 즉시 취소 (쿨다운 없음)
+                _closing_last_action_ts[code] = now_ts
+                _closing_cancelled.add(code)
+                try:
+                    cfg = _read_cfg() or load_config(str(CONFIG_PATH))
+                    cano = o.get("cano") or str(cfg.get("cano", "")).strip()
+                    acnt = o.get("acnt") or str(cfg.get("acnt_prdt_cd", "01")).strip() or "01"
+                    if not cano:
+                        raise RuntimeError("config cano 없음")
+                    client = _top_client or _init_top_client()
+                    _rest_submit(_cancel_closing_order, min_interval=0.5, timeout=15, client=client, cano=cano, acnt=acnt, ordno=ordno, code=code, qty=qty)
+                    o["ordno"] = ""
+                    _notify(f"{ts_prefix()} [종가매수취소] {code} {o.get('name','')} 예상체결 {price:.0f} < 첫틱 {first_tick:.0f}")
+                except Exception as e:
+                    _closing_cancelled.discard(code)
+                    retry_cnt = _closing_cancel_retry.get(code, 0) + 1
+                    _closing_cancel_retry[code] = retry_cnt
+                    if retry_cnt >= 3:
+                        _closing_cancel_failed.add(code)
+                        logger.warning(f"{ts_prefix()} [종가매수취소실패] {code}: {retry_cnt}회 재시도 후 중단 ({e})")
+                    else:
+                        logger.warning(f"{ts_prefix()} [종가매수취소실패] {code}: {e} (재시도 {retry_cnt}/3)")
+
+            # 취소 후 복귀: 첫틱 이상 또는 첫틱∈1호가 → 재주문
+            elif code in _closing_cancelled and (price >= first_tick or first_tick_in_hoga):
+                cooldown = 1.0
+                last_act = _closing_last_action_ts.get(code, 0)
+                if now_ts - last_act < cooldown:
+                    continue
+                _closing_last_action_ts[code] = now_ts
+                _closing_cancelled.discard(code)
+                try:
+                    cfg = _read_cfg() or load_config(str(CONFIG_PATH))
+                    cano = str(cfg.get("cano", "")).strip()
+                    acnt = str(cfg.get("acnt_prdt_cd", "01")).strip() or "01"
+                    client = _top_client or _init_top_client()
+                    j = _rest_submit(_buy_order_cash, min_interval=1.0, timeout=15, client=client, cano=cano, acnt_prdt_cd=acnt, tr_id="TTTC0802U", code=code, qty=qty, price=limit_up, ord_dvsn="01")
+                    out = j.get("output") or {}
+                    new_ordno = str(out.get("ODNO") or out.get("odno") or "").strip()
+                    o["ordno"] = new_ordno
+                    o["cano"] = cano
+                    o["acnt"] = acnt
+                    _notify(f"{ts_prefix()} [종가매수재주문] {code} {o.get('name','')} 예상체결 {price:.0f} >= 첫틱 {first_tick:.0f} ordno={new_ordno}")
+                except Exception as e:
+                    _closing_cancelled.add(code)
+                    logger.warning(f"{ts_prefix()} [종가매수재주문실패] {code}: {e}")
+    return
+
+
+def _run_closing_exp_check_152930() -> None:
+    """
+    15:29:30 일시 확인: 이 시점 가격을 첫 틱과 비교.
+    - 예상가 < 첫틱 → 취소
+    - 첫틱이 매수/매도 1호가 범위 내 → 유지 (취소 안 함)
+    """
+    global _closing_152930_done
+    if not CLOSE_BUY or not _closing_codes or _closing_152930_done:
+        return
+    with _closing_monitor_lock:
+        for o in list(_closing_buy_placed):
+            code = o.get("code", "")
+            if code not in _closing_codes:
+                continue
+            ordno = str(o.get("ordno", "")).strip()
+            if not ordno or code in _closing_cancelled or code in _closing_cancel_failed:
+                continue
+            first_tick = _closing_exp_first_tick.get(code, 0)
+            last_price = _closing_last_exp_price.get(code, 0)
+            bidp1 = _closing_last_bidp1.get(code, 0)
+            askp1 = _closing_last_askp1.get(code, 0)
+            if first_tick <= 0 or last_price <= 0:
+                continue
+            # 첫틱이 1호가 범위 내면 유지
+            first_tick_in_hoga = False
+            if bidp1 > 0 and askp1 > 0:
+                lo, hi = min(bidp1, askp1), max(bidp1, askp1)
+                first_tick_in_hoga = (lo - 1) <= first_tick <= (hi + 1)
+            elif bidp1 > 0 and abs(first_tick - bidp1) < 1:
+                first_tick_in_hoga = True
+            elif askp1 > 0 and abs(first_tick - askp1) < 1:
+                first_tick_in_hoga = True
+            if first_tick_in_hoga:
+                continue  # 유지
+            if last_price < first_tick:
+                qty = int(o.get("qty", 0))
+                if qty > 0:
+                    try:
+                        cfg = _read_cfg() or load_config(str(CONFIG_PATH))
+                        cano = o.get("cano") or str(cfg.get("cano", "")).strip()
+                        acnt = o.get("acnt") or str(cfg.get("acnt_prdt_cd", "01")).strip() or "01"
+                        if not cano:
+                            logger.warning(f"{ts_prefix()} [종가매수취소-15:29:30] {code} config cano 없음, 스킵")
+                            continue
+                        client = _top_client or _init_top_client()
+                        _rest_submit(_cancel_closing_order, min_interval=0.5, timeout=15, client=client, cano=cano, acnt=acnt, ordno=ordno, code=code, qty=qty)
+                        o["ordno"] = ""
+                        _closing_cancelled.add(code)
+                        _notify(f"{ts_prefix()} [종가매수취소-15:29:30] {code} {o.get('name','')} 예상체결 {last_price:.0f} < 첫틱 {first_tick:.0f}")
+                    except Exception as e:
+                        if "500" in str(e) or "Internal Server Error" in str(e):
+                            _closing_cancel_failed.add(code)
+                            logger.warning(f"{ts_prefix()} [종가매수취소실패-15:29:30] {code}: KIS 500 → 재시도 중단")
+                        else:
+                            logger.warning(f"{ts_prefix()} [종가매수취소실패-15:29:30] {code}: {e}")
+    _closing_152930_done = True
+
+
+_closing_redistribute_done = False
+
+
+def _run_closing_cancel_redistribute() -> None:
+    """
+    15:29:50 취소 금액 재분배.
+    취소 완료된 종목의 금액을 거래량 5000 이상 종목에 추가 시장가 매수.
+    """
+    global _closing_redistribute_done
+    if _closing_redistribute_done or not CLOSE_BUY or not _closing_cancelled:
+        return
+    _closing_redistribute_done = True
+
+    # 취소된 종목의 금액 합산
+    cancel_amount = 0.0
+    for o in _closing_buy_placed:
+        code = o.get("code", "")
+        if code in _closing_cancelled:
+            cancel_amount += float(o.get("amount_net", 0))
+    if cancel_amount <= 0:
+        logger.info(f"{ts_prefix()} [종가재분배] 취소 금액 없음, 재분배 스킵")
+        return
+
+    # 거래량 5000 이상 종목 중 미취소·미보유 종목 선별
+    placed_codes = {o.get("code") for o in _closing_buy_placed}
+    redist_candidates: list[dict] = []
+    state = _load_closing_buy_state()
+    if state and state.get("code_info"):
+        for code, info in state["code_info"].items():
+            if code in placed_codes:
+                continue
+            vol = int(info.get("acml_vol", 0) or 0)
+            if vol >= 5000:
+                pr = float(info.get("stck_prpr", 0) or 0)
+                if pr > 0:
+                    redist_candidates.append({"code": code, "price": pr, "vol": vol, "name": info.get("name", code)})
+    redist_candidates.sort(key=lambda x: x["vol"], reverse=True)
+
+    if not redist_candidates:
+        logger.info(f"{ts_prefix()} [종가재분배] 거래량≥5000 후보 없음 (취소금액={cancel_amount:,.0f})")
+        return
+
+    # 재분배: 상위 종목부터 시장가 매수
+    try:
+        cfg = _read_cfg() or load_config(str(CONFIG_PATH))
+        cano = str(cfg.get("cano", "")).strip()
+        acnt = str(cfg.get("acnt_prdt_cd", "01")).strip() or "01"
+        client = _top_client or _init_top_client()
+        remain_amount = cancel_amount
+        ordered: list[str] = []
+        for cand in redist_candidates:
+            if remain_amount < cand["price"]:
+                break
+            qty = int(remain_amount / cand["price"])
+            if qty <= 0:
+                continue
+            code = cand["code"]
+            limit_up = calc_limit_up_price(cand["price"])
+            try:
+                j = _buy_order_cash(client, cano, acnt, "TTTC0802U", code, qty, limit_up, ord_dvsn="01")
+                out = j.get("output") or {}
+                ordno = str(out.get("ODNO") or out.get("odno") or "").strip()
+                cost = cand["price"] * qty
+                remain_amount -= cost
+                ordered.append(f"{cand['name']}({code}) {qty}주 ≈{cost:,.0f}원")
+                _closing_buy_placed.append({
+                    "name": cand["name"], "code": code, "qty": qty, "limit_up": limit_up,
+                    "amount_net": cost, "ordno": ordno, "cano": cano, "acnt": acnt,
+                })
+            except Exception as e:
+                logger.warning(f"{ts_prefix()} [종가재분배주문실패] {code}: {e}")
+        if ordered:
+            msg = f"{ts_prefix()} [종가재분배] 취소금액={cancel_amount:,.0f}원 → {len(ordered)}종목 추가매수: {', '.join(ordered)}"
+            _notify(msg, tele=True)
+            logger.info(msg)
+        else:
+            logger.info(f"{ts_prefix()} [종가재분배] 추가매수 주문 없음 (취소금액={cancel_amount:,.0f})")
+    except Exception as e:
+        logger.warning(f"{ts_prefix()} [종가재분배] 실패: {e}")
+
+
+def _switch_to_closing_codes() -> None:
+    """15:20 종가매매 전환: 기존 종목 전부 해제 → _closing_codes 만 남긴다."""
+    global _base_codes
+    if not _closing_codes:
+        logger.warning(f"{ts_prefix()} [top] _closing_codes 비어 있음, 전환 불가")
+        return
+
+    # ── 0) CLOSE_BUY 옵션 시 매수 주문을 가장 먼저 실행 (지연 최소화) ──
+    if CLOSE_BUY:
+        try:
+            _run_closing_buy_orders()
+        except Exception as e:
+            logger.warning(f"{ts_prefix()} [종가매수] {e}")
+
+    with _lock:
+        # 기존 종목 전부 제거
+        old_codes = list(codes)
+        old_names = [code_name_map.get(c, c) for c in old_codes]
+        codes.clear()
+        _top_added_codes.clear()
+        for c in old_codes:
+            _code_added_ts.pop(c, None)
+
+        # 종가매매 종목으로 교체
+        now_ts = time.time()
+        for c in _closing_codes:
+            codes.append(c)
+            _per_sec_counts[c] = _per_sec_counts.get(c, 0)
+            _total_counts[c] = _total_counts.get(c, 0)
+            _since_save_counts[c] = _since_save_counts.get(c, 0)
+            _last_recv_ts[c] = _last_recv_ts.get(c, 0.0)
+            _last_rest_req_ts[c] = _last_rest_req_ts.get(c, 0.0)
+            _code_added_ts[c] = now_ts  # watchdog 3분 기준 리셋 (즉시 삭제 방지)
+            if c not in _ema_state:
+                _init_indicator_buf(c)
+
+        # base_codes 갱신 (종가매매 종목이 새 기본)
+        _base_codes = set(codes)
+        _persist_subscription_codes(codes)
+
+    # 이름 갱신
+    try:
+        code_name_map.update(_code_name_map())
+    except Exception:
+        pass
+
+    new_names = [code_name_map.get(c, c) for c in _closing_codes]
+
+    # ── 1) 모드를 CLOSE_EXP로 즉시 전환 (scheduler_loop의 중복 전환 방지) ──
+    with _mode_lock:
+        global _current_mode
+        _current_mode = RunMode.CLOSE_EXP
+
+    # ── 2) WSS 재연결으로 구독 초기화 (41개 해제 대신 9개만 신규 구독) ──
+    with _kws_lock:
+        if _active_kws is not None:
+            kws_ref = _active_kws
+            _active_kws = None  # 다른 스레드의 send 시도를 사전 차단
+            _request_ws_close(kws_ref)
+
+    # ── 3) 메시지 출력: 예상체결가 전환 → 종가매매 전환 완료 순서 ──
+    sys.stdout.write("\n")  # 제자리 출력 줄바꿈
+    _notify(f"{ts_prefix()} 실시간 구독 중지 -> 예상체결가 구독 시작", tele=True)
+    _notify(
+        f"{ts_prefix()} [top] ★★ 종가매매 전환 완료\n"
+        f"  해제: {len(old_codes)}개 {old_names}\n"
+        f"  신규: {len(_closing_codes)}개 {_closing_codes} / {new_names}",
+        tele=True,
+    )
+    # a2 예상체결가: 종가매매 종목으로 구독 전환
+    _a2_apply_subscriptions(datetime.now(KST))
+
+    # 15:20 예상체결 모니터링 상태 초기화
+    _closing_exp_first_tick.clear()
+    _closing_last_exp_price.clear()
+    _closing_last_bidp1.clear()
+    _closing_last_askp1.clear()
+    _closing_cancelled.clear()
+    _closing_cancel_failed.clear()
+    _closing_last_action_ts.clear()
+    global _closing_152930_done
+    _closing_152930_done = False
+
+
+def _top_rank_loop():
+    global _top_client, _top_client_2
+    if not TOP_RANK_ENABLED:
+        return
+    _load_krx_group_cache()
+    try:
+        _top_client = _init_top_client()
+    except Exception as e:
+        logger.warning(f"{ts_prefix()} [top] init failed: {e}")
+        return
+    # 계정2(syw_2) fallback 초기화 (실패해도 기본 계정으로 계속)
+    if USE_FALLBACK_ACCOUNT:
+        try:
+            _top_client_2 = _init_top_client_2()
+            if _top_client_2:
+                logger.info(f"{ts_prefix()} [top] 계정2(syw_2) fallback 초기화 완료")
+        except Exception:
+            _top_client_2 = None
+    logger.info(f"{ts_prefix()} [top] started (top{TOP_RANK_N}조회, {TOP_RANK_ADD_N}개 추가, sub={len(codes)}/{MAX_WSS_SUBSCRIBE}, until={TOP_RANK_END})")
+    schedule = _build_top_rank_schedule(datetime.now(KST))
+    idx = 0
+    while not _stop_event.is_set():
+        now = datetime.now(KST)
+        while idx < len(schedule) and now >= schedule[idx]:
+            idx += 1
+        if idx >= len(schedule) or now.time() >= TOP_RANK_END:
+            logger.info(f"{ts_prefix()} [top] end time reached, stopping")
+            return
+        next_ts = schedule[idx]
+        remain = (next_ts - now).total_seconds()
+        if remain <= 2.0:
+            time.sleep(max(0.005, remain * 0.5))  # 2초 이내: 정밀 폴링
+        else:
+            time.sleep(min(remain, 1.0))
+        if datetime.now(KST) < next_ts:
+            continue
+        logger.info(f"{ts_prefix()} [top] 랭킹 조회 시작 (schedule #{idx})")
+        is_closing_select = (next_ts.time() >= dtime(15, 19))   # 15:19 종가매매 선정
+        is_closing_switch = (next_ts.time() >= dtime(15, 20))  # 15:20 구독 전환 + 매수
+        try:
+            # 15:20 구독 전환: 15:19에서 선정된 _closing_codes 사용, fetch 생략
+            if is_closing_switch and _closing_codes:
+                _switch_to_closing_codes()
+                logger.info(f"{ts_prefix()} [top] end time reached (종가매매 전환 완료), stopping")
+                return
+            # ── 공통계정(메인) → 실패 시 계정2(syw_2)로 재시도 ──
+            try:
+                rows = _rest_submit(_fetch_fluctuation_top, _top_client, top_n=TOP_RANK_N)
+            except Exception as e1:
+                logger.warning(f"{ts_prefix()} [top] 공통계정 실패: {type(e1).__name__}: {e1}")
+                if USE_FALLBACK_ACCOUNT and _top_client_2:
+                    rows = _rest_submit(_fetch_fluctuation_top, _top_client_2, top_n=TOP_RANK_N)
+                    logger.info(f"{ts_prefix()} [top] 계정2(syw_2)로 재시도 성공 ({len(rows)}건)")
+                elif _is_rate_limit_error(e1):
+                    logger.info(f"{ts_prefix()} [top] 한도 초과 → 이번 스케줄 건너뜀")
+                    continue  # 한도 초과는 건너뛰고 다음 스케줄로
+                else:
+                    raise  # 한도 초과 외 에러는 전파
+            TOP_RANK_OUT_DIR.mkdir(parents=True, exist_ok=True)
+            ts = next_ts.strftime("%y%m%d_%H%M")
+            out_path = TOP_RANK_OUT_DIR / f"Fetch_fluctuation_top_{ts}.csv"
+            try:
+                pd.DataFrame(rows).to_csv(out_path, index=False, encoding="utf-8-sig")
+            except Exception as e:
+                logger.warning(f"{ts_prefix()} [top] save failed: {e}")
+            msg = f"{ts_prefix()} 상승률 상위 Top{TOP_RANK_N} 다운로드, 저장 완료 : {out_path}"
+            sys.stdout.write("\n")  # 제자리 출력 줄바꿈
+            _notify(msg)
+
+            # --- 현재 랭킹 종목코드 추출 ---
+            current_top_codes: list[str] = []
+            for row in rows:
+                code = str(
+                    row.get("stck_shrn_iscd")
+                    or row.get("stck_cd")
+                    or row.get("code")
+                    or ""
+                ).zfill(6)
+                if code:
+                    current_top_codes.append(code)
+
+            # ============================================================
+            # ============================================================
+            # 15:19 종가매매 종목 선정 — 방금 받은 rows에서 직접 필터
+            # 조건: 전일대비 CLOSING_TARGET_PDY_CTRT*100 % 이상 상승(sign=1)
+            #       + 현재가/당일고가 >= 0.97 (고가 대비 3% 이내)
+            # ============================================================
+            if TOP5_ADD and is_closing_select and not _closing_codes:
+                closing_candidates = []
+                _closing_code_info = {}
+                ctrt_threshold = CLOSING_TARGET_PDY_CTRT * 100  # 0.20 → 20.0
+                _cfg_limit_up_only = (_read_cfg() or load_config(str(CONFIG_PATH))).get("closing_buy_limit_up_only", False)
+                for r in rows:
+                    code = str(
+                        r.get("stck_shrn_iscd") or r.get("stck_cd") or r.get("code") or ""
+                    ).strip().zfill(6)
+                    if not code:
+                        continue
+                    try:
+                        prdy_ctrt = float(str(r.get("prdy_ctrt") or 0).replace(",", "") or 0)
+                        prdy_sign = str(r.get("prdy_vrss_sign") or "").strip()
+                        stck_prpr = float(str(r.get("stck_prpr") or 0).replace(",", "") or 0)
+                        stck_hgpr = float(str(r.get("stck_hgpr") or 0).replace(",", "") or 0)
+                        name      = str(r.get("hts_kor_isnm") or "").strip()
+                    except (TypeError, ValueError):
+                        continue
+                    if prdy_sign not in ("1", "2"):  # 상한가(1) 또는 상승(2)만
+                        continue
+                    # closing_buy_limit_up_only=true 시 상한가(sign=1)만 허용
+                    if _cfg_limit_up_only and prdy_sign != "1":
+                        continue
+                    if prdy_ctrt < ctrt_threshold:  # 전일대비 20% 이상
+                        continue
+                    if stck_hgpr <= 0:
+                        continue
+                    if stck_prpr / stck_hgpr < 0.97:  # 현재가 = 고가 대비 3% 이내
+                        continue
+                    closing_candidates.append(code)
+                    _closing_code_info[code] = {"prev_close": 0.0, "name": name, "prdy_ctrt": prdy_ctrt}
+                # prev_close: 상한가 계산용, 1d parquet에서 보완
+                if closing_candidates:
+                    prev_1d = _get_prev_close_from_1d(closing_candidates)
+                    for code in closing_candidates:
+                        pc = (prev_1d.get(code.zfill(6)) or prev_1d.get(code) or 0) if prev_1d else 0
+                        if pc > 0:
+                            _closing_code_info[code] = {**_closing_code_info[code], "prev_close": float(pc)}
+                _closing_codes.clear()
+                _closing_codes.extend(closing_candidates)
+                try:
+                    code_name_map.update(_code_name_map())
+                except Exception:
+                    pass
+                if _closing_codes:
+                    closing_names = [code_name_map.get(c, c) for c in _closing_codes]
+                    msg_cl = (
+                        f"{ts_prefix()} [top] ★ 종가매매 {len(_closing_codes)}개 선정 ({CLOSING_STRATEGY}): "
+                        f"{_closing_codes} / {closing_names}"
+                    )
+                    sys.stdout.write("\n")
+                    _notify(msg_cl, tele=True)
+                    n_sel = len(_closing_codes)
+                    _accts = _iter_enabled_accounts(trade_only=True)
+                    _max_inv = float(str((_accts[0] if _accts else {}).get("max_invest", "0") or 0).replace("_", "") or 0)
+                    per_alloc = int(_max_inv) // n_sel if n_sel else 0
+                    _notify(
+                        f"{ts_prefix()} [종가매매선정] 자원배분 | "
+                        f"총액(한도)={int(_max_inv):,}원 | 선정종목수={n_sel}개 | 종목당 배정액={per_alloc:,}원"
+                    )
+                    # 상세 선정 로그 (Phase 3-8)
+                    for i, c in enumerate(_closing_codes):
+                        info = _closing_code_info.get(c, {})
+                        nm = info.get("name", code_name_map.get(c, c))
+                        prdy = info.get("prdy_ctrt", 0.0)
+                        pc = info.get("prev_close", 0.0)
+                        is_limit = "▲상한가" if prdy >= 29.5 else "▲"
+                        cur_pr = 0.0
+                        hg_diff = 0
+                        hg_ratio = 0.0
+                        for r in rows:
+                            rc = str(r.get("stck_shrn_iscd") or r.get("code") or "").strip().zfill(6)
+                            if rc == c:
+                                cur_pr = float(str(r.get("stck_prpr") or 0).replace(",", "") or 0)
+                                hp = float(str(r.get("stck_hgpr") or 0).replace(",", "") or 0)
+                                if hp > 0 and cur_pr > 0:
+                                    hg_diff = int(cur_pr - hp)
+                                    hg_ratio = (cur_pr / hp - 1) * 100
+                                break
+                        # 예상 수량/금액 계산 (상한가 기준)
+                        _pc = info.get("prev_close") or 0
+                        _lu = calc_limit_up_price(_pc) if _pc > 0 else 0
+                        _qty = int(per_alloc // _lu) if _lu > 0 else 0
+                        _amt = int(_qty * _lu) if _lu > 0 else 0
+                        _notify(
+                            f"{ts_prefix()} [종가매매선정] #{i+1} {nm}({c}), "
+                            f"pr={cur_pr:,.0f}, prdy_ctrt={prdy:+.2f}({is_limit}), "
+                            f"hg-pr={hg_diff:,}, pr/hg={hg_ratio:+.2f}%, "
+                            f"qty={_qty}, amt={_amt:,}"
+                        )
+                    _save_closing_buy_state(list(_closing_codes), dict(_closing_code_info), [])
+
+            # ============================================================
+            # 15:20 구독 전환: 기존 전부 해제 → 종가매매 종목으로 교체 (TOP5_ADD=False면 스킵)
+            # ============================================================
+            if TOP5_ADD and is_closing_switch and _closing_codes:
+                _switch_to_closing_codes()
+                logger.info(f"{ts_prefix()} [top] end time reached (종가매매 전환 완료), stopping")
+                return
+
+            # ============================================================
+            # 일반 시간대 처리 (15:19/15:20 아닌 경우만, TOP5_ADD=True일 때)
+            # ============================================================
+            if TOP5_ADD and not is_closing_select:
+                changed = False
+
+                # --- 1) Top20 밖으로 밀린 종목 → 구독 해제 ---
+                current_top_keep_set = set(current_top_codes[:TOP_RANK_REMOVE_THRESHOLD])
+                codes_to_remove = [c for c in list(_top_added_codes) if c not in current_top_keep_set]
+                if codes_to_remove:
+                    removed = _remove_code_structs(codes_to_remove)
+                    for c in removed:
+                        _top_added_codes.discard(c)
+                        name = code_name_map.get(c, c)
+                        _log_top_sub_event(c, name, "해제")
+                    if removed:
+                        removed_names = [code_name_map.get(c, c) for c in removed]
+                        msg_rm = f"{ts_prefix()} [top] 구독 해제 (Top{TOP_RANK_REMOVE_THRESHOLD} 밖): {removed} / {removed_names}"
+                        sys.stdout.write("\n")
+                        _notify(msg_rm)
+                        changed = True
+
+                # --- 2) 상위 종목 중 ST 신규 → 구독 추가 (상한 관리) ---
+                candidates = []
+                for code in current_top_codes:
+                    if len(candidates) >= TOP_RANK_ADD_N:
+                        break
+                    if code in _base_codes:
+                        continue
+                    if code in codes:
+                        continue  # 이미 구독 중
+                    if code in _watchdog_removed_codes:
+                        continue  # watchdog WSS 미수신으로 해제됨 → 재추가 방지
+                    if not _is_stock_group(code):
+                        continue
+                    candidates.append(code)
+
+                # 구독 상한 체크
+                current_count = len(codes)
+                available_slots = max(0, MAX_WSS_SUBSCRIBE - current_count)
+                if available_slots < len(candidates):
+                    logger.info(
+                        f"{ts_prefix()} [top] 구독 상한 도달 ({current_count}/{MAX_WSS_SUBSCRIBE}), "
+                        f"추가 가능: {available_slots}/{len(candidates)}"
+                    )
+                    candidates = candidates[:available_slots]
+
+                added = _ensure_code_structs(candidates)
+                for c in added:
+                    _top_added_codes.add(c)
+                    name = code_name_map.get(c, c)
+                    _log_top_sub_event(c, name, "추가")
+                added_names = [code_name_map.get(c, c) for c in added]
+                if added:
+                    msg2 = f"{ts_prefix()} [top] 구독 추가: {added} / {added_names} (총 {len(codes)}/{MAX_WSS_SUBSCRIBE})"
+                    changed = True
+                else:
+                    if available_slots <= 0:
+                        reason = f"상한도달({current_count}/{MAX_WSS_SUBSCRIBE})"
+                    elif not candidates:
+                        reason = "후보없음(Top50이 base/구독중과 겹침 또는 ST아님)"
+                    else:
+                        reason = "확인필요"
+                    msg2 = f"{ts_prefix()} [top] 구독 추가 없음 (총 {len(codes)}/{MAX_WSS_SUBSCRIBE}) [{reason}]"
+                sys.stdout.write("\n")
+                _notify(msg2)
+
+                # --- 3) 해제/추가 완료 후 1회만 동적 구독 적용 ---
+                if changed:
+                    _persist_subscription_codes(codes)
+                    _trigger_ws_rebuild()
+        except Exception as e:
+            logger.warning(f"{ts_prefix()} [top] fetch failed (schedule #{idx}): {type(e).__name__}: {e}")
+            # ── 15:20 구독 전환은 fetch 실패해도 반드시 실행 (TOP5_ADD=True일 때만) ──
+            if TOP5_ADD and is_closing_switch:
+                if _closing_codes:
+                    _switch_to_closing_codes()
+                    logger.info(f"{ts_prefix()} [top] fetch 실패했으나 종가매매 전환 실행 완료")
+                else:
+                    # 15:19 선정도 실패 → 현재 구독 종목 그대로 유지
+                    logger.warning(
+                        f"{ts_prefix()} [top] 종가매매 선정 실패 → 현재 구독 유지 "
+                        f"(base={len(_base_codes)}개 + top_added={len(_top_added_codes)}개)"
+                    )
+                return
+            # ── 둘 다 실패 → 클라이언트 재초기화 시도 ──
+            err_str = str(e).lower()
+            if "401" in err_str or "403" in err_str or "token" in err_str:
+                try:
+                    _top_client = _init_top_client()
+                    logger.info(f"{ts_prefix()} [top] client 재초기화 완료")
+                except Exception as e2:
+                    logger.warning(f"{ts_prefix()} [top] client 재초기화 실패: {e2}")
+
+
+def _build_top_rank_schedule(now: datetime) -> list[datetime]:
+    base = now.date()
+    fixed = [
+        # 08:50, 08:59 제외 — 장 시작 전 랭킹은 의미 없음
+        dtime(9, 0),
+        dtime(9, 5),
+        dtime(9, 10),
+        dtime(9, 15),
+        dtime(9, 30),
+    ]
+    times = [datetime.combine(base, t, tzinfo=KST) for t in fixed]
+    cur = datetime.combine(base, dtime(10, 0), tzinfo=KST)
+    end = datetime.combine(base, dtime(15, 0), tzinfo=KST)
+    while cur <= end:
+        times.append(cur)
+        cur += timedelta(minutes=30)
+    # 종가매매 종목 선정 (15:19) + 구독 전환/매수 (15:20)
+    times.append(datetime.combine(base, dtime(15, 19), tzinfo=KST))
+    times.append(datetime.combine(base, dtime(15, 20), tzinfo=KST))
+    return sorted(set(times))
+
+# TR별 "실체결(Y) / 예상체결(N)" 구분
+TRID_TO_IS_REAL: dict[str, str] = {}  # tr_id -> "Y"/"N"
+TRID_TO_KIND: dict[str, str] = {}     # tr_id -> "regular_real"/"regular_exp"/"overtime_real"/"overtime_exp"
+
+# TRID fallback 매핑 (extract 실패 대비)
+KNOWN_TRID_MAP: dict[str, tuple[str, str]] = {
+    "H0STCNT0": ("regular_real", "Y"),   # 국내주식 실시간체결가 (KRX) — ccnl_krx
+    "H0UNCNT0": ("regular_real", "Y"),   # 국내주식 실시간체결가 (통합) — ccnl_total
+    "H0STANC0": ("regular_exp", "N"),
+    "H0STOUP0": ("overtime_real", "Y"),
+    "H0STOAC0": ("overtime_exp", "N"),
+    "H0NXCNT0": ("nxt_real", "Y"),       # NXT 실시간체결가
+    "H0NXANC0": ("nxt_exp", "N"),        # NXT 실시간예상체결
+}
+
+# 함수명 → TR_ID 역매핑 (req가 plain 함수라 속성 검사로 trid를 못 찾을 때 fallback)
+# domestic_stock_functions_ws.py 의 실제 함수명 기준
+_FUNC_NAME_TO_TRID: dict[str, str] = {
+    "ccnl_krx": "H0STCNT0",
+    "exp_ccnl_krx": "H0STANC0",
+    "market_status_krx": "H0STMKO0",
+    "overtime_ccnl_krx": "H0STOUP0",
+    "overtime_exp_ccnl_krx": "H0STOAC0",
+    "ccnl_nxt": "H0NXCNT0",
+    "exp_ccnl_nxt": "H0NXANC0",
+    "ccnl_notice": "H0STCNI0",
+}
+
+def _infer_tr_kind(trid: str, is_real: str | None) -> str:
+    cur = _get_mode()
+    if cur in (RunMode.PREOPEN_EXP, RunMode.CLOSE_EXP):
+        return "regular_exp"
+    if cur in (RunMode.REGULAR_REAL, RunMode.CLOSE_REAL):
+        return "regular_real"
+    if cur in (RunMode.OVERTIME_EXP, RunMode.OVERTIME_REAL):
+        return "overtime_exp" if is_real == "N" else "overtime_real"
+    if cur in (RunMode.NXT_PRE, RunMode.NXT_AFTER):
+        return "nxt_exp" if is_real == "N" else "nxt_real"
+    return "unknown"
+
+
+def _flush_part_buffer(reason: str = "periodic", force_full: bool = False) -> int:
+    """
+    _part_buffer 를 part 파일로 저장.
+    - force_full=False: 1500행 이상 시 1000행 저장·500행 버퍼 유지
+    - force_full=True (periodic/shutdown): 남은 데이터 전부 저장
+    """
+    if not _save_lock.acquire(blocking=False):
+        logger.info(f"[part] {reason} skipped (already flushing)")
+        return 0
+    try:
+        return _flush_part_buffer_inner(reason, force_full)
+    finally:
+        _save_lock.release()
+
+
+def _flush_part_buffer_inner(reason: str, force_full: bool) -> int:
+    """force_full이면 전부 저장, 아니면 PART_FLUSH_THRESHOLD행 이상 시 PART_FLUSH_SAVE행 저장·나머지 버퍼 유지."""
+    global _written_rows, _last_save_time, _part_seq, _part_buffer_rows
+    with _part_buffer_lock:
+        if not _part_buffer:
+            _last_save_time = time.time()
+            return 0
+        if not force_full and _part_buffer_rows < PART_FLUSH_THRESHOLD:
+            return 0
+        snapshot = list(_part_buffer)
+
+    try:
+        t0 = time.time()
+        df = pl.concat(snapshot, how="diagonal_relaxed")
+        if "recv_ts" in df.columns:
+            df = df.sort("recv_ts")
+
+        total_n = len(df)
+        if force_full:
+            df_save = df
+            df_keep = pl.DataFrame()
+        else:
+            if total_n < PART_FLUSH_THRESHOLD:
+                return 0
+            df_save = df.head(PART_FLUSH_SAVE)
+            df_keep = df.tail(total_n - PART_FLUSH_SAVE)
+
+        # 종목명 컬럼 추가
+        if "name" not in df_save.columns:
+            code_col = next(
+                (c for c in ("mksc_shrn_iscd", "stck_shrn_iscd", "code") if c in df_save.columns),
+                None,
+            )
+            if code_col:
+                try:
+                    name_map = _code_name_map()
+                    df_save = df_save.with_columns(
+                        pl.col(code_col)
+                        .cast(pl.Utf8)
+                        .str.zfill(6)
+                        .map_elements(lambda c: name_map.get(c, ""), return_dtype=pl.Utf8)
+                        .alias("name")
+                    )
+                except Exception:
+                    pass
+
+        n = len(df_save)
+        yymmdd = datetime.now(KST).strftime("%y%m%d")
+        hms = datetime.now(KST).strftime("%H%M%S")
+        _part_seq += 1
+        part_name = f"{yymmdd}_{hms}_{_part_seq:04d}.parquet"
+        part_path = PART_DIR / part_name
+        df_save.write_parquet(str(part_path), compression="zstd", use_pyarrow=True)
+
+        # 유지할 데이터를 버퍼에 되돌림 (force_full이면 비움)
+        with _part_buffer_lock:
+            _part_buffer.clear()
+            if len(df_keep) > 0:
+                _part_buffer.append(df_keep)
+            _part_buffer_rows = len(df_keep)
+
+        t1 = time.time()
+        with _lock:
+            _written_rows += n
+        _last_save_time = time.time()
+        try:
+            size_mb = part_path.stat().st_size / (1024 * 1024)
+        except Exception:
+            size_mb = -1
+        logger.info(
+            f"[part] {reason}: rows={n} sec={t1-t0:.3f} "
+            f"file={part_name} mb={size_mb:.2f}"
+        )
+        _emit_save_done(n)
+        return n
+    except Exception as e:
+        logger.error(f"[part] {reason} failed: {e}")
+        logger.error(traceback.format_exc())
+        return 0
+
+
+def _merge_parts_to_final() -> int:
+    """
+    당일 데이터 병합: FINAL(덮어쓰기 형식) + parts(청크 형식) → 중복 제거 후 FINAL 저장.
+    FINAL(YYMMDD_wss_data.parquet)는 기존 덮어쓰기 저장 형식으로 오늘 이미 있을 수 있음.
+    """
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    import pyarrow.dataset as ds
+
+    global _written_rows
+    yymmdd = datetime.now(KST).strftime("%y%m%d")
+    date_parts = sorted(PART_DIR.glob(f"{yymmdd}_*.parquet"))
+
+    tables: list[pa.Table] = []
+    # 1) 덮어쓰기 형식 파일 (FINAL) 우선 포함
+    if FINAL_PARQUET_PATH.exists() and _is_valid_parquet(FINAL_PARQUET_PATH):
+        try:
+            tables.append(pq.read_table(str(FINAL_PARQUET_PATH)))
+            logger.info(f"[merge] 기존 FINAL 포함: {FINAL_PARQUET_PATH.name}")
+        except Exception as e:
+            logger.warning(f"[merge] FINAL 읽기 실패: {e}")
+
+    # 2) parts(청크) 파일 개별 로드 — 스키마 불일치 방지
+    for p in date_parts:
+        try:
+            tables.append(pq.read_table(str(p)))
+        except Exception as e:
+            logger.warning(f"[merge] part 읽기 실패 {p.name}: {e}")
+    if date_parts:
+        logger.info(f"[merge] parts {len(date_parts)}개 포함")
+
+    if not tables:
+        logger.info(f"[merge] 병합할 데이터 없음 (날짜={yymmdd})")
+        return 0
+
+    # 스키마 통합: null/large_string→utf8, 테이블 간 string↔numeric 충돌 해소
+    def _unify_schema(tbl: pa.Table) -> pa.Table:
+        new_fields = []
+        for i, field in enumerate(tbl.schema):
+            if pa.types.is_null(field.type):
+                new_fields.append((i, field.name, pa.utf8()))
+            elif pa.types.is_large_string(field.type):
+                new_fields.append((i, field.name, pa.utf8()))
+        if new_fields:
+            for idx, name, new_type in new_fields:
+                col = tbl.column(idx).cast(new_type)
+                tbl = tbl.set_column(idx, name, col)
+        return tbl
+
+    tables = [_unify_schema(t) for t in tables]
+
+    # 테이블 간 동일 컬럼의 타입 충돌 해소 (예: bb_mid가 string vs double)
+    if len(tables) > 1:
+        # 컬럼별 최종 타입 결정: numeric 타입이 하나라도 있으면 float64로 통일
+        col_types: dict[str, set] = {}
+        for t in tables:
+            for field in t.schema:
+                col_types.setdefault(field.name, set()).add(field.type)
+        conflict_cols = {name for name, types in col_types.items() if len(types) > 1}
+        if conflict_cols:
+            logger.info(f"[merge] 타입 충돌 컬럼 통일: {conflict_cols}")
+            unified = []
+            for t in tables:
+                for col_name in conflict_cols:
+                    if col_name in t.column_names:
+                        idx = t.schema.get_field_index(col_name)
+                        ftype = t.schema.field(idx).type
+                        has_numeric = any(
+                            pa.types.is_floating(tp) or pa.types.is_integer(tp)
+                            for tp in col_types[col_name]
+                        )
+                        if has_numeric and (pa.types.is_string(ftype) or pa.types.is_large_string(ftype)):
+                            # string → float64 변환 (변환 불가 값은 null)
+                            col = t.column(idx)
+                            col = pa.compute.cast(col, pa.float64(), safe=False)
+                            t = t.set_column(idx, col_name, col)
+                        elif has_numeric and pa.types.is_null(ftype):
+                            col = pa.nulls(len(t), type=pa.float64())
+                            t = t.set_column(idx, col_name, col)
+                unified.append(t)
+            tables = unified
+
+    combined = pa.concat_tables(tables, promote_options="permissive") if len(tables) > 1 else tables[0]
+    df = combined.to_pandas()
+
+    # 3) code + recv_ts 기준 중복 제거 (덮어쓰기·parts 겹침 방지)
+    code_col = next((c for c in ("mksc_shrn_iscd", "stck_shrn_iscd", "code") if c in df.columns), None)
+    if code_col and "recv_ts" in df.columns:
+        before_n = len(df)
+        df = df.drop_duplicates(subset=[code_col, "recv_ts"], keep="last")
+        if len(df) < before_n:
+            logger.info(f"[merge] 중복 제거: {before_n - len(df)}행")
+
+    if "recv_ts" in df.columns:
+        try:
+            df = df.sort_values("recv_ts", kind="mergesort").reset_index(drop=True)
+        except Exception:
+            pass
+    combined = pa.Table.from_pandas(df, preserve_index=False)
+    tmp_path = FINAL_PARQUET_PATH.with_suffix(".tmp.parquet")
+    pq.write_table(combined, tmp_path, compression="zstd", use_dictionary=True)
+    tmp_path.replace(FINAL_PARQUET_PATH)
+
+    BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+    for p in date_parts:
+        try:
+            p.replace(BACKUP_DIR / p.name)
+        except Exception as e:
+            logger.warning(f"[merge] backup 이동 실패 {p.name}: {e}")
+
+    n = combined.num_rows
+    src_desc = f"FINAL+{len(date_parts)}parts" if date_parts else "FINAL만"
+    logger.info(f"[merge] 완료: {src_desc} → {FINAL_PARQUET_PATH.name} ({n:,}행)")
+    with _lock:
+        _written_rows = n
+    return n
+
+def _handle_existing_parquet(path: Path) -> None:
+    ts = datetime.now(KST).strftime("%y%m%d_%H%M%S")
+    if not _is_valid_parquet(path):
+        backup = path.with_suffix(path.suffix + f".bad.{ts}")
+        try:
+            path.rename(backup)
+            _record_overwrite("invalid_parquet", str(path), str(backup))
+            logger.warning(f"[parquet] invalid -> moved to {backup.name}")
+        except Exception as e:
+            _record_overwrite("invalid_parquet_rename_failed", str(path), str(path))
+            logger.warning(f"[parquet] invalid but rename failed: {e}")
+        return
+    backup = path.with_suffix(path.suffix + f".prev.{ts}")
+    try:
+        path.rename(backup)
+        _record_overwrite("overwrite_existing", str(path), str(backup))
+        logger.warning(f"[parquet] existing -> moved to {backup.name}")
+    except Exception as e:
+        _record_overwrite("overwrite_existing_rename_failed", str(path), str(path))
+        logger.warning(f"[parquet] existing but rename failed: {e}")
+
+def _is_valid_parquet(path: Path) -> bool:
+    try:
+        if path.stat().st_size < 8:
+            return False
+        with path.open("rb") as f:
+            head = f.read(4)
+            f.seek(-4, 2)
+            tail = f.read(4)
+        if head != b"PAR1" or tail != b"PAR1":
+            return False
+        return True
+    except Exception:
+        return False
+
+def _record_overwrite(reason: str, src: str, dst: str) -> None:
+    _overwrite_events.append(
+        {
+            "ts": datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S"),
+            "reason": reason,
+            "src": src,
+            "dst": dst,
+        }
+    )
+
+def _flush_overwrite_log() -> None:
+    if not _overwrite_events:
+        return
+    logger.warning("[parquet] overwrite events:")
+    for ev in _overwrite_events:
+        logger.warning(f" - {ev['ts']} reason={ev['reason']} src={ev['src']} dst={ev['dst']}")
+
+def _log_stale_after_save(threshold_sec: int) -> None:
+    now = time.time()
+    with _lock:
+        stale = [
+            c
+            for c in codes
+            if (_last_recv_ts.get(c, 0.0) > 0 and (now - _last_recv_ts[c]) >= threshold_sec)
+        ]
+        never = [c for c in codes if _total_counts.get(c, 0) == 0]
+    if not stale:
+        return
+    names = [code_name_map.get(c, c) for c in stale[:10]]
+    never_names = [code_name_map.get(c, c) for c in never[:10]]
+    msg = f"[{threshold_sec}초 이상 미수신] = {names}" + (" ..." if len(stale) > 10 else "")
+    if never_names:
+        msg += " / 누적 미수신 : " + ", ".join(never_names)
+    logger.info(msg)
+
+    # 20초 미수신 종목 → 현재가 REST 보강 요청 (가져와서 저장)
+    for c in stale:
+        if c in _rest_pending:
+            continue
+        _rest_pending.add(c)
+        try:
+            _price_queue.put_nowait(c)
+        except Exception:
+            _rest_pending.discard(c)
+
+
+def _init_indicator_buf(code: str) -> None:
+    """신규 종목 구독 시 EMA·BB 인메모리 상태 초기화."""
+    _ema_state[code] = {n: None for n in INDICATOR_MA_LINE}
+    _price_buf[code] = deque(maxlen=_IND_MAX_WINDOW)
+
+
+def _save_indicator_snapshot() -> None:
+    """EMA·BB 인메모리 지표 + 트레일스톱 highest 상태를 스냅샷 파일로 저장.
+
+    저장 내용: 종목별 EMA 값, price_buf (BB 계산용 deque), last_price, tick_count,
+              highest (트레일스톱용 최고가).
+    복원 시 가격 리플레이 없이 즉시 지표 상태 재구성 가능.
+    """
+    try:
+        # highest 수집: _str1_sell_state에서 미매도 종목의 highest
+        highest_map: dict[str, float] = {}
+        with _str1_sell_state_lock:
+            for code, st in _str1_sell_state.items():
+                if not st.get("sold") and st.get("highest", 0) > 0:
+                    highest_map[code] = st["highest"]
+
+        # 스냅샷 대상 종목: _ema_state 키 + highest 보유 종목
+        all_codes = set(_ema_state.keys()) | set(highest_map.keys())
+        rows: list[dict] = []
+        for code in all_codes:
+            ema = _ema_state.get(code, {})
+            buf = _price_buf.get(code)
+            buf_list = list(buf) if buf else []
+            rows.append({
+                "code": code,
+                "ema_3": ema.get(3),
+                "ema_50": ema.get(50),
+                "ema_200": ema.get(200),
+                "ema_300": ema.get(300),
+                "ema_500": ema.get(500),
+                "ema_2000": ema.get(2000),
+                "price_buf": buf_list,
+                "last_price": buf_list[-1] if buf_list else 0.0,
+                "tick_count": len(buf_list),
+                "highest": highest_map.get(code, 0.0),
+                "snapshot_ts": datetime.now(KST).isoformat(),
+            })
+        if not rows:
+            return
+        df = pl.DataFrame(rows)
+        tmp = SNAPSHOT_PATH.with_suffix(".tmp.parquet")
+        df.write_parquet(str(tmp), compression="zstd", use_pyarrow=True)
+        tmp.replace(SNAPSHOT_PATH)
+        n_highest = sum(1 for v in highest_map.values() if v > 0)
+        msg = f"{ts_prefix()} [snapshot] 저장: {len(rows)}종목 (highest={n_highest}건) → {SNAPSHOT_PATH.name}"
+        logger.info(msg)
+        sys.stdout.write(f"\n{msg}\n")
+        sys.stdout.flush()
+    except Exception as e:
+        logger.warning(f"[snapshot] 저장 실패: {e}")
+
+
+def _restore_from_snapshot() -> bool:
+    """스냅샷 파일에서 EMA·BB 지표 + highest 상태 직접 복원. 성공 시 True.
+
+    가격 리플레이 없이 직접 복원하므로 1초 이내 완료.
+    스냅샷이 없거나 당일 장중(09:00 이후) 것이 아니면 False → 새로 시작.
+    """
+    if not SNAPSHOT_PATH.exists() or not _is_valid_parquet(SNAPSHOT_PATH):
+        return False
+    try:
+        df = pl.read_parquet(str(SNAPSHOT_PATH))
+        if "code" not in df.columns or "price_buf" not in df.columns:
+            return False
+
+        # ── 스냅샷 시각 검증: 당일 09:00 이후에 저장된 것만 유효 ──
+        if "snapshot_ts" in df.columns and len(df) > 0:
+            snap_ts_str = str(df["snapshot_ts"][0])
+            try:
+                snap_dt = datetime.fromisoformat(snap_ts_str)
+                market_open = datetime.now(KST).replace(
+                    hour=9, minute=0, second=0, microsecond=0
+                )
+                if snap_dt < market_open:
+                    msg = (f"{ts_prefix()} [restore] 스냅샷이 당일 장 시작 전 데이터 → 스킵 "
+                           f"(snapshot_ts={snap_ts_str})")
+                    logger.info(msg)
+                    sys.stdout.write(f"{msg}\n")
+                    sys.stdout.flush()
+                    return False
+            except (ValueError, TypeError) as e:
+                logger.warning(f"[restore] snapshot_ts 파싱 실패: {e}")
+                return False
+
+        restored = 0
+        highest_restored = 0
+        for row in df.iter_rows(named=True):
+            code = str(row["code"]).zfill(6)
+            if code not in _ema_state:
+                _init_indicator_buf(code)
+            # EMA 상태 복원
+            ema = _ema_state[code]
+            for n in INDICATOR_MA_LINE:
+                key = f"ema_{n}"
+                val = row.get(key)
+                if val is not None:
+                    ema[n] = float(val)
+            # price_buf 복원 (BB 계산용)
+            buf_data = row.get("price_buf", [])
+            if buf_data:
+                _price_buf[code] = deque(buf_data, maxlen=_IND_MAX_WINDOW)
+            # highest 복원 (트레일스톱용)
+            h_val = row.get("highest", 0.0)
+            if h_val and float(h_val) > 0:
+                with _str1_sell_state_lock:
+                    if code in _str1_sell_state and not _str1_sell_state[code].get("sold"):
+                        cur = _str1_sell_state[code].get("highest", 0.0)
+                        if float(h_val) > cur:
+                            _str1_sell_state[code]["highest"] = float(h_val)
+                            highest_restored += 1
+            restored += 1
+
+        msg = f"{ts_prefix()} [restore] 스냅샷 즉시 복원: {restored}종목, highest={highest_restored}건 ({SNAPSHOT_PATH.name})"
+        logger.info(msg)
+        sys.stdout.write(f"{msg}\n")
+        sys.stdout.flush()
+        return restored > 0
+    except Exception as e:
+        logger.warning(f"[restore] 스냅샷 복원 실패: {e}")
+        return False
+
+
+def _restore_state_on_startup() -> None:
+    """
+    재시작 시 지표 상태 복원. 스냅샷 우선 → parts 리플레이 폴백.
+
+    1순위: 스냅샷 파일 (_indicator_snapshot.parquet) → 직접 복원 (1초 이내)
+    2순위: FINAL + parts 파일 → 가격 리플레이 복원 (기존 방식)
+
+    스냅샷 복원 후에도 스냅샷 이후에 생성된 parts가 있으면 추가 리플레이.
+    """
+    try:
+        # 장 시작 전(09:00 이전)에는 당일 데이터 없으므로 복원 불필요
+        if datetime.now(KST).time() < dtime(9, 0):
+            logger.info("[restore] 장 시작 전 → 복원 스킵")
+            sys.stdout.write(f"{ts_prefix()} [restore] 장 시작 전 → 복원 스킵\n")
+            sys.stdout.flush()
+            return
+
+        # 1순위: 스냅샷 직접 복원
+        snapshot_restored = _restore_from_snapshot()
+        snapshot_mtime = 0.0
+        if snapshot_restored and SNAPSHOT_PATH.exists():
+            snapshot_mtime = SNAPSHOT_PATH.stat().st_mtime
+            # 스냅샷 이후 생성된 parts만 추가 리플레이
+            new_parts = [p for p in sorted(PART_DIR.glob("*.parquet"))
+                         if p.stat().st_mtime > snapshot_mtime]
+            if new_parts:
+                logger.info(f"[restore] 스냅샷 이후 parts {len(new_parts)}개 추가 리플레이")
+                _replay_prices_from_files([str(p) for p in new_parts])
+            return
+
+        # 2순위: 기존 방식 (FINAL + parts 리플레이)
+        sources: list[str] = []
+        parts: list[Path] = []
+
+        if FINAL_PARQUET_PATH.exists() and _is_valid_parquet(FINAL_PARQUET_PATH):
+            sources.append(str(FINAL_PARQUET_PATH))
+            logger.info(f"[restore] FINAL 파일 발견: {FINAL_PARQUET_PATH.name}")
+
+        parts = sorted(PART_DIR.glob("*.parquet"))
+        if parts:
+            sources.extend(str(p) for p in parts)
+            logger.info(f"[restore] parts 파일 {len(parts)}개 발견 → 리플레이")
+
+        if not sources:
+            logger.info("[restore] 복원할 파일 없음 → 0부터 시작")
+            return
+
+        _replay_prices_from_files(sources)
+
+        msg = (
+            f"[restore] 복원 완료: parts={len(parts)}개, "
+            f"FINAL={'있음' if FINAL_PARQUET_PATH.exists() else '없음'}"
+        )
+        logger.info(msg)
+        sys.stdout.write(f"{msg}\n")
+        sys.stdout.flush()
+
+    except Exception as e:
+        logger.warning(f"[restore] 복원 실패 (무시하고 계속): {e}\n{traceback.format_exc()}")
+
+
+def _replay_prices_from_files(sources: list[str]) -> None:
+    """파일 목록에서 가격 데이터를 읽어 _calc_indicators 리플레이."""
+    dfs: list[pl.DataFrame] = []
+    for src in sources:
+        try:
+            dfs.append(pl.read_parquet(src))
+        except Exception as _e:
+            logger.warning(f"[restore] 파일 읽기 실패, 스킵: {src} → {_e}")
+    if not dfs:
+        return
+    df = pl.concat(dfs, how="diagonal_relaxed")
+
+    code_col = None
+    for c in ("mksc_shrn_iscd", "stck_shrn_iscd", "code"):
+        if c in df.columns:
+            code_col = c
+            break
+    if not code_col:
+        return
+
+    if "recv_ts" in df.columns:
+        df = df.sort("recv_ts")
+    df = df.with_columns(
+        pl.col(code_col).cast(pl.Utf8).str.zfill(6).alias(code_col)
+    )
+
+    restored_codes: list[str] = []
+    if "stck_prpr" in df.columns:
+        df_ind = df.with_columns(
+            pl.col("stck_prpr").cast(pl.Float64, strict=False).alias("stck_prpr")
+        ).drop_nulls("stck_prpr")
+        for df_code in df_ind.partition_by(code_col, maintain_order=True):
+            code = str(df_code[code_col][0])
+            if code not in _ema_state:
+                _init_indicator_buf(code)
+            for pr in df_code["stck_prpr"].to_list():
+                if pr and pr > 0:
+                    _calc_indicators(code, float(pr))
+            restored_codes.append(code)
+
+    logger.info(f"[restore] 리플레이 완료: {len(restored_codes)}종목 / {len(df)}행")
+
+
+def _calc_indicators(code: str, price: float) -> dict:
+    """틱 1개 수신 시 EMA + 볼린저 밴드 계산.
+
+    EMA: alpha = 2/(period+1), 첫 틱은 가격 그대로 초기값으로 설정.
+    BB:  price_buf 누적값으로 rolling std 계산 (기간 미달 시 None).
+    반환: {ma3, ma50, ..., bb_mid, bb_upper, bb_lower, bb_width} dict.
+    """
+    buf = _price_buf.get(code)
+    if buf is None:
+        return {}
+
+    state = _ema_state.get(code)
+    if state is None:
+        return {}
+
+    # ── 첫 틱: EMA 시가 초기화 + price_buf BB기간만큼 pre-fill ──
+    if len(buf) == 0:
+        for n in INDICATOR_MA_LINE:
+            state[n] = price
+        for _ in range(INDICATOR_BB_PERIOD):
+            buf.append(price)
+    else:
+        buf.append(price)
+
+    ema_vals: dict[str, float] = {}
+    for n in INDICATOR_MA_LINE:
+        alpha = 2.0 / (n + 1)
+        prev = state.get(n)
+        if prev is None:
+            state[n] = price
+        else:
+            state[n] = prev + alpha * (price - prev)
+        ema_vals[f"ma{n}"] = state[n]
+
+    bb_vals: dict[str, float | None] = {}
+    if len(buf) >= INDICATOR_BB_PERIOD:
+        window = list(buf)[-INDICATOR_BB_PERIOD:]
+        mean = sum(window) / INDICATOR_BB_PERIOD
+        variance = sum((x - mean) ** 2 for x in window) / (INDICATOR_BB_PERIOD - 1)
+        std = math.sqrt(variance)
+        bb_vals["bb_mid"]   = mean
+        bb_vals["bb_upper"] = mean + INDICATOR_BB_K * std
+        bb_vals["bb_lower"] = mean - INDICATOR_BB_K * std
+        bb_vals["bb_width"] = INDICATOR_BB_K * 2 * std
+    else:
+        bb_vals["bb_mid"]   = None
+        bb_vals["bb_upper"] = None
+        bb_vals["bb_lower"] = None
+        bb_vals["bb_width"] = None
+
+    return {**ema_vals, **bb_vals}
+
+
+def _check_str1_sell_conditions(
+    result: pl.DataFrame,
+    col_map: dict,
+    code_col: str,
+    kind: str,
+) -> None:
+    """
+    ingest_loop에서 호출: Str1 실전 매도 조건 판단 → 조건 충족 시 sell 큐에 추가.
+
+    [사전 모니터링 08:29~09:00] kind == "regular_exp"
+      stck_prpr(예상체결가)의 prdy_ctrt < 0 → 시초가 하락 예상 → 시장가 매도 주문 선제 등록
+    [정규장 09:00~] kind == "regular_real"
+      ① bidp1 < wghn_avrg_stck_prc  (가중평균 하락)
+      ② up_trend 지속 상태에서 ma500 < ma2000 데드크로스 (상태 기반, 매도 성공까지 유지)
+    """
+    if not _str1_sell_state:
+        return
+
+    is_opening_call_auction = (kind == "regular_exp")
+    is_regular   = (kind == "regular_real")
+    if not is_opening_call_auction and not is_regular:
+        return
+
+    df_tmp = result.with_columns(
+        pl.col(code_col).cast(pl.Utf8).str.zfill(6).alias(code_col)
+    )
+
+    pr_col      = col_map.get("stck_prpr") or col_map.get("antc_prce")
+    prdy_col    = col_map.get("prdy_ctrt")
+    wghn_col    = col_map.get("wghn_avrg_stck_prc")
+    bidp1_col   = col_map.get("bidp1")
+    hgpr_col    = col_map.get("stck_hgpr")
+    oprc_col    = col_map.get("stck_oprc")
+
+    global _opening_call_auction_last_summary_ts
+    now_ts = time.time()
+    newly_triggered: list[str] = []   # 이번 틱에서 처음 매도조건 진입한 종목
+
+    for df_code in df_tmp.partition_by(code_col, maintain_order=True):
+        code = str(df_code[code_col][0])
+        with _str1_sell_state_lock:
+            st = _str1_sell_state.get(code)
+            if not st or st.get("sold"):
+                _opening_call_auction_watch.pop(code, None)       # 매도 완료 → 모니터링 캐시 제거
+                continue
+            # 사전 주문 넣은 상태
+            if st.get("opening_call_auction_ordered"):
+                if is_regular:
+                    continue  # 09:00 이후, 시초가 체결 예정/체결됨
+                # is_opening_call_auction: 예상가 복귀 시 취소 검사 (아래에서 처리)
+
+        row = df_code.row(-1, named=True)  # Polars: 마지막 행을 dict로 반환
+
+        if is_opening_call_auction:
+            # ── 08:29~09:00: 예상체결가로 시초가 하락 감지 / 주문 취소 검사 ──
+            antc = 0.0
+            prdy = 0.0
+            try:
+                if pr_col:   antc = float(str(row.get(pr_col) or 0).replace(",", "") or 0)
+                if prdy_col: prdy = float(str(row.get(prdy_col) or 0).replace(",", "") or 0)
+            except (ValueError, TypeError):
+                continue
+            # 첫 틱에서 buy_price(T종가) 갱신
+            if antc > 0 and abs(prdy) < 100:
+                t_close = antc / (1 + prdy / 100)
+                with _str1_sell_state_lock:
+                    st2 = _str1_sell_state.get(code, {})
+                    if st2.get("buy_price", 0) == 0 and t_close > 0:
+                        _str1_sell_state[code]["buy_price"] = t_close
+            with _str1_sell_state_lock:
+                st2       = _str1_sell_state.get(code, {})
+                buy_price = st2.get("buy_price", 0)
+                name      = st2.get("name", code)
+                qty       = int(st2.get("qty", 0))
+                opening_call_auction_ordered = st2.get("opening_call_auction_ordered", False)
+
+            if opening_call_auction_ordered:
+                # 이미 장전 매도 주문 넣음 → 예상가 복귀 시 취소
+                should_cancel, cancel_reason = check_opening_call_auction_cancel(antc, prdy, buy_price)
+                if should_cancel:
+                    _enqueue_str1_opening_call_auction_cancel(code, cancel_reason)
+                # 모니터링은 "체결대기" 상태로 표시 (in_sell_cond=False, 유지)
+                prev_watch = _opening_call_auction_watch.get(code, {})
+                _opening_call_auction_watch[code] = {
+                    **prev_watch,
+                    "antc_prce": antc, "prdy_ctrt": prdy, "buy_price": buy_price,
+                    "in_sell_cond": False, "name": name, "qty": qty,
+                    "reason": "(체결대기·취소검사중)",
+                    "first_sell_ts": prev_watch.get("first_sell_ts"),
+                    "first_printed": prev_watch.get("first_printed", False),
+                }
+                continue
+
+            # no_sell 종목은 OCA 매도 스킵, 모니터링 캐시만 갱신
+            if code in _no_sell_codes:
+                prev_watch = _opening_call_auction_watch.get(code, {})
+                _opening_call_auction_watch[code] = {
+                    **prev_watch,
+                    "antc_prce": antc, "prdy_ctrt": prdy, "buy_price": buy_price,
+                    "in_sell_cond": False, "name": name, "qty": qty,
+                    "reason": "[no_sell]",
+                    "first_sell_ts": prev_watch.get("first_sell_ts"),
+                    "first_printed": prev_watch.get("first_printed", False),
+                }
+                continue
+
+            should_sell, reason = check_opening_call_auction_sell(antc, prdy)
+
+            # ── 장전 모니터링 상태 업데이트 ──
+            prev_watch = _opening_call_auction_watch.get(code, {})
+            was_in_cond = prev_watch.get("in_sell_cond", False)
+            _opening_call_auction_watch[code] = {
+                **prev_watch,
+                "antc_prce":     antc,
+                "prdy_ctrt":     prdy,
+                "buy_price":     buy_price,
+                "in_sell_cond":  should_sell,
+                "name":          name,
+                "qty":           qty,
+                "reason":        reason if should_sell else "",
+                "first_sell_ts": prev_watch.get("first_sell_ts") or (now_ts if should_sell else None),
+                "first_printed": prev_watch.get("first_printed", False),
+            }
+            # 첫 진입 감지: 이번 틱에 처음으로 매도조건 충족
+            if should_sell and not was_in_cond:
+                newly_triggered.append(code)
+
+            if should_sell:
+                _enqueue_str1_sell(code, reason, antc)
+
+        elif is_regular:
+            # ── 09:00 이후: 가중평균 하락 / MA 데드크로스 ──
+            bidp1 = 0.0; wghn = 0.0; oprc = 0.0; prdy_v = 0.0; stck_prpr = 0.0; hgpr = 0.0
+            try:
+                if bidp1_col: bidp1 = float(str(row.get(bidp1_col) or 0).replace(",", "") or 0)
+                if wghn_col:  wghn  = float(str(row.get(wghn_col)  or 0).replace(",", "") or 0)
+                if oprc_col:  oprc  = float(str(row.get(oprc_col)  or 0).replace(",", "") or 0)
+                # 시가 캐시: 값이 있으면 저장, 없으면 캐시에서 복원
+                if oprc > 0:
+                    _oprc_cache[code] = oprc
+                elif code in _oprc_cache:
+                    oprc = _oprc_cache[code]
+                if prdy_col:  prdy_v = float(str(row.get(prdy_col) or 0).replace(",", "") or 0)
+                if pr_col:    stck_prpr = float(str(row.get(pr_col) or 0).replace(",", "") or 0)
+                if hgpr_col:  hgpr  = float(str(row.get(hgpr_col)  or 0).replace(",", "") or 0)
+            except (ValueError, TypeError):
+                continue
+            # buy_price 첫 틱 보정 (regular_real에도 prdy_ctrt 있을 수 있음)
+            if bidp1 > 0 and abs(prdy_v) < 100:
+                try:
+                    t_close = bidp1 / (1 + prdy_v / 100)
+                    with _str1_sell_state_lock:
+                        if _str1_sell_state.get(code, {}).get("buy_price", 0) == 0 and t_close > 0:
+                            _str1_sell_state[code]["buy_price"] = t_close
+                except (ValueError, TypeError):
+                    pass
+            # EMA 상태에서 ma50, ma200, ma300, ma500, ma2000 조회
+            ema = _ema_state.get(code, {})
+            ma50   = ema.get(50)   or 0.0
+            ma200  = ema.get(200)  or 0.0
+            ma300  = ema.get(300)  or 0.0
+            ma500  = ema.get(500)  or 0.0
+            ma2000 = ema.get(2000) or 0.0
+
+            # ── 상한가 근접(29%+) 클라이언트 스톱 매도 (연속 N틱 이탈 확인) ──
+            if code not in _no_sell_codes:
+                with _str1_sell_state_lock:
+                    _st_sl = _str1_sell_state.get(code, {})
+                    _sl_ordered = _st_sl.get("stop_limit_ordered", False)
+                    _sl_sold = _st_sl.get("sold", False)
+                    _sl_monitoring = _st_sl.get("sl_monitoring", False)
+                    _sl_cndt = _st_sl.get("sl_cndt_price", 0)
+                    _sl_sell = _st_sl.get("sl_sell_price", 0)
+                    _sl_below = _st_sl.get("sl_below_count", 0)
+                if not _sl_ordered and not _sl_sold and bidp1 > 0:
+                    if prdy_v >= 29.0 and not _sl_monitoring:
+                        # ▶ 첫 29%+ 감지 → 모니터링 시작 (주문 안 함)
+                        prev_close = bidp1 / (1 + prdy_v / 100)
+                        if prev_close > 0:
+                            _cndt = int(prev_close * 1.29)
+                            _sell = int(prev_close * 1.28)
+                            with _str1_sell_state_lock:
+                                if code in _str1_sell_state:
+                                    _str1_sell_state[code]["sl_monitoring"] = True
+                                    _str1_sell_state[code]["sl_cndt_price"] = _cndt
+                                    _str1_sell_state[code]["sl_sell_price"] = _sell
+                                    _str1_sell_state[code]["sl_below_count"] = 0
+                            logger.info(
+                                f"{ts_prefix()} [스톱] {code} 29%+ 모니터링 시작"
+                                f" (조건={_cndt:,}, 지정={_sell:,})"
+                            )
+                    elif _sl_monitoring and _sl_cndt > 0:
+                        # ▶ 모니터링 중 → 이탈 확인
+                        if bidp1 < _sl_cndt:
+                            new_count = _sl_below + 1
+                            with _str1_sell_state_lock:
+                                if code in _str1_sell_state:
+                                    _str1_sell_state[code]["sl_below_count"] = new_count
+                            if new_count >= STOP_LIMIT_CONFIRM_TICKS:
+                                # N틱 연속 이탈 확인 → 지정가 매도
+                                _enqueue_str1_sell(
+                                    code,
+                                    f"str1_상한가_스톱({new_count}틱이탈,"
+                                    f"조건={_sl_cndt:,},지정={_sl_sell:,})",
+                                    ref_price=_sl_sell, ord_dvsn="00",
+                                    price=_sl_sell,
+                                )
+                            else:
+                                logger.debug(
+                                    f"{ts_prefix()} [스톱] {code} 이탈 {new_count}/{STOP_LIMIT_CONFIRM_TICKS}"
+                                    f" bidp1={bidp1:,} < 조건={_sl_cndt:,}"
+                                )
+                        else:
+                            # 29% 이상 복귀 → 카운트 리셋
+                            if _sl_below > 0:
+                                with _str1_sell_state_lock:
+                                    if code in _str1_sell_state:
+                                        _str1_sell_state[code]["sl_below_count"] = 0
+
+            # ── VI 포지션 매도 판단 ──
+            vi_pos = _vi_positions.get(code)
+            with _str1_sell_state_lock:
+                _src = _str1_sell_state.get(code, {}).get("source", "")
+            if vi_pos and not vi_pos.get("sold") and _src == "vi":
+                # VI 최고가 갱신 (VI 매수 시점 이후 bidp1 기준, 일중최고가 사용 안 함)
+                if bidp1 > vi_pos.get("highest", 0):
+                    vi_pos["highest"] = bidp1
+                if code not in _no_sell_codes:
+                    vi_buy_price = vi_pos.get("buy_price", 0)
+                    vi_buy_ts = vi_pos.get("buy_ts")
+                    minutes_since = (datetime.now(KST) - vi_buy_ts).total_seconds() / 60.0 if vi_buy_ts else 999.0
+                    vi_sell, vi_reason = check_vi_sell(
+                        bidp1, wghn, ma50, ma200, ma300, ma500, ma2000, oprc,
+                        highest_since_buy=vi_pos.get("highest", 0),
+                        buy_price=vi_buy_price,
+                        minutes_since_buy=minutes_since,
+                    )
+                    if vi_sell:
+                        vi_pos["sold"] = True
+                        vi_msg = f"{ts_prefix()} [VI매도] {name}({code}) 매도결정  사유={vi_reason}  매수가={vi_buy_price:,.0f}  현재가={bidp1:,.0f}"
+                        logger.info(vi_msg)
+                        _notify(vi_msg, tele=True)
+                        _enqueue_str1_sell(code, vi_reason, bidp1)
+            else:
+                # ── Str1 일반 매도 판단 (트레일스톱 포함) ──
+                with _str1_sell_state_lock:
+                    _st = _str1_sell_state.get(code, {})
+                    _buy_p = _st.get("buy_price", 0.0)
+                    _highest = _st.get("highest", 0.0)
+                # Str1 최고가 갱신 (일중최고가 vs 매수호가 중 큰 값) — no_sell이어도 유지
+                tick_high = max(bidp1, _highest)
+                if tick_high > _highest:
+                    _highest = tick_high
+                    with _str1_sell_state_lock:
+                        if code in _str1_sell_state:
+                            _str1_sell_state[code]["highest"] = _highest
+                if code not in _no_sell_codes:
+                    should_sell, reason, cur_up = check_realtime_sell(
+                        bidp1, wghn, ma50, ma200, ma300, ma500, ma2000, oprc,
+                        was_up_trend=_up_trend_state.get(code, False),
+                        highest_since_buy=_highest,
+                        buy_price=_buy_p,
+                    )
+                    _up_trend_state[code] = cur_up
+
+                    if should_sell:
+                        if "데드크로스" in reason:
+                            _ema_sell_cond[code] = True     # 매도 성공까지 유지용
+                        _enqueue_str1_sell(code, reason, bidp1)
+                    elif _buy_p > 0 and bidp1 > 0 and bidp1 < _buy_p * 0.97:
+                        loss_pct = (bidp1 / _buy_p - 1) * 100
+                        _enqueue_str1_sell(code, f"매수가손절({loss_pct:.2f}%,매수={int(_buy_p):,})", bidp1)
+                    elif _ema_sell_cond.get(code, False):
+                        # 데드크로스 재시도는 전일종가 위일 때만
+                        _enqueue_str1_sell(code, "str1_Up_trend_ma500_ma2000_데드크로스", bidp1)
+
+            # ── 정규장 실시간 체결 시 모니터링 캐시 갱신 (stale 방지) ──
+            with _str1_sell_state_lock:
+                st2 = _str1_sell_state.get(code, {})
+                buy_price = st2.get("buy_price", 0)
+                name = st2.get("name", code)
+                qty = int(st2.get("qty", 0))
+            price = stck_prpr if stck_prpr > 0 else (bidp1 if bidp1 > 0 else _last_stck_prpr.get(code, 0))
+            prev_watch = _opening_call_auction_watch.get(code, {})
+            _opening_call_auction_watch[code] = {
+                **prev_watch,
+                "antc_prce": price,
+                "prdy_ctrt": prdy_v,
+                "buy_price": buy_price,
+                "in_sell_cond": prdy_v < 0,
+                "name": name,
+                "qty": qty,
+                "reason": f"전일종가하락({prdy_v:.2f}%)" if prdy_v < 0 else "",
+            }
+
+    # ── 장전 예상체결가 시계열 스냅샷 수집 ──
+    if is_opening_call_auction and _opening_call_auction_watch:
+        _hhmm = datetime.now(KST).strftime("%H%M")
+        if _hhmm in _ANTC_SNAPSHOT_TIMES:
+            for _code, _w in _opening_call_auction_watch.items():
+                _ap = _w.get("antc_prce", 0)
+                if _ap > 0:
+                    _antc_prce_timeline.setdefault(_code, {})[_hhmm] = _ap
+
+    # ── Str1 모니터링 출력 (장전 08:29~09:00 / 장중 09:00~15:20 / 장마감 15:20~15:30) ──
+    if (is_opening_call_auction or is_regular) and _opening_call_auction_watch:
+        _print_opening_call_auction_monitor(newly_triggered, now_ts, is_opening_call_auction=is_opening_call_auction)
+
+
+def _print_antc_prce_timeline() -> None:
+    """장전 예상체결가 시계열 테이블 출력."""
+    try:
+        # 수집된 시각 컬럼만 표시 (시간순)
+        all_times = set()
+        for ts_map in _antc_prce_timeline.values():
+            all_times.update(ts_map.keys())
+        time_cols = [t for t in _ANTC_SNAPSHOT_TIMES if t in all_times]
+        if not time_cols:
+            return
+
+        rows = []
+        for code in sorted(_antc_prce_timeline.keys()):
+            w = _opening_call_auction_watch.get(code, {})
+            name = w.get("name", code)
+            qty = w.get("qty", 0)
+            buy_price = w.get("buy_price", 0)
+            row = {"종목명": name, "보유": f"{qty:,}", "매수단가": f"{buy_price:,.0f}"}
+            ts_map = _antc_prce_timeline[code]
+            for i, t in enumerate(time_cols):
+                col_label = f"예상:{t}" if i == 0 else t
+                row[col_label] = f"{ts_map[t]:,.0f}" if t in ts_map else "-"
+            rows.append(row)
+
+        columns = ["종목명", "보유", "매수단가"] + [f"예상:{time_cols[0]}"] + time_cols[1:]
+        align = {c: "right" for c in columns}
+        align["종목명"] = "left"
+
+        now_str = datetime.now(KST).strftime("%H:%M:%S")
+        tbl = print_table(rows, columns, align, no_print=True)
+        header = f"\n<예상체결가 현황> {now_str}"
+        output = f"{header}\n{tbl}"
+        sys.stdout.write(f"{output}\n")
+        sys.stdout.flush()
+        logger.info(output)
+    except Exception as e:
+        logger.warning(f"{ts_prefix()} [antc_timeline] {e}")
+
+
+def _run_balance_monitor_bg(sell_lines: list[str]) -> None:
+    """별도 스레드에서 REST 잔고조회 + 결과 출력. ingest_loop 블로킹 방지."""
+    try:
+        nt = datetime.now(KST).time()
+        if dtime(8, 29) <= nt < dtime(9, 0):
+            bal_label = "장전 예상체결가 모니터링"
+        elif dtime(15, 20) <= nt < dtime(15, 30):
+            bal_label = "장마감 예상체결가 모니터링"
+        else:
+            bal_label = "보유종목 모니터링"
+
+        # ── 장전 예상체결가 시계열 테이블 출력 ──
+        if dtime(8, 29) <= nt < dtime(9, 0) and _antc_prce_timeline:
+            _print_antc_prce_timeline()
+
+        hold_map = _query_and_print_balance(bal_label)
+
+        # ── 잔고 기반 매도 완료 감지: sell_ordered인데 잔고에서 사라진 종목 → sold=True ──
+        if hold_map is not None:
+            with _str1_sell_state_lock:
+                for code, st in list(_str1_sell_state.items()):
+                    if st.get("sold") or not st.get("sell_ordered"):
+                        continue
+                    # 잔고에 없거나 수량 0 → 체결 완료로 간주
+                    bm = hold_map.get(code, 0)
+                    bal_qty = bm.get("qty", 0) if isinstance(bm, dict) else (bm or 0)
+                    if bal_qty <= 0:
+                        st["sold"] = True
+                        st["sell_reason"] = st.get("sell_reason") or "잔고확인_체결완료"
+                        _opening_call_auction_watch.pop(code, None)
+                        name = st.get("name", code)
+                        logger.info(f"{ts_prefix()} [잔고확인] 매도 체결 확인: {name}({code}) — 잔고에서 소멸")
+                        _notify(f"[잔고확인] 매도 체결 확인: {name}({code})", tele=True)
+                _save_str1_sell_state()
+
+        if sell_lines:
+            now_str = datetime.now(KST).strftime("%H:%M:%S")
+            sell_header = f"  ▼ 매도조건 ({len(sell_lines)}종목) ─────────────────────"
+            sell_msg = "\n".join([sell_header] + [f"    {l}" for l in sell_lines])
+            sys.stdout.write(f"{sell_msg}\n")
+            sys.stdout.flush()
+            logger.info(sell_msg)
+            tele_lines = [f"[매도조건 {now_str}]"]
+            tele_lines.append(f"▼ 매도조건 {len(sell_lines)}종목")
+            tele_lines.extend(sell_lines)
+            _notify("\n".join(tele_lines), tele=True)
+    except Exception as e:
+        logger.warning(f"{ts_prefix()} [balance_monitor_bg] {e}")
+
+
+def _print_opening_call_auction_monitor(newly_triggered: list[str], now_ts: float, is_opening_call_auction: bool = True) -> None:
+    """
+    Str1 포지션 모니터링 출력.
+
+    - 08:29~09:00: 장전 예상체결가
+    - 09:00~15:20: 실시간 체결가 (정규장)
+    - 15:20~15:30: 장마감 예상체결가
+
+    ① 이번 틱에서 처음 매도조건 진입한 종목 → 즉시 출력 + 텔레그램
+    ② 60초마다 → REST 잔고조회를 별도 스레드에서 실행 (ingest_loop 블로킹 방지)
+    """
+    global _opening_call_auction_last_summary_ts
+
+    # ① 첫 진입 즉시 출력
+    for code in newly_triggered:
+        w = _opening_call_auction_watch.get(code, {})
+        _opening_call_auction_watch[code]["first_printed"] = True
+        prefix = "🔴 [동시호가매도조건 진입]" if is_opening_call_auction else "🔴 [매도조건 진입]"
+        msg = _fmt_opening_call_auction_alert_line(code, w, prefix=prefix)
+        _notify(msg, tele=True)
+
+    # ② 1분 주기 요약 — REST API 잔고조회를 별도 스레드에서 실행
+    if (now_ts - _opening_call_auction_last_summary_ts) < OPENING_CALL_AUCTION_SUMMARY_INTERVAL:
+        return
+    _opening_call_auction_last_summary_ts = now_ts
+
+    # 매도조건 종목 먼저 확인 (WSS 캐시 기반 — 빠름)
+    sell_lines: list[str] = []
+    for code, w in sorted(_opening_call_auction_watch.items()):
+        if w.get("in_sell_cond"):
+            sell_lines.append(_fmt_opening_call_auction_alert_line(code, w))
+
+    # REST 잔고조회 + 출력을 별도 스레드에서 실행 (ingest_loop 블로킹 방지)
+    threading.Thread(
+        target=_run_balance_monitor_bg,
+        args=(list(sell_lines),),
+        daemon=True,
+    ).start()
+
+
+def _get_str1_status_label(code: str) -> str:
+    """종목상태 라벨: 57/59(30분 단일가), mkop(시장구분) 등."""
+    stat = _single_price_codes.get(code)
+    if stat:
+        desc = "관리" if stat == "57" else "과열" if stat == "59" else stat
+        return f"{stat}({desc})"
+    mkop = _last_mkop_cls_code.get(code, "")
+    if mkop in ("57", "59"):
+        return f"{mkop}(단일가)"
+    if mkop:
+        return mkop
+    return "-"
+
+
+def _fmt_opening_call_auction_alert_line(code: str, w: dict, prefix: str = "") -> str:
+    """Str1 모니터링 1줄: 종목명, 종목상태, 보유수량, 가격, 전일대비, 매수가, 손익, 사유."""
+    name      = w.get("name", code)
+    qty       = int(w.get("qty", 0))
+    antc      = w.get("antc_prce", 0.0)
+    prdy      = w.get("prdy_ctrt", 0.0)
+    buy_p     = w.get("buy_price", 0.0)
+    reason    = w.get("reason", "")
+    diff      = antc - buy_p if antc > 0 and buy_p > 0 else 0.0
+    diff_pct  = (antc / buy_p - 1) * 100 if buy_p > 0 else 0.0
+    first_ts  = w.get("first_sell_ts")
+    elapsed   = f" ({int(time.time()-first_ts)}초 경과)" if first_ts else ""
+    stat      = _get_str1_status_label(code)
+
+    price_label = "예상가" if code in _single_price_codes else "현재가"
+    parts = [name]
+    if code in _no_sell_codes:
+        parts.append("[no_sell]")
+    parts.append(f"[{stat}]")
+    parts.append(f"보유={qty}주")
+    parts.append(f"{price_label}={antc:,.0f}" if antc > 0 else f"{price_label}=N/A")
+    parts.append(f"전일대비={prdy:+.2f}%")
+    if buy_p > 0:
+        parts.append(f"매입단가={buy_p:,.0f}  손익≈{diff:+,.0f}({diff_pct:+.2f}%)")
+    if reason:
+        parts.append(f"사유={reason}{elapsed}")
+    line = "  ".join(parts)
+    return f"{prefix} {line}".strip() if prefix else line
+
+
+def _print_opening_call_auction_order_summary() -> None:
+    """08:59:50~09:00 동시호가 주문현황 정리 (체결대기/취소요청/이상없음 구분)."""
+    global _opening_call_auction_order_summary_done
+    if _opening_call_auction_order_summary_done:
+        return
+    _opening_call_auction_order_summary_done = True
+
+    cancelled_done: list[str] = []   # 취소 완료 (로그에서)
+    with _str1_sell_state_lock:
+        cancelled_codes = {c[0] for c in _opening_call_auction_cancelled_log}
+        fill_wait: list[str] = []    # 체결대기 (주문접수완료, 09:00 시초가 체결 예정)
+        order_ok: list[str] = []     # 이상없음 (주문 없음)
+        cancel_req: list[str] = []   # 취소 요청 중
+        for code, name, reason in _opening_call_auction_cancelled_log:
+            cancelled_done.append(f"  {name}({code})  사유={reason}")
+        for code, st in _str1_sell_state.items():
+            if st.get("sold"):
+                continue
+            name = st.get("name", code_name_map.get(code, code))
+            qty = int(st.get("qty", 0))
+            ordno = str(st.get("ordno", "")).strip()
+            if code in cancelled_codes:
+                continue  # 취소완료는 위 cancelled_done에 이미 포함
+            if st.get("opening_call_auction_cancel_requested"):
+                cancel_req.append(f"  {name}({code}) 수량={qty}주  주문번호={ordno or '-'}  [취소요청중]")
+            elif st.get("opening_call_auction_ordered"):
+                fill_wait.append(f"  {name}({code}) 수량={qty}주  주문번호={ordno or '-'}  [매도주문접수완료→시초가 체결대기]")
+            else:
+                order_ok.append(f"  {name}({code}) 수량={qty}주  [매도주문 없음]")
+
+    if not fill_wait and not cancel_req and not order_ok and not cancelled_done:
+        _opening_call_auction_order_summary_done = True
+        return
+
+    _opening_call_auction_order_summary_done = True
+    now_str = datetime.now(KST).strftime("%H:%M:%S")
+    lines = [f"{'='*60}", f"[동시호가 주문현황 정리] {now_str} (09:00 전 최종)", "=" * 60]
+    if fill_wait:
+        lines.append(f"  ▼ 체결대기 ({len(fill_wait)}종목) ─────────────────────")
+        lines.extend(fill_wait)
+    if cancel_req:
+        lines.append(f"  ◐ 취소요청중 ({len(cancel_req)}종목) ─────────────────────")
+        lines.extend(cancel_req)
+    if cancelled_done:
+        lines.append(f"  ● 취소완료 ({len(cancelled_done)}종목) ─────────────────────")
+        lines.extend(cancelled_done)
+    if order_ok:
+        lines.append(f"  ○ 이상없음 ({len(order_ok)}종목) ─────────────────────")
+        lines.extend(order_ok)
+    lines.append("=" * 60)
+    msg = "\n".join(lines)
+    sys.stdout.write(f"\n{msg}\n\n")
+    sys.stdout.flush()
+    logger.info(msg)
+    if fill_wait:
+        _notify(f"[동시호가현황] 체결대기 {len(fill_wait)}건 (주문접수완료→09:00 시초가 체결 예정)", tele=True)
+
+
+_last_snapshot_ts: float = 0.0
+
+
+def writer_loop():
+    """1분마다 _part_buffer 를 part 파일로 flush. 5분마다 지표 스냅샷 저장."""
+    global _last_snapshot_ts
+    logger.info("[writer] started")
+    while not _stop_event.is_set():
+        try:
+            time_ok = (time.time() - _last_save_time) >= PART_FLUSH_SEC
+            if time_ok:
+                with _part_buffer_lock:
+                    has_data = bool(_part_buffer)
+                if has_data:
+                    _flush_part_buffer("periodic", force_full=True)
+            # ── 지표 스냅샷 주기 저장 (5분 간격) ──
+            now_ts = time.time()
+            if now_ts - _last_snapshot_ts >= SNAPSHOT_INTERVAL_SEC:
+                _last_snapshot_ts = now_ts
+                if _ema_state and datetime.now(KST).time() >= dtime(9, 0):
+                    _save_indicator_snapshot()
+        except Exception as e:
+            logger.error(f"[writer] save error: {e}")
+            logger.error(traceback.format_exc())
+        time.sleep(0.5)
+
+    # 종료 시 최종 저장
+    try:
+        _flush_part_buffer("shutdown", force_full=True)
+        _save_indicator_snapshot()  # 종료 시 최종 스냅샷
+    except Exception:
+        pass
+    logger.info("[writer] stopped")
+
+# =============================================================================
+# request -> tr_id 추정(가능하면)
+# (라이브러리 구현마다 구조가 다를 수 있어 여러 방식으로 시도)
+# =============================================================================
+def _extract_tr_id(req) -> str | None:
+    for key in ("tr_id", "trid", "trId", "TRID", "header_tr_id"):
+        if hasattr(req, key):
+            v = getattr(req, key)
+            if isinstance(v, str) and v:
+                return v
+    if isinstance(req, dict):
+        for key in ("tr_id", "trid", "trId", "TRID"):
+            v = req.get(key)
+            if isinstance(v, str) and v:
+                return v
+    # Fallback: plain 함수면 함수명으로 역매핑
+    name = getattr(req, "__name__", None)
+    if name and name in _FUNC_NAME_TO_TRID:
+        return _FUNC_NAME_TO_TRID[name]
+    return None
+
+# =============================================================================
+# 수신 콜백: 버퍼 적재만(저장 게이팅 + 컬럼 추가)
+# - is_real_ccnl: "Y"=체결가, "N"=예상체결가
+# - tr_kind: 어떤 스트림인지 (regular_real / regular_exp / overtime_real / overtime_exp)
+# =============================================================================
+def on_result(ws, tr_id, result, data_info):
+    # 18:00 종료 시 scheduler가 _stop_event.set() + _request_ws_close() 호출.
+    # kis_auth_llm.__subscriber는 wait_for(recv(), 60)로 1분마다 _close_requested 체크 → ws.close() 수행.
+    # 데이터 수신 시 on_result가 호출되므로, 여기서 _stop_event 감지 시 ws.close() 즉시 스케줄.
+    if _stop_event.is_set() and ws is not None:
+        try:
+            import asyncio
+            asyncio.ensure_future(ws.close())
+        except Exception:
+            pass
+        return
+
+    if result is None or getattr(result, "empty", True):
+        return
+
+    # 수신 시점 컬럼명 소문자 통일 (ccnl_krx 대문자 vs exp_ccnl_krx 소문자 → concat 시 중복 방지)
+    result.columns = [str(c).strip().lower() for c in result.columns]
+
+    # H0STCNI0 체결통보: 별도 로그 저장 + 체결 시 state 갱신 (parquet 미포함)
+    trid = str(tr_id)
+    if trid == "H0STCNI0":
+        recv_ts = datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S.%f")
+        _write_ccnl_notice_log(result, recv_ts)
+        # ── 가독성 로그 ──
+        for _, row in result.iterrows():
+            try:
+                cntg_yn = str(row.get("cntg_yn", "")).strip()
+                if cntg_yn not in ("1", "2"):
+                    continue
+                code = str(row.get("stck_shrn_iscd", "")).strip().zfill(6)
+                seln = str(row.get("seln_byov_cls", "")).strip()
+                side = "매도" if seln in ("01", "1") else "매수"
+                name = code_name_map.get(code, "") or code
+                label = f"{name}({code})" if name != code else code
+                oder_no = str(row.get("oder_no", "")).strip()
+                if cntg_yn == "1":  # 접수
+                    _raw_qty = row.get("cntg_qty", 0)
+                    try:
+                        qty = int(float(str(_raw_qty).replace(",", "").strip() or "0"))
+                    except (ValueError, TypeError):
+                        qty = 0
+                    qty_s = f" {qty}주" if qty else ""
+                    _notify(f"{ts_prefix()} [체결통보-접수] {side} {label}{qty_s} | 주문번호={oder_no}", tele=True)
+                else:  # 체결
+                    qty = int(float(str(row.get("cntg_qty", 0) or 0).replace(",", "") or 0))
+                    price = int(float(str(row.get("cntg_unpr", 0) or 0).replace(",", "") or 0))
+                    rmn = int(float(str(row.get("rmn_qty", 0) or 0).replace(",", "") or 0))
+                    pnl_txt = ""
+                    if seln in ("01", "1") and price > 0:  # 매도체결 → PNL 계산
+                        with _str1_sell_state_lock:
+                            st = _str1_sell_state.get(code, {})
+                            bp = float(st.get("buy_price") or 0)
+                        if bp > 0:
+                            pnl_info = calc_sell_pnl(bp, price, qty)
+                            pnl_txt = f" | PNL≈{pnl_info['pnl']:+,.0f}원({pnl_info['ret_pct']:+.2f}%)"
+                    _notify(f"{ts_prefix()} [체결통보-체결] {side} {label} {qty}주 x {price:,}원 | 잔여={rmn} | 주문번호={oder_no}{pnl_txt}", tele=True)
+            except Exception:
+                pass
+        _on_ccnl_notice_filled(result, recv_ts)
+        return
+
+    # H0STMKO0 장운영정보: VI 발동/해제 감지 (parquet 미포함)
+    if trid == "H0STMKO0":
+        _on_market_status_krx(result)
+        return
+    if result.columns.duplicated().any():
+        result = result.loc[:, ~result.columns.duplicated()]
+
+    trid = str(tr_id)
+    if trid not in TRID_TO_KIND and trid in KNOWN_TRID_MAP:
+        kind, is_real = KNOWN_TRID_MAP[trid]
+        TRID_TO_KIND[trid] = kind
+        TRID_TO_IS_REAL[trid] = is_real
+    else:
+        kind = TRID_TO_KIND.get(trid, "unknown")
+        is_real = TRID_TO_IS_REAL.get(trid, None)
+
+    recv_ts = datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S.%f")
+    # WSS 파서 단계에서 Polars로 변환 → ingest_loop는 Polars 네이티브로 처리
+    result_pl = pl.from_pandas(result)
+    _ingest_queue.put((result_pl, trid, kind, is_real, recv_ts))
+
+
+def ingest_loop():
+    global _last_print_ts, _last_summary_ts, _last_full_status_ts, _since_save_rows, _last_any_recv_ts, _part_buffer_rows
+    logger.info("[ingest] started")
+    while not _stop_event.is_set() or not _ingest_queue.empty():
+        try:
+            item = _ingest_queue.get(timeout=0.5)
+        except queue.Empty:
+            continue
+        if item is None:
+            break
+        # watchdog heartbeat: ingest_loop 가 살아있음을 표시
+        globals()['_last_ingest_tick_ts'] = time.time()
+        result, trid, kind, is_real, recv_ts = item
+        if kind == "unknown":
+            kind = "unknown"
+        if is_real is None and kind != "unknown":
+            is_real = "N" if "exp" in kind else "Y"
+
+        if print_option == 1:
+            print(result)
+            continue
+
+        col_map = {c: c for c in result.columns}  # Polars: columns already lowercase strings
+        code_col = col_map.get("mksc_shrn_iscd") or col_map.get("stck_shrn_iscd")
+        if not code_col:
+            continue
+
+        now = time.time()
+
+        # 저장 게이팅(시간대별)
+        with _flags_lock:
+            if kind == "regular_real":
+                save = SAVE_REAL_REGULAR
+            elif kind == "regular_exp":
+                save = SAVE_EXP_REGULAR
+            elif kind == "overtime_real":
+                save = SAVE_REAL_OVERTIME
+            elif kind == "overtime_exp":
+                save = SAVE_EXP_OVERTIME
+            elif kind in ("nxt_real", "nxt_exp"):
+                save = True  # NXT 체결가는 항상 저장
+            else:
+                save = (SAVE_MODE == "always")
+
+        # 모니터링 카운트 (Polars 네이티브)
+        try:
+            tmp = result.with_columns(
+                pl.col(code_col).cast(pl.Utf8).str.zfill(6).alias(code_col)
+            )
+            with _lock:
+                for df_code in tmp.partition_by(code_col, maintain_order=True):
+                    code = str(df_code[code_col][0])
+                    if code not in _per_sec_counts:
+                        continue
+                    n = len(df_code)
+                    _per_sec_counts[code] = (_per_sec_counts[code] + n) % PER_SEC_ROLLOVER
+                    _total_counts[code] += n
+                    _since_save_rows += n
+                    _since_save_counts[code] += n
+                    _last_recv_ts[code] = now
+                    _last_any_recv_ts = now
+                    # 종목별 tr_id 전환 감지 로깅
+                    prev_trid = _last_trid_per_code.get(code)
+                    if prev_trid and prev_trid != trid:
+                        name = code_name_map.get(code, code)
+                        logger.info(
+                            f"{ts_prefix()} [tr_id전환] {name}({code}) "
+                            f"{prev_trid} → {trid}"
+                        )
+                    _last_trid_per_code[code] = trid
+                    # 57/59 종목이 H0STCNT0(실시간체결) 수신 → 30분 단일가 아님 → 일반종목 전환
+                    if code in _single_price_codes and trid == "H0STCNT0":
+                        stat = _single_price_codes.pop(code)
+                        name = code_name_map.get(code, code)
+                        msg = (f"{ts_prefix()} [단일가해제] {name}({code}) "
+                               f"iscd_stat={stat} 실시간체결(H0STCNT0) 수신 → 일반종목 전환")
+                        logger.info(msg)
+                        _notify(msg, tele=True)
+                    # 57/59 후보 종목: 정시 윈도우 관찰 후 30분 단일가 확정/해제
+                    if code in _single_price_pending and trid != "FHKST01010100":
+                        t_now = datetime.now(KST).time()
+                        m, s = t_now.minute, t_now.second
+                        in_single_window = (m in (0, 30) and s < 30) or (m in (29, 59) and s >= 30)
+                        if in_single_window:
+                            # 정시 윈도우 내 첫 틱 → 관찰 시작 (즉시 확정하지 않음)
+                            stat = _single_price_pending.pop(code)
+                            _single_price_observe[code] = {"stat": stat, "first_ts": now, "tick_count": 1}
+                            name = code_name_map.get(code, code)
+                            desc = "57(관리종목)" if stat == "57" else "59(단기과열)"
+                            logger.info(f"{ts_prefix()} [KRX조회] {name}({code}) {desc} 정시 윈도우 첫 틱 → 관찰 시작 (10초간 추가 틱 확인)")
+                        else:
+                            stat = _single_price_pending.pop(code)
+                            name = code_name_map.get(code, code)
+                            msg = f"{ts_prefix()} [단일가해제] {name}({code}) iscd_stat={stat} 비단일가 시간대 틱 수신 → 일반종목"
+                            logger.info(msg)
+                            _notify(msg, tele=True)
+                    # 관찰 중인 종목: 추가 틱으로 연속 거래 여부 판정
+                    if code in _single_price_observe and trid != "FHKST01010100":
+                        obs = _single_price_observe[code]
+                        obs["tick_count"] += 1
+                        elapsed = (now - obs["first_ts"]).total_seconds()
+                        name = code_name_map.get(code, code)
+                        if obs["tick_count"] >= 3 and elapsed < 15:
+                            # 15초 내 3건 이상 → 연속 거래 (단일가 아님)
+                            _single_price_observe.pop(code)
+                            msg = f"{ts_prefix()} [단일가해제] {name}({code}) iscd_stat={obs['stat']} 정시 윈도우 내 {obs['tick_count']}틱/{elapsed:.0f}초 → 연속거래 판정 (일반종목)"
+                            logger.info(msg)
+                            _notify(msg, tele=True)
+                        elif elapsed >= 15:
+                            # 15초 경과 + 3건 미만 → 단일가 확정
+                            _single_price_observe.pop(code)
+                            _single_price_codes[code] = obs["stat"]
+                            desc = "57(관리종목)" if obs["stat"] == "57" else "59(단기과열)"
+                            msg = f"{ts_prefix()} [KRX조회] 30분 단일가 확정 {name}({code}) {desc} ({obs['tick_count']}틱/{elapsed:.0f}초 관찰)"
+                            logger.info(msg)
+                            _notify(msg, tele=True)
+                    # WSS 전용 수신 시각 (REST 제외)
+                    if trid != "FHKST01010100":
+                        _last_wss_recv_ts[code] = now
+                        # 실시간 수신 재개 → H0STMKO0 일시구독 해제 (미수신 해소)
+                        if code in _a2_mkstatus_codes:
+                            _a2_mkstatus_unsubscribe(code)
+                    if kind == "regular_real" and _get_mode() == RunMode.CLOSE_REAL:
+                        _regular_real_seen.add(code)
+                    if kind == "overtime_real":
+                        _overtime_real_seen.add(code)
+        except Exception:
+            pass
+
+        # 15:20~15:30 예상체결가 모니터링 (Polars DataFrame 그대로 전달)
+        if kind == "regular_exp" and _get_mode() == RunMode.CLOSE_EXP:
+            try:
+                _run_closing_exp_monitor_tick(result, code_col, col_map)
+            except Exception as e:
+                logger.warning(f"{ts_prefix()} [종가모니터] tick 처리 오류: {e}")
+
+        # 최근 전일대비율·체결가·종목상태 캐시 (Polars 네이티브)
+        try:
+            prdy_col = col_map.get("prdy_ctrt")
+            pr_col = col_map.get("stck_prpr")
+            mkop_col = col_map.get("new_mkop_cls_code")
+            tmp2 = result.with_columns(
+                pl.col(code_col).cast(pl.Utf8).str.zfill(6).alias(code_col)
+            )
+            for df_code in tmp2.partition_by(code_col, maintain_order=True):
+                code = str(df_code[code_col][0])
+                if not code or code == "None" or code == "000000":
+                    continue
+                if prdy_col:
+                    try:
+                        _last_prdy_ctrt[code] = float(df_code[prdy_col][-1])
+                    except Exception:
+                        pass
+                if pr_col:
+                    try:
+                        _last_stck_prpr[code] = float(str(df_code[pr_col][-1]).replace(",", "") or 0)
+                    except Exception:
+                        pass
+                if mkop_col:
+                    try:
+                        v = str(df_code[mkop_col][-1] or "").strip()
+                        if v:
+                            prev_mkop = _last_mkop_cls_code.get(code, "")
+                            if prev_mkop and prev_mkop != v:
+                                name = code_name_map.get(code, code)
+                                logger.info(
+                                    f"{ts_prefix()} [mkop변경] {name}({code}) "
+                                    f"{prev_mkop} → {v}"
+                                )
+                            _last_mkop_cls_code[code] = v
+                    except Exception:
+                        pass
+                # VI기준가 캐시 (실시간체결에만 존재)
+                vi_prc_col = col_map.get("vi_stnd_prc")
+                if vi_prc_col:
+                    try:
+                        vp = float(str(df_code[vi_prc_col][-1]).replace(",", "") or 0)
+                        if vp > 0:
+                            _vi_stnd_prc[code] = vp
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+        # _vi_delayed_codes 조기 해제: stck_oprc > 0이면 시가 형성됨 → VI 아님
+        if _vi_delayed_codes and kind == "regular_exp":
+            oprc_col_check = col_map.get("stck_oprc")
+            if oprc_col_check:
+                try:
+                    tmp2_vi = result.with_columns(
+                        pl.col(code_col).cast(pl.Utf8).str.zfill(6).alias(code_col)
+                    )
+                    for df_code in tmp2_vi.partition_by(code_col, maintain_order=True):
+                        code = str(df_code[code_col][0])
+                        if code in _vi_delayed_codes:
+                            try:
+                                oprc_val = float(str(df_code[oprc_col_check][-1]).replace(",", "") or 0)
+                                if oprc_val > 0:
+                                    _vi_delayed_codes.discard(code)
+                                    name = code_name_map.get(code, code)
+                                    logger.info(
+                                        f"{ts_prefix()} [VI지연해제] {name}({code}) "
+                                        f"stck_oprc={oprc_val:,.0f} → 시가형성 확인, 실시간체결 전환"
+                                    )
+                            except (ValueError, TypeError):
+                                pass
+                    if not _vi_delayed_codes:
+                        _trigger_ws_rebuild()
+                except Exception:
+                    pass
+
+        if save:
+            if is_real is None:
+                is_real = "N" if "exp" in kind else "Y"
+
+            try:
+                df_save = result.with_columns([
+                    pl.col(code_col).cast(pl.Utf8).str.zfill(6).alias(code_col),
+                    pl.lit(recv_ts).alias("recv_ts"),
+                    pl.lit(trid).alias("tr_id"),
+                    pl.lit(is_real).alias("is_real_ccnl"),
+                ])
+                chunks: list[pl.DataFrame] = []
+                with _lock:
+                    for df_code in df_save.partition_by(code_col, maintain_order=True):
+                        code = str(df_code[code_col][0])
+                        # ── 기술적 지표 계산 (EMA + BB) — Polars 네이티브 ──
+                        pr_col = "stck_prpr"
+                        if pr_col in df_code.columns:
+                            ind_rows: list[dict] = []
+                            for pr_val in df_code[pr_col]:
+                                try:
+                                    ind_rows.append(_calc_indicators(code, float(pr_val)))
+                                except (TypeError, ValueError):
+                                    ind_rows.append({})
+                            if ind_rows:
+                                ind_df = pl.DataFrame(ind_rows)
+                                for col_name in ind_df.columns:
+                                    df_code = df_code.with_columns(
+                                        ind_df[col_name].alias(col_name)
+                                    )
+                        # ── VI/마켓 이벤트 컬럼 추가 (parquet 저장용) ──
+                        _mkt = _code_market_map.get(code, "")
+                        _mkt_evt = _market_wide_event.get(_mkt, "") or _market_event.get(code, "")
+                        _mkt_mkop = _market_wide_mkop.get(_mkt, "") or _last_mkop_cls_code.get(code, "")
+                        df_code = df_code.with_columns([
+                            pl.lit("Y" if code in _vi_active_codes else "").alias("vi_yn"),
+                            pl.lit(_vi_start_ts.get(code, "")).alias("vi_start_ts"),
+                            pl.lit(_vi_end_ts.get(code, "")).alias("vi_end_ts"),
+                            pl.lit(_mkt_evt).alias("market_event"),
+                            pl.lit(_mkt_mkop).alias("new_mkop_cls_code"),
+                            # 전방호환 컬럼 — Chunk 4의 fill-forward 생성기 추가 전까지는
+                            # 모두 빈 문자열. 스키마 호환성만 선제 확보.
+                            pl.lit("").alias("fill_forward"),
+                            pl.lit("").alias("halt_reason"),
+                        ])
+                        chunks.append(df_code)
+                # _part_buffer 에 추가 (PART_FLUSH_SAVE 행 또는 1분마다 part 파일로 flush)
+                if chunks:
+                    with _part_buffer_lock:
+                        for chunk in chunks:
+                            _part_buffer.append(chunk)
+                        total_n = sum(len(c) for c in chunks)
+                        _part_buffer_rows += total_n
+                    # PART_FLUSH_THRESHOLD 도달 시 오래된 PART_FLUSH_SAVE 행 flush
+                    if _part_buffer_rows >= PART_FLUSH_THRESHOLD:
+                        _flush_part_buffer(f"{PART_FLUSH_SAVE}rows")
+            except Exception:
+                logger.error("[ingest] part buffer append failed")
+                logger.error(traceback.format_exc())
+
+        # ── Str1 실전 매도 조건 체크 ─────────────────────────────────────────
+        if STR1_SELL_ENABLED and _str1_sell_state:
+            try:
+                _check_str1_sell_conditions(result, col_map, code_col, kind)
+            except Exception as _e:
+                logger.debug(f"[str1_sell] 조건 체크 예외: {_e}")
+
+        # ── VI 발동 종목 예상체결가 모니터링 ──────────────────────────────────
+        if _vi_active_codes and "exp" in kind:
+            try:
+                _monitor_vi_exp_price(result, col_map, code_col)
+            except Exception as _e:
+                logger.debug(f"[VI모니터] 예외: {_e}")
+
+        if print_option == 2 and (now - _last_print_ts) >= 1.0:
+            _print_counts()
+            for c in _per_sec_counts:
+                _per_sec_counts[c] = 0
+            _last_print_ts = now
+
+        if (now - _last_summary_ts) >= SUMMARY_EVERY_SEC:
+            with _lock:
+                total_rows = sum(_total_counts.values())
+                saved_rows = _written_rows
+            accum_rows = _part_buffer_rows
+
+            logger.info(
+            f"[summary] total_rows={total_rows} saved_rows={saved_rows} "
+            f"buf={accum_rows} saved={saved_rows} -> parts"
+            )
+            _last_summary_ts = now
+
+        if (now - _last_full_status_ts) >= FULL_STATUS_EVERY_SEC:
+            _log_full_progress()
+            _last_full_status_ts = now
+    logger.info("[ingest] stopped")
+
+
+def _watchdog_loop():
+    """
+    ingest_loop heartbeat 감시.
+    - 10초마다 `_last_ingest_tick_ts` 정체 여부 확인
+    - 60초 초과: 텔레그램 경고 1회 발송 (로그 + 시간정보 포함)
+    - 120초 초과: 치명 경고 + faulthandler.dump_traceback(_faulthandler_log_fp) + os._exit(2)
+    - 최초 tick 세팅 전에는 skip
+    """
+    logger.info("[watchdog] started")
+    WARN_SEC = 60
+    FATAL_SEC = 120
+    warned = False
+    fataled = False
+
+    def _safe_notify(msg: str) -> None:
+        # watchdog 이 _notify 내부 텔레그램 호출에서 hang 되지 않도록 방어
+        try:
+            _notify(msg, tele=True)
+        except Exception as _e:
+            try:
+                logger.error(f"{ts_prefix()} [watchdog] notify failed: {_e}")
+            except Exception:
+                pass
+
+    while not _stop_event.is_set():
+        try:
+            time.sleep(10)
+            tick = globals().get('_last_ingest_tick_ts', 0.0) or 0.0
+            if tick <= 0.0:
+                # 최초 tick 세팅 전 (프로그램 기동 직후) — 감시 skip
+                continue
+            # 15:31~16:00: 정규장 종료 후 WS 데이터 미수신은 정상 → watchdog 감시 중단
+            now_t = datetime.now(KST).time()
+            if dtime(15, 31) <= now_t < dtime(16, 0):
+                warned = False
+                fataled = False
+                # ★ 스킵 구간 종료 후 idle 폭발 방지: heartbeat를 현재 시각으로 리셋
+                globals()['_last_ingest_tick_ts'] = time.time()
+                continue
+            idle = time.time() - tick
+
+            if idle >= FATAL_SEC:
+                if not fataled:
+                    fataled = True
+                    msg = (f"{ts_prefix()} [watchdog][FATAL] ingest_loop "
+                           f"{idle:.1f}s 무응답 → 프로세스 강제 종료(os._exit 2). "
+                           f"스레드 스택을 stderr 에 덤프합니다.")
+                    try:
+                        logger.critical(msg)
+                    except Exception:
+                        pass
+                    _safe_notify(msg)
+                    try:
+                        _faulthandler_log_fp.write(
+                            f"\n===== watchdog forced dump @ {datetime.now(KST).isoformat()} (idle {idle:.1f}s) =====\n"
+                        )
+                        faulthandler.dump_traceback(_faulthandler_log_fp)
+                        _faulthandler_log_fp.flush()
+                    except Exception:
+                        pass
+                    os._exit(2)
+            elif idle >= WARN_SEC:
+                if not warned:
+                    warned = True
+                    msg = (f"{ts_prefix()} [watchdog][WARN] ingest_loop "
+                           f"{idle:.1f}s 무응답 — freeze 가능성. "
+                           f"{FATAL_SEC}s 초과 시 강제 종료 예정.")
+                    try:
+                        logger.error(msg)
+                    except Exception:
+                        pass
+                    _safe_notify(msg)
+            else:
+                # 정상 복귀 → 경고 플래그 리셋
+                if warned:
+                    try:
+                        logger.info(f"{ts_prefix()} [watchdog] ingest_loop 정상 복귀 (idle={idle:.1f}s)")
+                    except Exception:
+                        pass
+                    warned = False
+        except Exception as _e:
+            try:
+                logger.error(f"{ts_prefix()} [watchdog] loop 예외: {_e}")
+            except Exception:
+                pass
+    logger.info("[watchdog] stopped")
+
+
+# =============================================================================
+# 종료 처리
+# =============================================================================
+def _shutdown(reason: str):
+    global _active_kws
+    if _stop_event.is_set():
+        return
+    logger.warning(f"\n{'=' * 66}\n[shutdown] {reason}\n{'=' * 66}")
+    _stop_event.set()
+    _ws_rebuild_event.set()
+    # 서버가 연결 종료 시 구독 자동 정리 → 구독 해제 생략, WebSocket만 닫기
+    with _kws_lock:
+        if _active_kws is not None:
+            _request_ws_close(_active_kws)
+            _active_kws = None  # 다른 스레드의 추가 send 방지
+    # a2 WSS 종료
+    if _kws_a2 is not None:
+        try:
+            _kws_a2.shutdown()
+        except Exception:
+            pass
+    time.sleep(0.3)
+
+def _handle_signal(signum, frame):
+    _shutdown(f"signal={signum}")
+    # ingest 큐가 소진될 때까지 최대 8초 대기 (메모리 데이터 유실 방지)
+    deadline = time.time() + 8.0
+    while not _ingest_queue.empty() and time.time() < deadline:
+        time.sleep(0.2)
+    # accumulator 즉시 저장
+    try:
+        _flush_part_buffer("signal_shutdown", force_full=True)
+    except Exception:
+        pass
+    # 지표 스냅샷 최종 저장
+    try:
+        _save_indicator_snapshot()
+    except Exception:
+        pass
+    raise SystemExit(0)
+
+signal.signal(signal.SIGINT, _handle_signal)
+signal.signal(signal.SIGTERM, _handle_signal)
+
+def _request_ws_close(kws) -> None:
+    for attr in ("close", "shutdown"):
+        try:
+            fn = getattr(kws, attr, None)
+            if callable(fn):
+                fn()
+                return
+        except Exception:
+            pass
+    for attr in ("ws", "wsapp", "websocket"):
+        try:
+            obj = getattr(kws, attr, None)
+            fn = getattr(obj, "close", None)
+            if callable(fn):
+                fn()
+                return
+        except Exception:
+            pass
+
+# =============================================================================
+# WebSocket 실행: 시간대별 구독 전환 + 자동 재연결
+# =============================================================================
+def _register_trid(req) -> str | None:
+    rid = _extract_tr_id(req)
+    if rid:
+        if req in (ccnl_krx, overtime_ccnl_krx):  # noqa: F405
+            TRID_TO_IS_REAL[rid] = "Y"
+        else:
+            TRID_TO_IS_REAL[rid] = "N"
+
+        if req == ccnl_krx:  # noqa: F405
+            TRID_TO_KIND[rid] = "regular_real"
+        elif req == exp_ccnl_krx:  # noqa: F405
+            TRID_TO_KIND[rid] = "regular_exp"
+        elif req == overtime_ccnl_krx:  # noqa: F405
+            TRID_TO_KIND[rid] = "overtime_real"
+        elif req == overtime_exp_ccnl_krx:  # noqa: F405
+            TRID_TO_KIND[rid] = "overtime_exp"
+        else:
+            TRID_TO_KIND[rid] = "unknown"
+    return rid
+
+def _send_subscribe(
+    kws,
+    req,
+    data,
+    tr_type: str,
+    *,
+    label: str | None = None,
+    quiet: bool = False,
+) -> None:
+    """WSS 구독/해제 전송 (배치).
+
+    Args:
+        label: 성공 로그 헤더를 override. 예: "예상체결가 구독 추가 성공".
+               None 이면 기본 "구독 추가 결과"/"구독 해제 결과" 사용.
+        quiet: True 면 성공 로그 skip. 실패 로그는 항상 기록.
+    """
+    rid = _register_trid(req)
+    action = "구독 추가" if tr_type == "1" else "구독 해제"
+    success_header = label if label is not None else f"{action} 결과"
+    for idx, chunk in enumerate(_chunks(data, MAX_CODES_PER_SESSION), start=1):
+        try:
+            kws.send_request(request=req, tr_type=tr_type, data=chunk)
+            if not quiet:
+                code_names = [f"{code_name_map.get(c, c)}({c})" for c in chunk]
+                logger.info(
+                    f"{ts_prefix()} [{success_header}] TR_ID={rid or 'unknown'} "
+                    f"종목={', '.join(sorted(code_names))}"
+                )
+        except Exception as e:
+            code_names = [f"{code_name_map.get(c, c)}({c})" for c in chunk]
+            logger.warning(
+                f"{ts_prefix()} [{action} 실패] TR_ID={rid or 'unknown'} "
+                f"종목={', '.join(sorted(code_names))} err={e}"
+            )
+
+def _apply_subscriptions(kws, desired: dict, force: bool = False) -> None:
+    """
+    desired: {request_func: set(종목코드)} — _desired_subscription_map()의 반환값
+    종목별로 올바른 구독 타입을 적용합니다.
+    구독 슬롯 초과 방지: 해제 완료 후 대기 → 신규 구독 (batch 10개씩)
+    """
+    all_reqs = [ccnl_krx, exp_ccnl_krx, overtime_ccnl_krx, overtime_exp_ccnl_krx]  # noqa: F405
+
+    if force:
+        # ── force 재구독: ALREADY IN SUBSCRIBE 방지 위해 UNSUBSCRIBE 후 SUBSCRIBE ──
+        for req in all_reqs:
+            want = desired.get(req, set())
+            if want:
+                _cnm = code_name_map if "code_name_map" in globals() else {}
+                _names = [_cnm.get(c, c) for c in sorted(want)]
+                logger.info(f"{ts_prefix()} [ws] force 재구독: {req.__name__} {len(want)}종목 {_names}")
+                _send_subscribe(kws, req, list(want), "2")  # UNSUBSCRIBE 먼저
+                time.sleep(0.05)
+                _send_subscribe(kws, req, list(want), "1")  # SUBSCRIBE
+                _subscribed[req.__name__] = set(want)
+            else:
+                _subscribed.pop(req.__name__, None)
+        return
+
+    # ── 1단계: 모든 해제 대상을 먼저 일괄 UNSUBSCRIBE (슬롯 확보) ──
+    pending_adds: list[tuple] = []
+    any_unsub = False
+    for req in all_reqs:
+        want = desired.get(req, set())
+        have = _subscribed.get(req.__name__, set())
+        if want != have:
+            to_add = list(want - have)
+            to_del = list(have - want) if want else list(have)
+        else:
+            to_add = []
+            to_del = []
+        if to_del:
+            # batch 단위 해제 (10개씩)
+            for i in range(0, len(to_del), 10):
+                batch = to_del[i:i+10]
+                _send_subscribe(kws, req, batch, "2")
+            any_unsub = True
+        if to_add:
+            pending_adds.append((req, to_add))
+
+    # ── 해제 → 신규 구독 사이 서버 처리 대기 ──
+    if any_unsub and pending_adds:
+        time.sleep(0.1)
+
+    # ── 2단계: 신규 구독 (batch 10개씩) ────
+    for req, add_list in pending_adds:
+        for i in range(0, len(add_list), 10):
+            batch = add_list[i:i+10]
+            _send_subscribe(kws, req, batch, "1")  # SUBSCRIBE
+
+    # ── 3단계: 전송 완료 후 _subscribed 갱신 ──────────────────────
+    for req in all_reqs:
+        want = desired.get(req, set())
+        if want:
+            _subscribed[req.__name__] = set(want)
+        else:
+            _subscribed.pop(req.__name__, None)
+
+def _desired_subscription_map(now: datetime) -> dict:
+    """
+    종목별 구독 매핑을 반환: {request_func: set(종목코드)}
+    - VI 종목은 09:00~09:02 예상체결 유지, 나머지는 실시간체결
+    - 모드 전환 시 종목별로 정확한 구독 타입 지정
+    """
+    global _overtime_real_active
+    t = now.time()
+    all_codes = set(codes)
+
+    # NXT 프리마켓 (08:00~08:50)
+    if dtime(8, 0) <= t < dtime(8, 50):
+        if _nxt_target_codes:
+            return {ccnl_nxt: set(_nxt_target_codes)}  # noqa: F405
+        return {}
+
+    if t < dtime(8, 0) or not all_codes:
+        return {}
+    if dtime(8, 50) <= t < dtime(9, 0):
+        # a2 활성 → 예상체결가는 a2에서 처리, a1은 08:59:29부터 57/59 실시간체결만
+        if _kws_a2 is not None:
+            single_codes = (_single_price_codes.keys() | _single_price_pending.keys()) & all_codes
+            if single_codes and t >= dtime(8, 59, 29):
+                return {ccnl_krx: single_codes}  # noqa: F405
+            return {}  # 예상체결가는 a2가 담당
+        # a2 미사용 → 기존 로직
+        single_codes = (_single_price_codes.keys() | _single_price_pending.keys()) & all_codes
+        if single_codes and t >= dtime(8, 59, 29):
+            return {
+                exp_ccnl_krx: all_codes - single_codes,
+                ccnl_krx: single_codes,
+            }  # noqa: F405
+        return {exp_ccnl_krx: all_codes}  # noqa: F405
+
+    if dtime(9, 0) <= t < dtime(15, 20):
+        # ── VI / 57·59(30분 단일가) / 일반 종목 분리 ──
+        vi_codes = (_vi_delayed_codes | _vi_active_codes) & all_codes
+        single_codes = (_single_price_codes.keys() | _single_price_pending.keys()) & all_codes
+
+        # a2 WSS 활성 → 예상체결가 전체를 a2에서 처리, a1은 실시간체결만
+        if _kws_a2 is not None:
+            vi_codes = set()  # a1에서 VI 예상체결 구독 불필요
+            # 57/59 예상체결도 a2에서 처리 → a1은 실시간 체결가 구간만
+            minute, second = t.minute, t.second
+            single_real_window = (
+                (minute in (29, 59) and second >= 29) or (minute in (0, 30) and second < 6)
+            )
+            single_real = single_codes if single_real_window else set()
+            rest_codes = all_codes - single_codes
+            result = {}
+            if rest_codes or single_real:
+                result[ccnl_krx] = rest_codes | single_real
+            return result
+
+        rest_codes = all_codes - vi_codes - single_codes
+
+        # 57/59: XX:29:29~XX:00:05 / XX:59:29~XX:30:05 = 실시간 체결가, 그 외 예상체결가
+        minute, second = t.minute, t.second
+        single_real_window = (
+            (minute in (29, 59) and second >= 29) or (minute in (0, 30) and second < 6)
+        )
+        single_real = single_codes if single_real_window else set()
+        single_exp = single_codes - single_real
+
+        result = {}
+        exp_set = vi_codes | single_exp
+        if exp_set:
+            result[exp_ccnl_krx] = exp_set
+        if rest_codes or single_real:
+            result[ccnl_krx] = rest_codes | single_real
+        return result
+
+    if dtime(15, 20) <= t < dtime(15, 30):
+        # a2 활성 → 예상체결가는 a2에서 처리
+        if _kws_a2 is not None:
+            return {}
+        return {exp_ccnl_krx: all_codes}  # noqa: F405
+
+    if dtime(15, 30) <= t < dtime(15, 40):
+        # 전 종목 종가 체결 수신 완료 → 구독 종료
+        if len(_regular_real_seen) >= len(codes):
+            return {}
+        # 15:31 타임아웃 → 미수신 종목 있어도 종료
+        if t >= dtime(15, 31):
+            return {}
+        # 15:30~15:31: 종가 체결가 수신 대기
+        return {ccnl_krx: all_codes}  # noqa: F405
+
+    # 15:40~16:00 시간외종가 — WSS 구독 불필요 (REST 주문 + 체결통보)
+    if dtime(15, 40) <= t < dtime(16, 0):
+        return {}
+
+    # NXT 애프터마켓 (16:00~20:00)
+    if dtime(16, 0) <= t < dtime(20, 0):
+        if _nxt_target_codes:
+            return {ccnl_nxt: set(_nxt_target_codes)}  # noqa: F405
+        return {}
+
+    return {}
+
+def run_ws_forever():
+    global _close_force_stopped
+    backoff = 2
+    attempt = 0
+
+    while not _stop_event.is_set():
+        mode = _get_mode()
+        if mode == RunMode.EXIT:
+            break
+
+        attempt += 1
+        kws = None
+        try:
+            logger.info(f"{ts_prefix()} [ws] connect attempt={attempt} mode={mode.name}")
+
+            # 재연결 시 접속키(approval_key) 갱신 - htsid 만료 방지
+            if attempt > 1:
+                try:
+                    ka.auth_ws(svr="prod")
+                    logger.info(f"{ts_prefix()} [ws] auth_ws 재발급 완료")
+                except Exception as ae:
+                    logger.warning(f"{ts_prefix()} [ws] auth_ws 재발급 실패: {ae}")
+
+            # open_map 초기화 후 현재 시각에 맞는 구독 등록 (종목별 매핑)
+            ka.open_map.clear()
+            _subscribed.clear()
+            # H0STCNI0 체결통보: a2 활성 시 a2에서 구독, 아니면 a1에서 구독
+            now_t = datetime.now(KST).time()
+            if _kws_a2 is not None:
+                # a2에서 체결통보 구독 (a1 슬롯 절약, 이미 구독 시 스킵)
+                _a2_subscribe_ccnl_notice()
+            else:
+                acc_key = _get_ccnl_notice_tr_key()
+                if acc_key:
+                    ka.KISWebSocket.subscribe(ccnl_notice, [acc_key])  # noqa: F405
+                    _subscribed["ccnl_notice"] = {acc_key}
+                    logger.info(f"{ts_prefix()} [체결통보] H0STCNI0 구독 요청: tr_key={acc_key!r}")
+                else:
+                    warn_msg = f"{ts_prefix()} [체결통보] H0STCNI0 구독 스킵: my_htsid 미설정!"
+                    logger.warning(warn_msg)
+                    _notify(warn_msg, tele=True)
+
+            desired_map = _desired_subscription_map(datetime.now(KST))
+            total_sub = sum(len(v) for v in desired_map.values())
+            if total_sub > MAX_WSS_SUBSCRIBE:
+                logger.warning(
+                    f"{ts_prefix()} [ws] 구독 상한 초과 예상: {total_sub} > {MAX_WSS_SUBSCRIBE}"
+                )
+            for req, code_set in desired_map.items():
+                ka.KISWebSocket.subscribe(req, list(code_set))
+                _subscribed[req.__name__] = set(code_set)
+            # H0STMKO0 장운영정보: a2 온디맨드로 이전 (a1 상시구독 제거)
+            # VI 감지는 REST 폴링(_vi_poll_check) + a2 일시구독으로 처리
+            # H0STCNI0 종목별 체결통보: open_map 등록 제거 (연결 불안정 원인)
+            # 체결통보는 주문 성공 시 _ccnl_notice_sub_add()로 동적 구독
+            sub_desc = ", ".join(f"{r.__name__}={len(c)}종목" for r, c in desired_map.items())
+            if _mkstatus_sub_codes:
+                sub_desc += f", H0STMKO0={len(_mkstatus_sub_codes)}종목"
+            if _ccnl_notice_sub_codes:
+                sub_desc += f", H0STCNI0(종목별)={len(_ccnl_notice_sub_codes)}종목"
+            logger.info(
+                f"{ts_prefix()} [ws] open_map prepared: {sub_desc} total={total_sub}"
+            )
+
+            # 재연결 도중 쌓인 이벤트 클리어
+            # (open_map에 최신 codes가 이미 반영되었으므로 이전 이벤트는 무효)
+            _ws_rebuild_event.clear()
+
+            kws = ka.KISWebSocket(api_url="")
+            with _kws_lock:
+                global _active_kws
+                _active_kws = kws
+
+            def _on_system(rsp):
+                if rsp.isOk and rsp.tr_msg and "SUCCESS" in rsp.tr_msg:
+                    if getattr(rsp, "tr_id", "") == "H0STCNI0" and attempt > 1:
+                        _notify(f"{ts_prefix()} [체결통보] 재접속 완료", tele=True)
+                    return
+                if rsp.tr_msg:
+                    msg = str(rsp.tr_msg)
+                    # 구독 전환 시 서버 타이밍에 따른 무해한 메시지는 DEBUG로
+                    if "not found" in msg.lower() or "ALREADY IN SUBSCRIBE" in msg:
+                        logger.debug(
+                            f"{ts_prefix()} [ws][system] tr_id={rsp.tr_id} tr_key={rsp.tr_key} msg={msg}"
+                        )
+                    elif "htsid" in msg.lower():
+                        cur_htsid = _get_ccnl_notice_tr_key()
+                        warn_msg = (
+                            f"{ts_prefix()} [ws][system] htsid 에러! "
+                            f"현재설정={cur_htsid!r}, "
+                            f"tr_id={rsp.tr_id}, tr_key={rsp.tr_key}, msg={msg}"
+                        )
+                        logger.warning(warn_msg)
+                        _notify(warn_msg, tele=True)
+                    else:
+                        logger.warning(
+                            f"{ts_prefix()} [ws][system] tr_id={rsp.tr_id} tr_key={rsp.tr_key} msg={msg}"
+                        )
+
+            kws.on_system = _on_system
+
+            # 시간 플래그 즉시 1회 갱신
+            update_time_flags()
+
+            logger.info(f"{ts_prefix()} [ws] start on_result (parquet={FINAL_PARQUET_PATH.name})")
+            kws.start(on_result=on_result)
+
+            logger.info(f"{ts_prefix()} [ws] kws.start returned (mode={mode.name})")
+
+        except SystemExit:
+            break
+        except Exception as e:
+            logger.error(f"{ts_prefix()} [ws] connection exception: {e}")
+            logger.error(traceback.format_exc())
+        finally:
+            with _kws_lock:
+                if _active_kws is kws:
+                    _active_kws = None
+            # ── 연결 끊김 → 즉시 타이머 리셋 ──
+            # scheduler_loop의 60초 미수신 타이머가 끊긴 시점 기준으로
+            # 불필요한 UNSUBSCRIBE→SUBSCRIBE를 하지 않도록 리셋
+            global _last_any_recv_ts
+            _last_any_recv_ts = 0.0
+            _subscribed.clear()  # 서버 세션 사라짐 → 구독 상태 초기화
+
+        if _stop_event.is_set():
+            break
+
+        # 종가 체결 수신 완료 후 OR 15:31~16:00 구간 → 16:00까지 대기
+        # (_close_force_stopped 플래그뿐 아니라 시간도 직접 체크하여 레이스 컨디션 방지)
+        now_t = datetime.now(KST).time()
+        should_wait = (
+            _close_force_stopped
+            or (dtime(15, 31) <= now_t < dtime(16, 0))
+        )
+        if should_wait and now_t < dtime(16, 0):
+            _close_force_stopped = True  # 플래그 보정
+            logger.info(f"{ts_prefix()} [ws] 종가 체결 수신 완료, 16:00 시간외까지 대기")
+            while not _stop_event.is_set():
+                if datetime.now(KST).time() >= dtime(16, 0):
+                    break
+                time.sleep(1.0)
+            logger.info(f"{ts_prefix()} [ws] 16:00 도달 → 시간외 단일가 연결 시작")
+        else:
+            logger.info(f"{ts_prefix()} [ws] reconnect in {backoff}s...")
+            time.sleep(backoff)
+
+    logger.info(f"{ts_prefix()} [ws] stopped")
+
+# =============================================================================
+# main
+# =============================================================================
+if __name__ == "__main__":
+    if is_holiday():
+        msg = f"{ts_prefix()} {PROGRAM_NAME} => 오늘은 휴일이므로 프로그램을 종료합니다."
+        _notify(msg, tele=True)
+        sys.exit(0)
+    else:
+        msg = f"{ts_prefix()} {PROGRAM_NAME} => 오늘은 개장일이므로 프로그램을 시작합니다."
+        _notify(msg, tele=True)
+    logger.info(f"[save_mode] {SAVE_MODE}")
+    logger.info(f"[part] flush {PART_FLUSH_THRESHOLD}행 시 {PART_FLUSH_SAVE}행 저장/{PART_FLUSH_SEC}s -> parts/ -> 18:00 merge")
+    logger.info(f"[monitor] summary_every={SUMMARY_EVERY_SEC}s stale={STALE_SEC}s")
+    logger.info(f"[parquet] -> {FINAL_PARQUET_PATH}")
+
+    if datetime.now(KST).time() >= END_TIME:
+        prefix = ts_prefix()
+        sys.stdout.write(f"{prefix} 종료 시각 경과 → 저장된 스냅샷 확인 후 종료\n")
+        sys.stdout.flush()
+        logger.info(f"{prefix} 종료 시각 경과 → 스냅샷={FINAL_PARQUET_PATH}")
+        _notify(f"{prefix} {PROGRAM_NAME} 종료 시각 경과로 종료", tele=True)
+        raise SystemExit(0)
+
+    # ── KRX_code로 57/59(30분 단일가) 종목 사전 초기화 ──────────
+    _check_iscd_stat_krx(list(codes))
+
+    # ── 시작 즉시 계좌 잔고조회 → 보유종목 출력 + balance_map 취득 ──────────
+    _startup_balance_map = _print_startup_balance()
+
+    # 재시작 시 미체결 매수주문 전부 취소 (OPEN_BUY_ORDER_CANCEL=True 시, 16:00~18:00 제외)
+    _run_open_buy_order_cancel_on_startup()
+
+    # 16:00 이후 재시작: 시간외 단일가 주문은 서버에 유지되므로 중복 주문 방지
+    if datetime.now(KST).time() >= dtime(16, 0):
+        _overtime_order_done = True  # noqa: F841 — 모듈 레벨 변수 직접 갱신
+        logger.info(f"{ts_prefix()} [시간외단일가] 16:00 이후 재시작 → 기존 주문 유지, 중복 주문 방지")
+
+    # 15:20~15:30 재시작 시 미처리 종가매수 주문 재시도 (state 저장 기반)
+    _run_closing_buy_retry_on_startup()
+
+    # Str1 매도 상태 복원 — 시작잔고 결과 전달 (중복 API 호출 없이 재사용)
+    _load_str1_sell_state_on_startup(_startup_balance_map)
+
+    # 매도 금지 종목 로드
+    _load_no_sell_codes()
+
+    # 당일 parts/FINAL → _ema_state, _price_buf 지표 복원 (재시작 연속성)
+    _restore_state_on_startup()
+
+    # 시작 시 base_codes를 월별 구독 이력 CSV에 기록
+    _log_base_codes_on_startup()
+
+    # 워커 시작
+    t_writer = threading.Thread(target=writer_loop, daemon=True)
+    t_writer.start()
+
+    t_ingest = threading.Thread(target=ingest_loop, daemon=True)
+    t_ingest.start()
+
+    # ingest_loop heartbeat 감시 워치독 (freeze 시 텔레그램 알림 + 강제 종료)
+    t_watchdog = threading.Thread(target=_watchdog_loop, daemon=True)
+    t_watchdog.start()
+
+    # Str1 매도 워커 시작 (ingest → sell_queue → KIS API 주문)
+    t_str1_sell = threading.Thread(target=_str1_sell_worker, daemon=True)
+    t_str1_sell.start()
+
+    # 시간 플래그 루프 시작
+    t_flags = threading.Thread(target=time_flag_loop, daemon=True)
+    t_flags.start()
+
+    # 스케줄러 시작
+    t_sched = threading.Thread(target=scheduler_loop, daemon=True)
+    t_sched.start()
+
+    # REST 요청 워커
+    t_rest = threading.Thread(target=_rest_worker, daemon=True)
+    t_rest.start()
+
+    # a2 WSS (VI 예상체결가 전용) — a2 인증 완료 시만 시작
+    if _a2_approval_key:
+        t_a2_wss = threading.Thread(target=_init_a2_wss, name="a2_vi_exp_wss", daemon=True)
+        t_a2_wss.start()
+
+    # REST 현재가 보강 워치독/요청 루프
+    t_price_watch = threading.Thread(target=_price_watchdog_loop, daemon=True)
+    t_price_watch.start()
+    t_price_req = threading.Thread(target=_price_request_loop, daemon=True)
+    t_price_req.start()
+
+    # 상위 랭킹 추가 구독 루프 시작
+    t_top = threading.Thread(target=_top_rank_loop, daemon=True)
+    t_top.start()
+
+    try:
+        run_ws_forever()
+    finally:
+        _shutdown("finally")
+        try:
+            # ingest 큐 소진 먼저 → 그 다음 writer flush (순서 중요: ingest→writer)
+            t_ingest.join(timeout=10.0)
+            t_writer.join(timeout=10.0)
+            t_str1_sell.join(timeout=5.0)
+            t_flags.join(timeout=3.0)
+            t_sched.join(timeout=3.0)
+            t_rest.join(timeout=3.0)
+            t_price_watch.join(timeout=3.0)
+            t_price_req.join(timeout=3.0)
+            t_top.join(timeout=3.0)
+        except Exception:
+            pass
+        # 종료 시 메모리 버퍼만 part로 저장 (병합은 18:00 장 종료 시에만 수행)
+        try:
+            with _part_buffer_lock:
+                has_data = bool(_part_buffer)
+            if has_data:
+                _notify(f"{ts_prefix()} 메모리 데이터 part 저장 중", tele=False)
+                _flush_part_buffer("final_shutdown", force_full=True)
+                _notify(f"{ts_prefix()} part 저장 완료", tele=False)
+        except Exception as e:
+            logger.error(f"[finally] 최종 flush 실패: {e}")
+        _flush_overwrite_log()
+        # 연도별 거래장부 parquet → CSV 변환 저장
+        try:
+            year = datetime.now(KST).strftime("%Y")
+            _yearly_pq = LEDGER_DIR / f"trade_ledger_{year}.parquet"
+            if _yearly_pq.exists():
+                pd.read_parquet(_yearly_pq).to_csv(
+                    _yearly_pq.with_suffix(".csv"), index=False, encoding="utf-8-sig"
+                )
+                logger.info(f"[ledger] CSV 변환 완료: {_yearly_pq.with_suffix('.csv')}")
+        except Exception as e:
+            logger.error(f"[ledger] CSV 변환 실패: {e}")
+        _notify(f"{ts_prefix()} {PROGRAM_NAME} 종료", tele=True)
+        logger.info("=== WSS END ===")

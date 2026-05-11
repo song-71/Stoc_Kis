@@ -1,0 +1,420 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Todo & Ex_Order</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:'Segoe UI',sans-serif;background:#f0f2f5;color:#333;min-height:100vh}
+.container{max-width:600px;margin:0 auto;padding:16px}
+.tabs{display:flex;gap:4px;margin-bottom:16px}
+.tab{flex:1;padding:12px;text-align:center;background:#fff;border:none;border-radius:10px 10px 0 0;font-size:15px;font-weight:600;cursor:pointer;color:#888;transition:.2s}
+.tab.active{background:#4a90d9;color:#fff}
+.tab-content{display:none}
+.tab-content.active{display:block}
+.card{background:#fff;border-radius:12px;box-shadow:0 2px 8px rgba(0,0,0,.08);padding:16px;margin-bottom:12px}
+h2{font-size:18px;margin-bottom:12px;color:#4a90d9}
+input,select{width:100%;padding:10px 12px;border:1px solid #ddd;border-radius:8px;font-size:14px;margin-bottom:8px;outline:none;transition:.2s}
+input:focus,select:focus{border-color:#4a90d9}
+button{padding:10px 18px;border:none;border-radius:8px;font-size:14px;font-weight:600;cursor:pointer;transition:.2s}
+button:active{transform:scale(.97)}
+.btn-primary{background:#4a90d9;color:#fff}
+.btn-primary:hover{background:#3a7bc8}
+.btn-danger{background:#e74c3c;color:#fff}
+.btn-danger:hover{background:#c0392b}
+.btn-sm{padding:6px 12px;font-size:12px}
+
+/* Todo */
+.filter-bar{display:flex;gap:8px;margin-bottom:12px;flex-wrap:wrap}
+.filter-btn{padding:6px 14px;border-radius:20px;background:#eee;border:none;font-size:13px;cursor:pointer}
+.filter-btn.active{background:#4a90d9;color:#fff}
+.badge{font-size:11px;background:#4a90d9;color:#fff;border-radius:10px;padding:1px 7px;margin-left:4px}
+.todo-item{display:flex;align-items:center;gap:10px;padding:10px 0;border-bottom:1px solid #f0f0f0}
+.todo-item:last-child{border-bottom:none}
+.todo-item input[type=checkbox]{width:auto;margin:0;cursor:pointer;accent-color:#27ae60}
+.todo-title{flex:1;font-size:14px}
+.todo-title.done{text-decoration:line-through;color:#aaa}
+.todo-meta{display:flex;gap:6px;align-items:center}
+.tag{font-size:11px;padding:2px 8px;border-radius:10px;background:#eee}
+.tag-긴급{background:#fde8e8;color:#e74c3c}
+.tag-업무{background:#e8f0fe;color:#4a90d9}
+.tag-개인{background:#e8f8e8;color:#27ae60}
+.tag-일반{background:#f0f0f0;color:#666}
+.priority{font-size:11px;font-weight:700}
+.p-높음{color:#e74c3c}
+.p-보통{color:#f39c12}
+.p-낮음{color:#888}
+.del-btn{background:none;border:none;color:#ccc;font-size:18px;cursor:pointer;padding:0 4px}
+.del-btn:hover{color:#e74c3c}
+
+/* Orders */
+.radio-group{display:flex;gap:12px;margin-bottom:8px}
+.radio-group label{display:flex;align-items:center;gap:4px;font-size:14px;cursor:pointer}
+.radio-group input{width:auto;margin:0}
+.form-row{display:flex;gap:8px}
+.form-row>*{flex:1}
+label.field-label{font-size:12px;color:#888;margin-bottom:2px;display:block}
+.order-table{width:100%;font-size:13px;border-collapse:collapse}
+.order-table th{background:#f5f5f5;padding:8px 6px;text-align:left;font-weight:600;font-size:12px}
+.order-table td{padding:8px 6px;border-bottom:1px solid #f0f0f0}
+.status-wait{color:#aaa}
+.status-accepted{color:#4a90d9}
+.status-done{color:#27ae60}
+
+/* Modal */
+.modal-overlay{display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,.4);z-index:100;justify-content:center;align-items:center}
+.modal-overlay.show{display:flex}
+.modal{background:#fff;border-radius:12px;padding:24px;width:320px;box-shadow:0 8px 30px rgba(0,0,0,.2)}
+.modal h3{margin-bottom:16px;font-size:16px}
+.modal-actions{display:flex;gap:8px;justify-content:flex-end;margin-top:12px}
+
+/* Toast */
+.toast-container{position:fixed;bottom:20px;right:20px;z-index:200;display:flex;flex-direction:column;gap:8px}
+.toast{padding:12px 18px;background:#333;color:#fff;border-radius:10px;font-size:13px;animation:slideIn .3s;box-shadow:0 4px 12px rgba(0,0,0,.2);max-width:300px}
+.toast.success{background:#27ae60}
+.toast.error{background:#e74c3c}
+.toast.info{background:#4a90d9}
+@keyframes slideIn{from{transform:translateX(100%);opacity:0}to{transform:translateX(0);opacity:1}}
+
+.empty{text-align:center;color:#aaa;padding:24px;font-size:14px}
+</style>
+</head>
+<body>
+<div class="container">
+  <div class="tabs">
+    <button class="tab active" onclick="switchTab('todo')">Todo</button>
+    <button class="tab" onclick="switchTab('order')">Ex_Order</button>
+  </div>
+
+  <!-- Tab 1: Todo -->
+  <div id="tab-todo" class="tab-content active">
+    <div class="card">
+      <h2>할 일 추가</h2>
+      <input type="text" id="todo-title" placeholder="할 일을 입력하세요">
+      <div class="form-row">
+        <select id="todo-category">
+          <option value="일반">일반</option>
+          <option value="업무">업무</option>
+          <option value="개인">개인</option>
+          <option value="긴급">긴급</option>
+        </select>
+        <select id="todo-priority">
+          <option value="높음">높음</option>
+          <option value="보통" selected>보통</option>
+          <option value="낮음">낮음</option>
+        </select>
+      </div>
+      <button class="btn-primary" style="width:100%" onclick="addTodo()">추가</button>
+    </div>
+    <div class="card">
+      <h2>할 일 목록</h2>
+      <div class="filter-bar" id="filter-bar"></div>
+      <div id="todo-list"></div>
+    </div>
+  </div>
+
+  <!-- Tab 2: Ex_Order -->
+  <div id="tab-order" class="tab-content">
+    <div class="card">
+      <h2>주문 입력</h2>
+      <label class="field-label">주문 유형</label>
+      <div class="radio-group">
+        <label><input type="radio" name="order-type" value="1" checked> 매수</label>
+        <label><input type="radio" name="order-type" value="2"> 매도</label>
+      </div>
+      <label class="field-label">종목명 / 종목코드</label>
+      <input type="text" id="ord-symbol" placeholder="예: 삼성전자 또는 005930">
+      <div class="form-row">
+        <div>
+          <label class="field-label">수량 (0이면 금액 사용)</label>
+          <input type="number" id="ord-qty" value="0" min="0">
+        </div>
+        <div>
+          <label class="field-label">금액</label>
+          <input type="text" id="ord-amount" value="0" placeholder="1,000,000">
+        </div>
+      </div>
+      <div class="form-row">
+        <div>
+          <label class="field-label">가격 (0=시장가)</label>
+          <input type="number" id="ord-price" value="0" min="0">
+        </div>
+        <div>
+          <label class="field-label">계좌</label>
+          <input type="text" id="ord-target" value="all">
+        </div>
+      </div>
+      <label class="field-label">주문 방식</label>
+      <select id="ord-ordtype">
+        <option value="auto">auto (자동)</option>
+        <option value="05">05 (장전시간외)</option>
+        <option value="06">06 (장후시간외)</option>
+        <option value="07">07 (시간외단일가)</option>
+      </select>
+      <button class="btn-primary" style="width:100%;margin-top:4px" onclick="showPasswordModal('submit')">주문 제출</button>
+    </div>
+    <div class="card">
+      <h2>일괄 주문 (엑셀 붙여넣기)</h2>
+      <p style="font-size:12px;color:#888;margin-bottom:8px">컬럼: order &nbsp; symbol &nbsp; qty &nbsp; amount &nbsp; target_price &nbsp; target &nbsp; ord_type<br>탭 또는 쉼표 구분. '-'는 빈값. order: 1=매수, 2=매도</p>
+      <textarea id="bulk-text" rows="6" style="width:100%;padding:10px 12px;border:1px solid #ddd;border-radius:8px;font-size:13px;font-family:monospace;outline:none;resize:vertical" placeholder="1&#9;삼성전자&#9;10&#10;2&#9;005930&#9;5&#9;0&#9;65000&#10;1&#9;카카오&#9;0&#9;1,000,000&#9;0&#9;-&#9;05"></textarea>
+      <div style="display:flex;gap:8px;margin-top:8px">
+        <button class="btn-primary btn-sm" onclick="previewBulk()">미리보기</button>
+        <button class="btn-primary btn-sm" style="background:#27ae60" onclick="submitBulk()">일괄 제출</button>
+      </div>
+      <div id="bulk-preview" style="margin-top:10px"></div>
+    </div>
+    <div class="card">
+      <h2>주문 현황 <span style="font-size:12px;color:#aaa">(3초 자동갱신)</span></h2>
+      <div id="order-list"></div>
+    </div>
+  </div>
+</div>
+
+<!-- Password Modal -->
+<div class="modal-overlay" id="pw-modal">
+  <div class="modal">
+    <h3>비밀번호 입력</h3>
+    <input type="password" id="pw-input" placeholder="비밀번호">
+    <div class="modal-actions">
+      <button class="btn-sm" style="background:#eee" onclick="closeModal()">취소</button>
+      <button class="btn-sm btn-primary" onclick="confirmPassword()">확인</button>
+    </div>
+  </div>
+</div>
+
+<div class="toast-container" id="toast-container"></div>
+
+<script>
+// --- Tabs ---
+function switchTab(t){
+  document.querySelectorAll('.tab').forEach(function(el,i){el.classList.toggle('active',i===(t==='todo'?0:1))});
+  document.getElementById('tab-todo').classList.toggle('active',t==='todo');
+  document.getElementById('tab-order').classList.toggle('active',t==='order');
+  if(t==='order') fetchOrders();
+}
+
+// --- Toast ---
+function toast(msg,type){
+  type=type||'info';
+  var el=document.createElement('div');
+  el.className='toast '+type;
+  el.textContent=msg;
+  document.getElementById('toast-container').appendChild(el);
+  setTimeout(function(){el.remove()},5000);
+}
+
+// --- Todo ---
+var PRIO={'높음':3,'보통':2,'낮음':1};
+var todos=[];
+var currentFilter='전체';
+
+function fetchTodos(){
+  fetch('/api/todos').then(function(r){return r.json()}).then(function(data){
+    todos=data;
+    renderTodos();
+  });
+}
+
+function renderTodos(){
+  var counts={'전체':todos.length};
+  todos.forEach(function(t){counts[t.category]=(counts[t.category]||0)+1});
+  var cats=['전체','일반','업무','개인','긴급'];
+  document.getElementById('filter-bar').innerHTML=cats.map(function(c){
+    return '<button class="filter-btn '+(currentFilter===c?'active':'')+'" onclick="setFilter(\''+c+'\')">'+c+'<span class="badge">'+(counts[c]||0)+'</span></button>';
+  }).join('');
+
+  var list=currentFilter==='전체'?todos.slice():todos.filter(function(t){return t.category===currentFilter});
+  list.sort(function(a,b){
+    if(a.done!==b.done) return a.done?1:-1;
+    if(PRIO[b.priority]!==PRIO[a.priority]) return PRIO[b.priority]-PRIO[a.priority];
+    return b.id-a.id;
+  });
+
+  if(!list.length){document.getElementById('todo-list').innerHTML='<div class="empty">할 일이 없습니다</div>';return}
+  document.getElementById('todo-list').innerHTML=list.map(function(t){
+    return '<div class="todo-item">'+
+      '<input type="checkbox" '+(t.done?'checked':'')+' onchange="toggleTodo('+t.id+')">'+
+      '<span class="todo-title '+(t.done?'done':'')+'">'+esc(t.title)+'</span>'+
+      '<div class="todo-meta">'+
+        '<span class="tag tag-'+t.category+'">'+t.category+'</span>'+
+        '<span class="priority p-'+t.priority+'">'+t.priority+'</span>'+
+        '<button class="del-btn" onclick="deleteTodo('+t.id+')">&times;</button>'+
+      '</div></div>';
+  }).join('');
+}
+
+function setFilter(c){currentFilter=c;renderTodos()}
+
+function addTodo(){
+  var title=document.getElementById('todo-title').value.trim();
+  if(!title)return;
+  var category=document.getElementById('todo-category').value;
+  var priority=document.getElementById('todo-priority').value;
+  fetch('/api/todos',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({title:title,category:category,priority:priority})}).then(function(){
+    document.getElementById('todo-title').value='';
+    fetchTodos();
+  });
+}
+
+function toggleTodo(id){
+  var t=todos.find(function(x){return x.id===id});
+  fetch('/api/todos/'+id,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({done:!t.done})}).then(function(){fetchTodos()});
+}
+
+function deleteTodo(id){
+  if(!confirm('삭제하시겠습니까?'))return;
+  fetch('/api/todos/'+id,{method:'DELETE'}).then(function(){fetchTodos()});
+}
+
+function esc(s){var d=document.createElement('div');d.textContent=s;return d.innerHTML}
+
+// --- Amount comma formatting ---
+var amtInput=document.getElementById('ord-amount');
+amtInput.addEventListener('input',function(){
+  var v=this.value.replace(/[^\d]/g,'');
+  this.value=v?Number(v).toLocaleString():'';
+});
+
+// --- Orders ---
+var pendingAction=null;
+var prevResults={};
+
+function showPasswordModal(type,no){
+  pendingAction={type:type,no:no};
+  document.getElementById('pw-input').value='';
+  document.getElementById('pw-modal').classList.add('show');
+  setTimeout(function(){document.getElementById('pw-input').focus()},100);
+}
+function closeModal(){document.getElementById('pw-modal').classList.remove('show');pendingAction=null}
+
+document.getElementById('pw-input').addEventListener('keydown',function(e){if(e.key==='Enter')confirmPassword()});
+
+function confirmPassword(){
+  var pw=document.getElementById('pw-input').value;
+  if(!pw)return;
+  var action=pendingAction;
+  closeModal();
+  if(action.type==='submit') submitOrder(pw);
+  else if(action.type==='cancel') cancelOrder(action.no,pw);
+  else if(action.type==='bulk') submitBulkOrders(pw,action.orders);
+}
+
+function submitOrder(pw){
+  var order=document.querySelector('input[name="order-type"]:checked').value;
+  var symbol=document.getElementById('ord-symbol').value.trim();
+  if(!symbol){toast('종목을 입력하세요','error');return}
+  var qty=parseInt(document.getElementById('ord-qty').value)||0;
+  var amount=parseInt(amtInput.value.replace(/[^\d]/g,''))||0;
+  var target_price=parseFloat(document.getElementById('ord-price').value)||0;
+  var target=document.getElementById('ord-target').value.trim()||'all';
+  var ord_type=document.getElementById('ord-ordtype').value;
+
+  fetch('/api/orders',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:pw,orders:[{order:order,symbol:symbol,qty:qty,amount:amount,target_price:target_price,target:target,ord_type:ord_type}]})}).then(function(r){
+    if(r.status===403){toast('비밀번호 불일치','error');return}
+    if(r.status===201){r.json().then(function(){toast('주문 접수 완료','success');fetchOrders()});return}
+    r.json().catch(function(){return{}}).then(function(d){toast(d.message||'주문 실패','error')});
+  }).catch(function(){toast('통신 오류','error')});
+}
+
+function cancelOrder(no){
+  if(!confirm('주문 #'+no+'을 취소하시겠습니까?'))return;
+  fetch('/api/orders/'+no,{method:'DELETE'}).then(function(r){
+    toast('주문 취소 완료','success');
+    fetchOrders();
+  }).catch(function(){toast('통신 오류','error')});
+}
+
+function fetchOrders(){
+  fetch('/api/orders').then(function(r){return r.json()}).then(function(list){
+    list.forEach(function(o){
+      var prev=prevResults[o.no];
+      if(prev!==undefined && prev!==o.result && o.result){
+        var typeStr=(o.order==='1'||o.order===1)?'매수':'매도';
+        toast(o.symbol+' '+typeStr+': '+o.result, o.result==='주문완료'?'success':'info');
+      }
+      prevResults[o.no]=o.result||'';
+    });
+    renderOrders(list);
+  }).catch(function(){});
+}
+
+function renderOrders(list){
+  if(!list.length){document.getElementById('order-list').innerHTML='<div class="empty">주문 내역이 없습니다</div>';return}
+  var html='<table class="order-table"><tr><th>No</th><th>유형</th><th>종목</th><th>수량</th><th>금액</th><th>가격</th><th>결과</th><th></th></tr>';
+  list.forEach(function(o){
+    var typeStr=(o.order==='1'||o.order===1)?'매수':'매도';
+    var res=o.result||'';
+    var cls='status-wait',label='대기';
+    if(res==='접수'){cls='status-accepted';label='접수됨'}
+    else if(res==='주문완료'){cls='status-done';label='완료'}
+    else if(res){cls='status-accepted';label=res}
+    html+='<tr>'+
+      '<td>'+o.no+'</td><td>'+typeStr+'</td><td>'+esc(o.symbol||'')+'</td>'+
+      '<td>'+(o.qty||'-')+'</td><td>'+(o.amount?Number(o.amount).toLocaleString():'-')+'</td>'+
+      '<td>'+(o.target_price||'시장가')+'</td>'+
+      '<td class="'+cls+'">'+label+'</td>'+
+      '<td>'+(res!=='주문완료'?'<button class="btn-sm btn-danger" onclick="cancelOrder('+o.no+')">취소</button>':'')+'</td>'+
+    '</tr>';
+  });
+  html+='</table>';
+  document.getElementById('order-list').innerHTML=html;
+}
+
+// --- Bulk Order ---
+function parseBulkText(){
+  var text=document.getElementById('bulk-text').value.trim();
+  if(!text)return[];
+  var lines=text.split('\n');
+  var results=[];
+  lines.forEach(function(line){
+    line=line.trim();
+    if(!line)return;
+    var cols=line.indexOf('\t')>=0?line.split('\t'):line.split(',');
+    cols=cols.map(function(c){return c.trim()});
+    function val(i){var v=cols[i]||'';return(v==='-'||v==='--'||v==='.')?'':v}
+    function numVal(i){var v=val(i);if(!v)return 0;return parseInt(v.replace(/[,\s]/g,''))||0}
+    var order=val(0),symbol=val(1),qty=numVal(2),amount=numVal(3),target_price=numVal(4),target=val(5)||'all',ord_type=val(6)||'auto';
+    if(!order||!symbol)return;
+    results.push({order:order,symbol:symbol,qty:qty,amount:amount,target_price:target_price,target:target,ord_type:ord_type});
+  });
+  return results;
+}
+
+function previewBulk(){
+  var orders=parseBulkText();
+  if(!orders.length){toast('파싱할 내용이 없습니다','error');return}
+  var html='<table class="order-table"><tr><th>#</th><th>유형</th><th>종목</th><th>수량</th><th>금액</th><th>가격</th><th>계좌</th><th>방식</th></tr>';
+  orders.forEach(function(o,i){
+    var typeStr=o.order==='1'?'매수':o.order==='2'?'매도':'?';
+    html+='<tr><td>'+(i+1)+'</td><td>'+typeStr+'</td><td>'+esc(o.symbol)+'</td><td>'+(o.qty||'-')+'</td><td>'+(o.amount?Number(o.amount).toLocaleString():'-')+'</td><td>'+(o.target_price||'시장가')+'</td><td>'+esc(o.target)+'</td><td>'+esc(o.ord_type)+'</td></tr>';
+  });
+  html+='</table>';
+  document.getElementById('bulk-preview').innerHTML=html;
+}
+
+function submitBulk(){
+  var orders=parseBulkText();
+  if(!orders.length){toast('파싱할 내용이 없습니다','error');return}
+  pendingAction={type:'bulk',orders:orders};
+  document.getElementById('pw-input').value='';
+  document.getElementById('pw-modal').classList.add('show');
+  setTimeout(function(){document.getElementById('pw-input').focus()},100);
+}
+
+function submitBulkOrders(pw,orders){
+  fetch('/api/orders',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:pw,orders:orders})}).then(function(r){
+    if(r.status===403){toast('비밀번호 불일치','error');return}
+    if(r.status===201){r.json().then(function(d){toast(d.count+'건 주문 접수 완료','success');document.getElementById('bulk-preview').innerHTML='';fetchOrders()});return}
+    r.json().catch(function(){return{}}).then(function(d){toast(d.error||'주문 실패','error')});
+  }).catch(function(){toast('통신 오류','error')});
+}
+
+// --- Init ---
+fetchTodos();
+setInterval(function(){if(document.getElementById('tab-order').classList.contains('active'))fetchOrders()},3000);
+
+document.getElementById('todo-title').addEventListener('keydown',function(e){if(e.key==='Enter')addTodo()});
+</script>
+</body>
+</html>

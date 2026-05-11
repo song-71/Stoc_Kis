@@ -2,6 +2,30 @@
 
 ---
 
+## [2026-05-11] <Phase1-hash>
+- **Category**: feat
+- **Title**: strategy_lab Phase 1 — LocalParquetProvider (우리 parquet → kis_backtest DataProvider 어댑터)
+- **Files**: `strategy_lab/data_adapters/local_parquet_provider.py` (신규), `strategy_lab/tests/test_local_parquet_provider.py` (신규), `strategy_lab/data_adapters/__init__.py` (+3줄)
+- **Changes**:
+  1. AI Extensions plugin 설치 보류 결정: cwd 강제(strategy_builder/backtester/), kis-prod-guard.sh의 /api/orders 차단, kis_devlp.yaml 충돌 회피. 대신 Claude 가 strategy_builder/backtester 코드를 직접 호출하는 구조로 전환.
+  2. `LocalParquetProvider` 구현: `kis_backtest.providers.base.DataProvider` Protocol 충족.
+     - `get_history(symbol, start, end, resolution=DAILY)`: polars lazy scan, symbol/date 필터, Bar 리스트 반환.
+     - `get_quote(symbol)`: 마지막 종가를 더미 호가(bid/ask)로 채워 반환.
+     - `subscribe_realtime(...)`: NotImplementedError (실시간은 ws_realtime_trading.py 담당).
+  3. symbol zfill(6) 자동 처리, 미존재 종목은 `[]` 또는 KeyError.
+  4. KIS API 인증 불필요, kis_devlp.yaml 불필요. 의존성: polars, pydantic.
+  5. 데이터 소스: `data/1d_data/kis_1d_unified_parquet_DB.parquet` (22컬럼 기존 파일).
+  6. pytest 7건 전부 PASSED: OHLC 정합성, zfill 자동화, 미존재 종목, MINUTE 미지원 등.
+  7. `strategy_lab/.venv` 분리: pandas 3.0.2, polars 1.40.1, pydantic 2.13.4, pytest 9.0.3.
+- **Impact**: 파케이 데이터를 backtester 어댑터로 공급하는 기반 완성. 운영 코드(ws_realtime_trading 계열) 무수정, 무영향. 다음(Phase 2): .kis.yaml 전략 작성 + LeanClient 백테스트 실행(Docker).
+
+## [2026-05-11] af19bc9
+- **Category**: feat
+- **Title**: strategy_lab Phase 0 — KIS open-trading-api subtree 흡수 + 골격
+- **Files**: strategy_lab/.gitignore, README.md, requirements.txt, strategies_local/__init__.py, data_adapters/__init__.py, tests/__init__.py, backtests/{configs,results,reports}/.gitkeep
+- **Changes**: strategy_lab/ 신규 폴더 생성. KIS 공식 GitHub(open_trading_api/)는 a42a7ec squash merge 로 별도 완료. 이번 commit 은 골격 파일(init, gitkeep, README, requirements) 9개.
+- **Impact**: 자연어 기반 전략 설계/백테스트 환경 기반 마련. 운영 코드(ws_realtime_trading 계열) 무수정, 단방향 데이터 공유 구조.
+
 ## [2026-05-08] 3078c8e
 - **Category**: refactor
 - **Title**: 잔고조회 출력을 계좌별 블록으로 분리

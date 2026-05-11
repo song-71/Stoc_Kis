@@ -565,9 +565,6 @@ REST_MAX_PER_SEC = 10
 REST_AFTER_WINDOW_DELAY = 0.1
 
 # 장중 미수신 감시 — REST 거래상태 확인
-# 단일 임계 정책: 모든 종목 IDLE 10초 → 1회 enqueue, 다음 WSS 틱 수신 전까지 재진입 차단
-STALE_CHECK_IDLE_SEC = 10       # 종목별 WSS 미수신 단일 임계(초)
-# (legacy) 아래 상수는 다른 경로(전체 WSS 끊김 등)에서 참조 가능성 있어 유지
 STALE_CHECK_SEC = 60            # 종목별 미수신 기준(초) → REST 상태 확인 트리거
 STALE_CHECK_HALTED_SEC = 300    # 거래중단 확인 후 재확인 간격(초)
 STALE_CHECK_VI_SEC = 30         # VI 발동 종목 재확인 간격(초)
@@ -5111,29 +5108,8 @@ def scheduler_loop():
                         _sub_info = ", ".join(
                             f"{k.__name__}:{len(v)}" for k, v in _desired.items() if v
                         )
-                        # 직전 NO_DATA_WARN_SEC 동안 수신/미수신 종목 분리
-                        # → 전면끊김(1006/1007) vs 특정 종목만 누락 구분
-                        _all_sub_codes: set[str] = set()
-                        for _v in _desired.values():
-                            _all_sub_codes |= _v
-                        _recv_thr = now_ts - NO_DATA_WARN_SEC
-                        _missed = [
-                            c for c in _all_sub_codes
-                            if _last_recv_ts.get(c, 0.0) < _recv_thr
-                        ]
-                        if _all_sub_codes and len(_missed) == len(_all_sub_codes):
-                            _miss_part = f" 전면끊김({len(_missed)}종목)"
-                        elif _missed:
-                            _miss_names = ",".join(
-                                code_name_map.get(c, c) for c in sorted(_missed)
-                            )
-                            _recv_n = len(_all_sub_codes) - len(_missed)
-                            _miss_part = f" 수신:{_recv_n}/미수신:{len(_missed)}[{_miss_names}]"
-                        else:
-                            _miss_part = ""
                         _notify(
-                            f"{ts_prefix()} {int(idle_sec)}초 데이터 미수신 → 재구독 시도 "
-                            f"({_sub_info}{_miss_part})"
+                            f"{ts_prefix()} {int(idle_sec)}초 데이터 미수신 → 재구독 시도 ({_sub_info})"
                         )
                         _last_no_data_warn_ts = now_ts
                     if idle_sec >= NO_DATA_REBUILD_SEC and (now_ts - _last_rebuild_ts) >= NO_DATA_REBUILD_SEC:
@@ -5871,17 +5847,14 @@ def _vi_exp_sub_switch(code: str) -> None:
     _vi_exp_sub_ts[code] = time.time()
     _vi_active_codes.add(code)
     name = code_name_map.get(code, code)
-    # snapshot pattern: lock 안에서는 _active_kws 참조만 캡쳐, send 는 lock 밖
-    # → dead socket 의 send 가 hang 해도 lock 점유 안 함 (260511 사고 재발 방지)
     with _kws_lock:
-        kws_snap = _active_kws
-    if kws_snap is not None:
-        try:
-            _send_subscribe(kws_snap, ccnl_krx, [code], "2")  # noqa: F405  실시간 해제
-            _send_subscribe(kws_snap, exp_ccnl_krx, [code], "1")  # noqa: F405  예상체결 구독
-            logger.info(f"{ts_prefix()} [VI전환] {name}({code}) ccnl→exp swap 완료")
-        except Exception as e:
-            logger.warning(f"{ts_prefix()} [VI전환] {name}({code}) swap 실패: {e}")
+        if _active_kws is not None:
+            try:
+                _send_subscribe(_active_kws, ccnl_krx, [code], "2")  # noqa: F405  실시간 해제
+                _send_subscribe(_active_kws, exp_ccnl_krx, [code], "1")  # noqa: F405  예상체결 구독
+                logger.info(f"{ts_prefix()} [VI전환] {name}({code}) ccnl→exp swap 완료")
+            except Exception as e:
+                logger.warning(f"{ts_prefix()} [VI전환] {name}({code}) swap 실패: {e}")
     try:
         _mkstatus_sub_add({code})
     except Exception as e:
@@ -5894,16 +5867,14 @@ def _vi_exp_sub_restore(code: str) -> None:
     _vi_active_codes.discard(code)
     _vi_exp_last_notify.pop(code, None)
     name = code_name_map.get(code, code)
-    # snapshot pattern: lock 안에서는 _active_kws 참조만 캡쳐, send 는 lock 밖
     with _kws_lock:
-        kws_snap = _active_kws
-    if kws_snap is not None:
-        try:
-            _send_subscribe(kws_snap, exp_ccnl_krx, [code], "2")  # noqa: F405  예상체결 해제
-            _send_subscribe(kws_snap, ccnl_krx, [code], "1")      # noqa: F405  실시간 복귀
-            logger.info(f"{ts_prefix()} [VI복구] {name}({code}) exp→ccnl 복귀 완료")
-        except Exception as e:
-            logger.warning(f"{ts_prefix()} [VI복구] {name}({code}) 복귀 실패: {e}")
+        if _active_kws is not None:
+            try:
+                _send_subscribe(_active_kws, exp_ccnl_krx, [code], "2")  # noqa: F405  예상체결 해제
+                _send_subscribe(_active_kws, ccnl_krx, [code], "1")      # noqa: F405  실시간 복귀
+                logger.info(f"{ts_prefix()} [VI복구] {name}({code}) exp→ccnl 복귀 완료")
+            except Exception as e:
+                logger.warning(f"{ts_prefix()} [VI복구] {name}({code}) 복귀 실패: {e}")
     # ── H0STMKO0 keep-alive 순환 (마켓당 1개 유지) ──
     market = _code_market_map.get(code, "")
     if market:
@@ -7150,13 +7121,12 @@ def _on_market_status_krx(result) -> None:
                         _notify(f"{ts_prefix()} [장운영] {market} 해제 — REST 폴링 재개", tele=True)
 
         # VI 발동/해제 감지 (vi_cls_code)
-        # H0STMKO0 PDF 기준 VI_CLS_CODE는 Y/N (Y=발동, N=해제)
-        vi_cls = str(row.get("vi_cls_code", "")).strip().upper()
-        if vi_cls in ("Y", "N"):
+        vi_cls = str(row.get("vi_cls_code", "")).strip()
+        if vi_cls:
             prev_vi = _vi_cls_cache.get(code, "")
             if vi_cls != prev_vi:
                 _vi_cls_cache[code] = vi_cls
-                if vi_cls == "Y":  # VI 발동
+                if vi_cls != "0":  # VI 발동 (정적VI=1, 동적VI=2, 정적+동적=3 등)
                     cnt = _vi_trigger_count.get(code, 0) + 1
                     _vi_trigger_count[code] = cnt
                     _vi_exp_sub_switch(code)
@@ -7164,25 +7134,33 @@ def _on_market_status_krx(result) -> None:
                     _vi_start_ts[code] = datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S")
                     _vi_end_ts.pop(code, None)
                     _market_event[code] = "VI발동"
-                    msg = f"{ts_prefix()} [VI발동] {name}({code}) vi_cls=Y ({cnt}회차)"
+                    msg = (f"{ts_prefix()} [VI발동] {name}({code}) "
+                           f"vi_cls={vi_cls} ({cnt}회차)")
                     logger.warning(msg)
                     _notify(msg, tele=True)
-                else:  # vi_cls == "N" → VI 해제 통보
-                    # ccnl 복귀는 120초 fallback에서만 처리 (여기서 _vi_exp_sub_restore 호출 X)
-                    now_dt = datetime.now(KST)
-                    recv_ts_us = now_dt.strftime("%Y-%m-%d %H:%M:%S.%f")
-                    _vi_end_ts[code] = recv_ts_us
-                    msg = (f"{ts_prefix()} [VI해제통보] {name}({code}) "
-                           f"recv_ts={recv_ts_us} vi_cls=N (즉시성 검증용 — ccnl 복귀는 120초 fallback)")
-                    logger.info(msg)
-                    _notify(msg, tele=True)
+                else:  # vi_cls == "0" → VI 해제
+                    _vi_exp_sub_restore(code)
+                    _vi_end_ts[code] = datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S")
                     _market_event.pop(code, None)
                     _vi_trigger_info.pop(code, None)
-                    # H0STMKO0 동적 해제 — 마켓당 최소 1개 유지 (보유 종목 보호 포함)
-                    try:
-                        _mkstatus_sub_remove_with_min(code)
-                    except Exception as e:
-                        logger.warning(f"{ts_prefix()} [VI해제] H0STMKO0 해제 실패 {code}: {e}")
+                    msg = (f"{ts_prefix()} [VI해제] {name}({code}) "
+                           f"vi_cls={vi_cls}")
+                    logger.info(msg)
+                    _notify(msg, tele=True)
+                    # H0STMKO0 동적 구독 해제 (keepalive/보유 종목 제외)
+                    keepalive_set = set(_mkt_keepalive_current.values())
+                    if code not in keepalive_set:
+                        held_codes_vi = set()
+                        try:
+                            with _str1_sell_state_lock:
+                                held_codes_vi = {c for c, st in _str1_sell_state.items() if not st.get("sold")}
+                        except Exception:
+                            pass
+                        if code not in held_codes_vi:
+                            try:
+                                _mkstatus_sub_remove({code})
+                            except Exception as e:
+                                logger.warning(f"{ts_prefix()} [VI해제] H0STMKO0 해제 실패 {code}: {e}")
 
 
 H0STMKO0_MAX_SLOTS: int = 5  # 데이터(ccnl/exp) 슬롯 ≥35 보장 위한 보수적 cap
@@ -7214,22 +7192,15 @@ def _mkstatus_sub_add(codes_to_add: set[str]) -> None:
         )
     if not new_codes:
         return
-    # snapshot pattern: lock 안에서는 _active_kws 참조만 캡쳐, send 는 lock 밖
     with _kws_lock:
-        kws_snap = _active_kws
-    if kws_snap is None:
-        return
-    try:
-        _send_subscribe(kws_snap, market_status_krx, list(new_codes), "1")  # noqa: F405
-        send_ok = True
-    except Exception as e:
-        send_ok = False
-        logger.warning(f"{ts_prefix()} [H0STMKO0] 구독 추가 실패: {e}")
-    if send_ok:
-        with _kws_lock:
-            _mkstatus_sub_codes.update(new_codes)
-        names = [f"{code_name_map.get(c, c)}({c})" for c in new_codes]
-        logger.info(f"{ts_prefix()} [H0STMKO0] 구독 추가: {', '.join(names)}")
+        if _active_kws is not None:
+            try:
+                _send_subscribe(_active_kws, market_status_krx, list(new_codes), "1")  # noqa: F405
+                _mkstatus_sub_codes.update(new_codes)
+                names = [f"{code_name_map.get(c, c)}({c})" for c in new_codes]
+                logger.info(f"{ts_prefix()} [H0STMKO0] 구독 추가: {', '.join(names)}")
+            except Exception as e:
+                logger.warning(f"{ts_prefix()} [H0STMKO0] 구독 추가 실패: {e}")
 
 
 def _mkstatus_sub_remove(codes_to_remove: set[str]) -> None:
@@ -7238,51 +7209,15 @@ def _mkstatus_sub_remove(codes_to_remove: set[str]) -> None:
     active = set(codes_to_remove) & _mkstatus_sub_codes
     if not active:
         return
-    # snapshot pattern: lock 안에서는 _active_kws 참조만 캡쳐, send 는 lock 밖
-    # → 260511 09:13:17 lock-holding-hang 사고 직접 원인 경로 차단
     with _kws_lock:
-        kws_snap = _active_kws
-    if kws_snap is None:
-        return
-    try:
-        _send_subscribe(kws_snap, market_status_krx, list(active), "2")  # noqa: F405
-        send_ok = True
-    except Exception as e:
-        send_ok = False
-        logger.warning(f"{ts_prefix()} [H0STMKO0] 구독 해제 실패: {e}")
-    if send_ok:
-        with _kws_lock:
-            _mkstatus_sub_codes -= active
-        names = [f"{code_name_map.get(c, c)}({c})" for c in active]
-        logger.info(f"{ts_prefix()} [H0STMKO0] 구독 해제: {', '.join(names)}")
-
-
-def _mkstatus_sub_remove_with_min(code: str) -> None:
-    """VI 해제 종목 H0STMKO0 해제. 마켓 내 마지막 1개라면 keep-alive로 유지.
-    보유 종목(매도 모니터링 중)은 별도 보호로 해제 안 함.
-    """
-    market = _code_market_map.get(code, "")
-    if not market:
-        return
-    held: set[str] = set()
-    try:
-        with _str1_sell_state_lock:
-            held = {c for c, st in _str1_sell_state.items() if not st.get("sold")}
-    except Exception:
-        pass
-    if code in held:
-        return
-
-    mkt_subs = [c for c in _mkstatus_sub_codes if _code_market_map.get(c, "") == market]
-    if len(mkt_subs) > 1:
-        _mkstatus_sub_remove({code})
-        remaining = [c for c in mkt_subs if c != code]
-        if remaining:
-            _mkt_keepalive_current[market] = remaining[0]
-        logger.info(f"{ts_prefix()} [H0STMKO0] {code} 해제 ({market}) — 잔여 {len(remaining)}개")
-    else:
-        _mkt_keepalive_current[market] = code
-        logger.info(f"{ts_prefix()} [H0STMKO0 keep-alive] {market} 마지막 종목 {code} 유지 — 사이드카/서킷 채널")
+        if _active_kws is not None:
+            try:
+                _send_subscribe(_active_kws, market_status_krx, list(active), "2")  # noqa: F405
+                _mkstatus_sub_codes -= active
+                names = [f"{code_name_map.get(c, c)}({c})" for c in active]
+                logger.info(f"{ts_prefix()} [H0STMKO0] 구독 해제: {', '.join(names)}")
+            except Exception as e:
+                logger.warning(f"{ts_prefix()} [H0STMKO0] 구독 해제 실패: {e}")
 
 
 def _avg_tick_interval(code: str) -> float:
@@ -7341,42 +7276,6 @@ def _inquire_vi_status_single(client: KisClient, code: str) -> tuple[bool, str, 
         return (False, "", "")
 
 
-def _process_vi_trigger(code: str, name: str, prc_output: dict) -> None:
-    """현재가 조회로 vi_cls_code=Y 확인 후 호출.
-    1) inquire-vi-status 1회 호출로 정확한 발동시각 획득
-    2) _vi_start_ts[code]에 ISO 시각 기록 → ingest worker가 parquet vi_start_ts 컬럼에 자동 기록
-    3) ccnl→exp swap + H0STMKO0 동적 추가 (_vi_exp_sub_switch)
-    4) 가격 row 기록
-    """
-    try:
-        vi_client = _price_client or _init_price_client()
-        is_vi, vi_time, vi_cls_detail = _inquire_vi_status_single(vi_client, code)
-    except Exception as e:
-        logger.warning(f"{ts_prefix()} [VI감지] {name}({code}) vi_status 조회 실패: {e}")
-        is_vi, vi_time, vi_cls_detail = True, "", ""
-
-    now = datetime.now(KST)
-    if vi_time and len(vi_time) == 6 and vi_time.isdigit():
-        vi_iso = now.strftime("%Y-%m-%d ") + f"{vi_time[:2]}:{vi_time[2:4]}:{vi_time[4:6]}"
-    else:
-        vi_iso = now.strftime("%Y-%m-%d %H:%M:%S")
-        vi_time = vi_time or now.strftime("%H%M%S")
-
-    _vi_trigger_info[code] = {"vi_time": vi_time, "vi_cls_code": vi_cls_detail or "1"}
-    _vi_start_ts[code] = vi_iso
-    _vi_end_ts.pop(code, None)
-    _market_event[code] = "VI발동"
-
-    _vi_exp_sub_switch(code)
-
-    msg = (f"{ts_prefix()} [VI발동-REST] {name}({code}) "
-           f"발동시각={vi_time} cls={vi_cls_detail or '?'} → 예상체결 전환")
-    logger.warning(msg)
-    _notify(msg, tele=True)
-
-    _enqueue_rest_price_row(code, prc_output)
-
-
 def _handle_stale_check_result(code: str, output: dict) -> None:
     """REST 상태확인(FHKST01010100) 결과로 종목 상태 판단 및 조치.
 
@@ -7396,14 +7295,6 @@ def _handle_stale_check_result(code: str, output: dict) -> None:
     def _status_notify(msg: str) -> None:
         sys.stdout.write("\n")
         _notify(msg)
-
-    # ── VI 발동 우선 분기 (vi_cls_code=Y) ─────────────────────────────
-    # 현재가 조회 응답에 vi_cls_code=Y 가 명시되면 곧바로 VI 처리 분기로 진입
-    # (temp_stop_yn=Y 와 별개로 VI 발동을 빠르게 캐치)
-    vi_cls_prc = str(output.get("vi_cls_code", "")).strip().upper()
-    if vi_cls_prc == "Y" and code not in _vi_exp_sub_ts:
-        _process_vi_trigger(code, name, output)
-        return
 
     # ── 장중 일시정지 (VI 등) → VI 상태 REST 조회 후 후속처리 ──
     if temp_stop == "Y":
@@ -7583,12 +7474,12 @@ def _price_watchdog_loop() -> None:
                         pass
 
         # ================================================================
-        # (C) 장중 종목별 미수신 감시 (09:10~15:30) — 단일 임계 정책
+        # (C) 장중 종목별 미수신 감시 (09:10~15:30)
         #     - WSS 전용 시각(_last_wss_recv_ts)으로 stale 판단
         #       (REST가 _last_recv_ts를 갱신해 WSS 미수신을 마스킹하는 문제 방지)
-        #     - 모든 종목 단일 임계 STALE_CHECK_IDLE_SEC (10초)
-        #     - 1회 enqueue 후 다음 WSS 틱 수신 전까지 재진입 차단
-        #       (재진입 차단 키: _last_stale_check_ts[c] vs _last_wss_recv_ts[c])
+        #     - WSS 한 번도 미수신 종목: STALE_CHECK_SEC(60초) 간격
+        #     - WSS 수신 이력 있는 종목: STALE_CHECK_INACTIVE_SEC(20초) 미수신 시만
+        #     - 거래정지 종목: STALE_CHECK_HALTED_SEC(300초) 간격
         # ================================================================
         if dtime(9, 10) <= now_t <= dtime(15, 30):
             with _lock:
@@ -7597,12 +7488,37 @@ def _price_watchdog_loop() -> None:
                         continue
                     last_wss = _last_wss_recv_ts.get(c, 0.0)
                     idle = (now - last_wss) if last_wss > 0 else (now - start_ts)
-                    if idle < STALE_CHECK_IDLE_SEC:
+
+                    # ── "갑자기 끊김" 감지: 활발히 거래되던 종목이 갑자기 멈춤 → VI 의심 ──
+                    avg_itv = _avg_tick_interval(c)
+                    if (avg_itv < 5.0
+                            and last_wss > 0
+                            and idle >= max(10.0, avg_itv * 3)
+                            and c not in _vi_exp_sub_ts
+                            and c not in _halted_codes):
+                        last_check = _last_stale_check_ts.get(c, 0.0)
+                        if (now - last_check) >= 10.0:
+                            _last_stale_check_ts[c] = now
+                            _rest_pending.add(c)
+                            try:
+                                _price_queue.put_nowait(("stale_check", c))
+                            except Exception:
+                                pass
+                            continue
+
+                    # 상태별 재확인 간격 적용
+                    if c in _halted_codes:
+                        check_interval = STALE_CHECK_HALTED_SEC    # 300초
+                    elif last_wss > 0:
+                        # WSS 수신 이력 있음 → 비활성 구간
+                        check_interval = STALE_CHECK_INACTIVE_SEC  # 20초
+                    else:
+                        # WSS 한 번도 미수신 → 빈번하게 확인
+                        check_interval = STALE_CHECK_SEC           # 60초
+                    if idle < check_interval:
                         continue
-                    # ── 재진입 차단 ──
-                    # 직전 stale_check 이후 WSS 틱이 한 번도 안 들어왔으면 큐에 다시 안 넣음
                     last_check = _last_stale_check_ts.get(c, 0.0)
-                    if last_check > 0 and last_wss <= last_check:
+                    if (now - last_check) < check_interval:
                         continue
                     _last_stale_check_ts[c] = now
                     _rest_pending.add(c)
@@ -7611,12 +7527,10 @@ def _price_watchdog_loop() -> None:
                     except Exception:
                         pass
 
-            # VI 예상체결가 구독 자동 복귀 (120초 경과 — fallback 주력 경로)
-            # H0STMKO0 vi_cls=N 통보는 즉시성 검증용 로그만 남기고 ccnl 복귀는 여기서 일임.
+            # VI 예상체결가 구독 자동 해제 (300초 경과 — H0STMKO0 감지 실패 시 fallback)
             for c in list(_vi_exp_sub_ts):
-                if (now - _vi_exp_sub_ts[c]) >= 120:
-                    _vi_exp_sub_restore(c)
-                    logger.info(f"{ts_prefix()} [VI 자동복귀] {c} 발동 후 120초 경과 → ccnl 복귀")
+                if (now - _vi_exp_sub_ts[c]) >= 300:
+                    _vi_exp_sub_unsub(c)
 
         if not wss_alive:
             # WSS 5초 이상 전체 미수신 → 연결 이상, 종목별 60초 간격 REST 상태확인

@@ -2,7 +2,7 @@
 
 ---
 
-## [2026-05-11] <Phase1-hash>
+## [2026-05-11] 0bd6f6d
 - **Category**: feat
 - **Title**: strategy_lab Phase 1 — LocalParquetProvider (우리 parquet → kis_backtest DataProvider 어댑터)
 - **Files**: `strategy_lab/data_adapters/local_parquet_provider.py` (신규), `strategy_lab/tests/test_local_parquet_provider.py` (신규), `strategy_lab/data_adapters/__init__.py` (+3줄)

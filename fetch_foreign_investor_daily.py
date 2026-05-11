@@ -7,11 +7,11 @@ unified parquet 에 append (기존 행 dedup).
 비용: 2500종목 × 1 호출 = ~2.5분 (rate limit 18 RPS + sleep 0.06)
 
 사용법:
-  python3 fetch_investor_daily.py                       # 오늘 데이터 수집
-  python3 fetch_investor_daily.py --date 20260424       # 특정 일자 강제 수집
+  python3 fetch_foreign_investor_daily.py                       # 오늘 데이터 수집
+  python3 fetch_foreign_investor_daily.py --date 20260424       # 특정 일자 강제 수집
 
 cron 등록 (예시):
-  30 16 * * 1-5 /home/ubuntu/Stoc_Kis/venv/bin/python /home/ubuntu/Stoc_Kis/fetch_investor_daily.py >> /home/ubuntu/Stoc_Kis/out/logs/investor_daily.log 2>&1
+  30 16 * * 1-5 /home/ubuntu/Stoc_Kis/venv/bin/python /home/ubuntu/Stoc_Kis/fetch_foreign_investor_daily.py >> /home/ubuntu/Stoc_Kis/out/logs/investor_daily.log 2>&1
 """
 import argparse
 import json

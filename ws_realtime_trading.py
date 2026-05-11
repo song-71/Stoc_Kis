@@ -145,7 +145,7 @@ OPEN_BUY_ORDER_CANCEL = True
 # 08:30~08:40 시간외 종가 추가 매수 (True: 전일 미매수 종목에 전일종가 지정가 ORD_DVSN=02 매수)
 MORNING_EXTRA_CLOSING_PR_BUY = False
 # 16:00~18:00 시간외 단일가 매수 (False: 16:01에 조기 종료)
-OVERTIME_SINGLE_PRICE_BUY = False
+OVERTIME_SINGLE_PRICE_BUY = True
 
 """
 실행/모니터링/종료 명령어
@@ -4099,7 +4099,9 @@ MAIN_WSS_BACKOFF_ALREADY_IN_USE_SEC: float = 90.0
 # [260506] WSS 자기보호 자동중단 — 핸드셰이크 N회 연속 실패 시 reconnect 중단 + 프로세스 종료
 # (KIS WSS 가 IP 단위 throttle 누적되기 전 자기측에서 끊어 IP 차단 자초 방지)
 # KRX 사이드카/서킷브레이커와는 무관 — KRX 정지 시 핸드셰이크는 정상이라 카운터 증가 안 함.
-HANDSHAKE_FAIL_SELF_STOP_LIMIT: int = 10
+# [260511] 임계 10 → 2 로 단축. SDK retry 10회 = 1 burst → dwell<15s 면 1 카운트.
+# 2 burst (약 22초) 안에 즉시 자체 종료 → ALREADY IN USE storm 의 origin 차단.
+HANDSHAKE_FAIL_SELF_STOP_LIMIT: int = 2
 
 # [260427] v5 진단 카운터 (5분 주기 INFO 로그) — 매수가 안 일어난 원인 추적
 _v5_diag_counters: dict[str, int] = {
@@ -11138,11 +11140,19 @@ def _shutdown(reason: str):
     _stop_event.set()
     _ws_rebuild_event.set()
     t0 = time.time()  # [260423] 단계별 경과시간 측정
-    # WSS 종료 (새 데이터 유입 차단)
+    # WSS 종료 (새 데이터 유입 차단) — snapshot pattern
+    # [260511] lock 안에서 _request_ws_close 호출하면 좀비 hang 시 close 자체가 hang
+    #         → KIS 측 ALREADY IN USE 잔재 유발. snapshot 으로 lock 즉시 풀고 lock 밖에서 close
     with _kws_lock:
-        if _active_kws is not None:
-            _request_ws_close(_active_kws)
-            _active_kws = None  # 다른 스레드의 추가 send 방지
+        kws_snap = _active_kws
+        _active_kws = None  # 다른 스레드의 추가 send 방지
+    if kws_snap is not None:
+        # close 자체도 dead socket 에서 hang 가능 → 별도 thread + 5초 timeout
+        _close_t = threading.Thread(target=_request_ws_close, args=(kws_snap,), daemon=True)
+        _close_t.start()
+        _close_t.join(timeout=5.0)
+        if _close_t.is_alive():
+            logger.warning(f"[shutdown] _request_ws_close 5s timeout — dead socket 추정, 계속 진행")
     t_wss = time.time()
     logger.info(f"[shutdown] (1/4) WSS 종료 완료 (+{t_wss-t0:.2f}s)")
     # ── 메모리 데이터 저장 (WSS 종료 후, 큐 소진 대기 → flush → snapshot) ──
@@ -11188,27 +11198,35 @@ def _request_ws_close(kws) -> None:
     # [260428] close frame 송신 전 active 구독 명시적 UNSUBSCRIBE 송신 → KIS 가 즉시 정리
     # → 재시작 시 ALREADY IN USE storm 차단. (이전: close 만 호출 → KIS 측 정리 지연)
     # 부모 main 의 _subscribed 만 대상 (a2 자식은 자체 cmd_queue 의 stop 으로 정리됨).
-    if kws is _active_kws:
-        try:
-            _name_to_req = {
-                "ccnl_krx": ccnl_krx,                  # noqa: F405
-                "exp_ccnl_krx": exp_ccnl_krx,          # noqa: F405
-                "ccnl_notice": ccnl_notice,            # noqa: F405
-                "overtime_ccnl_krx": overtime_ccnl_krx,        # noqa: F405
-                "overtime_exp_ccnl_krx": overtime_exp_ccnl_krx,# noqa: F405
-            }
-            for _name, _codes in list(_subscribed.items()):
-                _req = _name_to_req.get(_name)
-                if not _req or not _codes:
-                    continue
-                try:
-                    _send_subscribe(kws, _req, list(_codes), "2")  # tr_type=2 → UNSUBSCRIBE
-                except Exception as _e:
-                    logger.debug(f"{ts_prefix()} [shutdown] UNSUBSCRIBE 실패 ({_name}): {_e}")
-            # KIS 가 UNSUBSCRIBE 처리할 시간 (close frame 전 짧은 dwell)
-            time.sleep(0.5)
-        except Exception as _e:
-            logger.debug(f"{ts_prefix()} [shutdown] UNSUBSCRIBE 단계 skip: {_e}")
+    # [260511] kws is _active_kws 체크 제거 — _shutdown 이 _active_kws=None 으로 먼저
+    #         설정 후 호출하므로, 항상 _subscribed 기반으로 UNSUBSCRIBE 시도.
+    #         각 send 는 1초 thread timeout 으로 dead socket hang 방지.
+    try:
+        _name_to_req = {
+            "ccnl_krx": ccnl_krx,                  # noqa: F405
+            "exp_ccnl_krx": exp_ccnl_krx,          # noqa: F405
+            "ccnl_notice": ccnl_notice,            # noqa: F405
+            "overtime_ccnl_krx": overtime_ccnl_krx,        # noqa: F405
+            "overtime_exp_ccnl_krx": overtime_exp_ccnl_krx,# noqa: F405
+        }
+        for _name, _codes in list(_subscribed.items()):
+            _req = _name_to_req.get(_name)
+            if not _req or not _codes:
+                continue
+            # send 자체도 dead socket 에서 hang 가능 → thread + 1s timeout
+            _ut = threading.Thread(
+                target=_send_subscribe,
+                args=(kws, _req, list(_codes), "2"),
+                daemon=True,
+            )
+            _ut.start()
+            _ut.join(timeout=1.0)
+            if _ut.is_alive():
+                logger.debug(f"{ts_prefix()} [shutdown] UNSUBSCRIBE timeout ({_name})")
+        # KIS 가 UNSUBSCRIBE 처리할 시간 (close frame 전 짧은 dwell)
+        time.sleep(0.5)
+    except Exception as _e:
+        logger.debug(f"{ts_prefix()} [shutdown] UNSUBSCRIBE 단계 skip: {_e}")
 
     # close frame 송신 (KISWebSocket.close default timeout=10.0)
     for attr in ("close", "shutdown"):

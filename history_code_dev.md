@@ -2,6 +2,13 @@
 
 ---
 
+## [2026-05-12] afd1fa2
+- **Category**: chore(ops)
+- **Title**: 운영 토글 기본값 복원 (TARGET_DATE, OPTION)
+- **Files**: `ws_merge_wss_parts.py`, `ws_realtime_trading_Restart.py`
+- **Changes**: TARGET_DATE "260507" → "" (오늘 날짜 자동), OPTION 2 → 1 (재시작 모드) — 5/7 임시 설정 완료 후 기본값 복원
+- **Impact**: 운영 설정 복원. 코드 로직 변경 없음.
+
 ## [2026-05-12] 09380eb
 - **Category**: fix
 - **Title**: H0STCNI0 체결통보 복호화 누락 버그 수정 — 복호화 분기 강건화 + 진단 로그 추가

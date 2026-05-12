@@ -4467,6 +4467,63 @@ def _format_external_order_intake_msg(order: dict, idx: int) -> str:
             f"{action} {name_part}{qty_part}{price_part}{ot_part}")
 
 
+def _cleanup_failed_external_orders_at_startup() -> None:
+    """프로그램 시작 직후(08:30 이전) 1회 호출: config.json 의 failed 외부주문 정리.
+
+    - `external_orders` 배열에서 result.startswith("failed") 항목을 모두 삭제
+    - 각 건마다 로그, 합계 로그 1회 (0건이면 무로그)
+    - 08:30 이후엔 동작 안 함 (장 시작 후 발생한 failed 는 알림/수동 처리 대상)
+    """
+    try:
+        if datetime.now(KST).time() >= dtime(8, 30):
+            return
+        cfg = _read_cfg()
+        if not cfg:
+            return
+        ext_orders = cfg.get("external_orders")
+        if not ext_orders or not isinstance(ext_orders, list):
+            return
+
+        removed = 0
+        kept: list = []
+        for order in ext_orders:
+            if not isinstance(order, dict):
+                kept.append(order)
+                continue
+            _result = str(order.get("result", "")).strip()
+            if not _result.startswith("failed"):
+                kept.append(order)
+                continue
+            # failed 건 → 로그 후 제외
+            try:
+                _no = order.get("no", "?")
+                _sym_raw = str(order.get("symbol", "")).strip()
+                _code_resolved = (_parse_codes(_sym_raw) or [_sym_raw])[0]
+                _name = _code_name_map().get(_code_resolved, _sym_raw)
+                _qty = int(order.get("target_qty") or order.get("qty") or 0)
+                _amt = float(order.get("amount", 0) or 0)
+                logger.info(
+                    f"{ts_prefix()} [외부주문][시작cleanup] 삭제: "
+                    f"종목={_name}({_code_resolved}) 수량={_qty} 금액={_amt:,.0f} result={_result}"
+                )
+            except Exception as _e:
+                logger.info(
+                    f"{ts_prefix()} [외부주문][시작cleanup] 삭제: order={order} "
+                    f"(로그 구성 오류: {_e})"
+                )
+            removed += 1
+
+        if removed > 0:
+            if kept:
+                cfg["external_orders"] = kept
+            else:
+                cfg.pop("external_orders", None)
+            save_config(cfg, str(CONFIG_PATH))
+            logger.info(f"{ts_prefix()} [외부주문][시작cleanup] {removed}건 정리 완료")
+    except Exception as e:
+        logger.warning(f"{ts_prefix()} [외부주문][시작cleanup] 처리 오류: {e}")
+
+
 def _check_external_orders() -> None:
     """config.json의 external_orders 배열 모니터링 → 주문 실행.
 
@@ -4475,12 +4532,20 @@ def _check_external_orders() -> None:
       target_price(0=시장가, "상한가"/"하한가" 키워드 가능), ord_type, result, target_qty, remain_qty
 
     ord_type (생략 시 auto):
-      auto/""    : target_price=0→시장가(01), target_price>0→지정가(00)
+      auto/""    : 현재 시각 기준 자동 매핑
+                    <08:55           : 대기 (08:55까지)
+                    08:55~15:30      : 시장가(01) 또는 지정가(00, target_price>0)
+                    15:30~15:40      : 대기 (15:40까지)
+                    15:40~16:00      : 장후시간외종가(06), 가격 미입력
+                    16:00~18:00      : 시간외단일가(07),
+                                       target_price 없으면 REST 로 상한가 자동 조회
+                    >=18:00          : 대기 (다음날 08:55까지)
       pre_market : 장전시간외종가(05), 08:30~08:40, 전일종가 자동체결
       post_market: 장후시간외종가(06), 15:40~16:00, 당일종가 자동체결
       overtime   : 시간외단일가(07), 16:00~18:00, target_price 필수
 
     result 진행: "" → "접수" → "주문완료" → 삭제
+                          → "failed: ..." → 1회 텔레그램 알림 후 유지 (수동 처리)
     """
     global _last_external_order_ts
     now_ts = time.time()
@@ -4508,6 +4573,9 @@ def _check_external_orders() -> None:
 
             # ── 접수 단계: 빈 result → "접수" ──
             if result == "":
+                # 재주문 진입: 이전 실패/대기 플래그 reset (재실패 시 다시 알림 받기 위함)
+                order.pop("_failed_notified", None)
+                order.pop("_time_wait_logged", None)
                 order["result"] = "접수"
                 changed = True
                 logger.info(f"{ts_prefix()} [외부주문] config raw: {order}")
@@ -4527,8 +4595,49 @@ def _check_external_orders() -> None:
                 changed = True
                 continue
 
-            # ── 완료 정리: "주문완료" → 삭제 대기 (다음 사이클) ──
+            # ── 실패 처리: "failed: ..." → 1회 텔레그램 알림 후 config 유지 ──
+            if result.startswith("failed"):
+                if not order.get("_failed_notified"):
+                    try:
+                        _no = order.get("no", idx + 1)
+                        _sym_raw = str(order.get("symbol", "")).strip()
+                        _code_resolved = (_parse_codes(_sym_raw) or [_sym_raw])[0]
+                        _name = _code_name_map().get(_code_resolved, _sym_raw)
+                        _qty = int(order.get("target_qty") or order.get("qty") or 0)
+                        _amt = float(order.get("amount", 0) or 0)
+                        _fail_msg = (
+                            f"{ts_prefix()} [외부주문] #{_no} 실패: 종목={_name}({_code_resolved}) "
+                            f"수량={_qty} 금액={_amt:,.0f} result={result} — "
+                            f"config 에서 result 를 빈값(\"\")으로 수정 시 재주문"
+                        )
+                    except Exception as _e:
+                        _fail_msg = (
+                            f"{ts_prefix()} [외부주문] #{order.get('no', idx + 1)} 실패: result={result} "
+                            f"— config 에서 result 를 빈값(\"\")으로 수정 시 재주문 (메시지 구성 오류: {_e})"
+                        )
+                    _notify(_fail_msg, tele=True)
+                    logger.warning(_fail_msg)
+                    order["_failed_notified"] = True
+                    changed = True
+                continue
+
+            # ── 완료 정리: "주문완료" → 결과 로그 후 삭제 대기 ──
             if result == "주문완료":
+                try:
+                    _no = order.get("no", idx + 1)
+                    _sym_raw = str(order.get("symbol", "")).strip()
+                    _code_resolved = (_parse_codes(_sym_raw) or [_sym_raw])[0]
+                    _name = _code_name_map().get(_code_resolved, _sym_raw)
+                    _t_qty = int(order.get("target_qty") or order.get("qty") or 0)
+                    logger.info(
+                        f"{ts_prefix()} [외부주문] #{_no} 완료 정리: "
+                        f"종목={_name}({_code_resolved}) 수량={_t_qty} 결과={result} → config 삭제"
+                    )
+                except Exception as _e:
+                    logger.info(
+                        f"{ts_prefix()} [외부주문] #{order.get('no', idx + 1)} 완료 정리: "
+                        f"결과={result} → config 삭제 (로그 구성 오류: {_e})"
+                    )
                 completed_indices.append(idx)
 
         # 완료 항목 삭제 (역순)
@@ -4556,7 +4665,14 @@ def _exec_external_order(cfg: dict, order: dict, idx: int) -> None:
     Phase 4-4: target 필드로 대상 계좌 지정. "all"이면 전체 계좌에 주문.
 
     ord_type 옵션 (생략 시 auto):
-      auto / ""  : target_price=0 → 시장가(01), target_price>0 → 지정가(00)
+      auto / ""  : 현재 시각 기준 자동 매핑
+                    <08:55       : 대기 (08:55까지)
+                    08:55~15:30  : 시장가(01) (target_price=0) / 지정가(00) (target_price>0)
+                    15:30~15:40  : 대기 (15:40까지)
+                    15:40~16:00  : 장후시간외종가(06), target_price 무시
+                    16:00~18:00  : 시간외단일가(07),
+                                   target_price 없으면 REST 상한가(stck_mxpr) 자동 조회
+                    >=18:00      : 대기 (다음날 08:55까지)
       pre_market : 장전시간외종가(05), 08:30~08:40, 전일종가 자동체결, 가격 미입력
       post_market: 장후시간외종가(06), 15:40~16:00, 당일종가 자동체결, 가격 미입력
       overtime   : 시간외단일가(07), 16:00~18:00, target_price 필수
@@ -4640,37 +4756,95 @@ def _exec_external_order(cfg: dict, order: dict, idx: int) -> None:
         "post_market": ("06", "장후시간외종가"),
         "overtime": ("07", "시간외단일가"),
     }
+    _now_dt = datetime.now(KST)
+    _now_t = _now_dt.time()
+    _now_hm = _now_dt.strftime("%H%M")
+    _no_for_log = order.get("no", idx + 1)
+
     if ord_type in _ORD_TYPE_MAP:
+        # ── 명시 ord_type: 기존 동작 그대로 유지 ──
         ord_dvsn, ord_label = _ORD_TYPE_MAP[ord_type]
         # 05/06은 가격 미입력, 07은 target_price 필수
         if ord_dvsn == "07" and target_price <= 0:
             order["result"] = f"failed: 시간외단일가(07)는 target_price 필수"
             return
         price_val = target_price if ord_dvsn == "07" else 0
+
+        # ── 명시 ord_type 시간 윈도우 체크 (대기) ──
+        _ORD_TIME_WINDOW = {
+            "05": ("0830", "0840", "장전시간외종가(05)는 08:30~08:40"),
+            "06": ("1540", "1600", "장후시간외종가(06)는 15:40~16:00"),
+            "07": ("1600", "1800", "시간외단일가(07)는 16:00~18:00"),
+        }
+        if ord_dvsn in _ORD_TIME_WINDOW:
+            _t_start, _t_end, _t_desc = _ORD_TIME_WINDOW[ord_dvsn]
+            if _now_hm < _t_start or _now_hm >= _t_end:
+                # 아직 시간이 안 됐으면 "접수" 상태 유지 → 다음 사이클에서 재시도
+                order["result"] = "접수"
+                if not order.get("_time_wait_logged"):
+                    logger.info(f"{ts_prefix()} [외부주문] #{_no_for_log} 시간 대기 중: {_t_desc} (현재={_now_hm})")
+                    order["_time_wait_logged"] = True
+                return
     else:
-        # auto (기본): target_price=0 → 시장가(01), target_price>0 → 지정가(00)
+        # ── auto (기본) / 빈값: 현재 시각 기준 자동 매핑 ──
         if ord_type and ord_type != "auto":
             logger.warning(f"{ts_prefix()} [외부주문] 미인식 ord_type='{ord_type}' → auto 처리")
-        ord_dvsn = "01" if target_price == 0 else "00"
-        ord_label = "시장가" if ord_dvsn == "01" else "지정가"
-        price_val = target_price if target_price > 0 else 0
 
-    # ── 주문 가능 시간 체크 (장 시간 외이면 대기) ──
-    _now_hm = datetime.now(KST).strftime("%H%M")
-    _ORD_TIME_WINDOW = {
-        "05": ("0830", "0840", "장전시간외종가(05)는 08:30~08:40"),
-        "06": ("1540", "1600", "장후시간외종가(06)는 15:40~16:00"),
-        "07": ("1600", "1800", "시간외단일가(07)는 16:00~18:00"),
-        "00": ("0830", "1530", "지정가(00)는 08:30~15:30(동시호가 포함)"),
-        "01": ("0900", "1530", "시장가(01)는 09:00~15:30(장중)"),
-    }
-    if ord_dvsn in _ORD_TIME_WINDOW:
-        _t_start, _t_end, _t_desc = _ORD_TIME_WINDOW[ord_dvsn]
-        if _now_hm < _t_start or _now_hm >= _t_end:
+        # 시각별 분기:
+        #   < 08:55          : 대기 (08:55 까지)
+        #   08:55 ~ 15:30    : 시장가(01) 또는 지정가(00, target_price>0)
+        #   15:30 ~ 15:40    : 대기 (15:40 까지)
+        #   15:40 ~ 16:00    : 장후시간외종가(06), 가격 미입력
+        #   16:00 ~ 18:00    : 시간외단일가(07), target_price 없으면 상한가 자동 조회
+        #   >= 18:00         : 대기 (다음날 08:55 까지)
+        _wait_reason: str | None = None
+        if _now_t < dtime(8, 55):
+            _wait_reason = "08:55까지"
+        elif _now_t < dtime(15, 30):
+            # 08:55 ~ 15:30 : 동시호가(08:55~09:00) 시장가 + 장중(09:00~15:30) 시장가/지정가
+            ord_dvsn = "01" if target_price == 0 else "00"
+            ord_label = "시장가" if ord_dvsn == "01" else "지정가"
+            price_val = target_price if target_price > 0 else 0
+        elif _now_t < dtime(15, 40):
+            _wait_reason = "15:40까지"
+        elif _now_t < dtime(16, 0):
+            # 15:40 ~ 16:00 : 장후시간외종가(06), target_price 무시
+            ord_dvsn = "06"
+            ord_label = "장후시간외종가"
+            price_val = 0
+        elif _now_t < dtime(18, 0):
+            # 16:00 ~ 18:00 : 시간외단일가(07)
+            ord_dvsn = "07"
+            ord_label = "시간외단일가"
+            if target_price > 0:
+                price_val = target_price
+            else:
+                # target_price 미지정 → REST inquire_price 로 상한가(stck_mxpr) 조회
+                try:
+                    _any_acct = next(iter(_iter_enabled_accounts()), None)
+                    if _any_acct:
+                        _pc = _init_account_client(_any_acct)
+                        _resp = _pc.inquire_price(code)
+                        _mxpr = float(str(_resp.get("stck_mxpr") or 0).replace(",", "") or 0)
+                        if _mxpr <= 0:
+                            order["result"] = "failed: 시간외단일가(07) 상한가 조회 실패"
+                            return
+                        price_val = _mxpr
+                        logger.info(f"{ts_prefix()} [외부주문] #{_no_for_log} 시간외단일가 상한가 자동조회: {code} = {price_val:,.0f}")
+                    else:
+                        order["result"] = "failed: 시간외단일가(07) 상한가 조회용 계좌 없음"
+                        return
+                except Exception as _e:
+                    order["result"] = f"failed: 시간외단일가(07) 상한가 조회 오류: {_e}"
+                    return
+        else:
+            _wait_reason = "다음날 08:55까지"
+
+        if _wait_reason is not None:
             # 아직 시간이 안 됐으면 "접수" 상태 유지 → 다음 사이클에서 재시도
             order["result"] = "접수"
             if not order.get("_time_wait_logged"):
-                logger.info(f"{ts_prefix()} [외부주문] 시간 대기 중: {_t_desc} (현재={_now_hm})")
+                logger.info(f"{ts_prefix()} [외부주문] #{_no_for_log} 시간 대기 중: {_wait_reason} (현재={_now_hm})")
                 order["_time_wait_logged"] = True
             return
 
@@ -4741,6 +4915,8 @@ def _exec_external_order(cfg: dict, order: dict, idx: int) -> None:
                     logger.warning(f"{ts_prefix()} [외부주문] ordno 추적 등록 실패: {_e}")
 
         except Exception as e:
+            _last_err_msg = str(e)
+            order["_last_error"] = f"[{alias}] {_last_err_msg}"
             logger.warning(f"{ts_prefix()} [외부주문] #{order.get('no',idx+1)} [{alias}] 실패: {e}")
 
     if success_count > 0:
@@ -4750,7 +4926,8 @@ def _exec_external_order(cfg: dict, order: dict, idx: int) -> None:
         if order_type == 1 and order.get("no_sell"):
             _add_no_sell_code(sym.zfill(6), source="external_order")
     else:
-        order["result"] = f"failed: {len(target_accounts)}계좌 전부 실패"
+        _err_tail = order.get("_last_error", "")
+        order["result"] = f"failed: {len(target_accounts)}계좌 전부 실패" + (f" ({_err_tail})" if _err_tail else "")
 
 
 def scheduler_loop():
@@ -4758,6 +4935,8 @@ def scheduler_loop():
     global _overtime_real_active, _overtime_real_last_progress_ts, _vi_delayed_codes, _vi_delay_until, _last_overtime_real_slot
     global _end_time_reached, _active_kws
     logger.info(f"{ts_prefix()} [scheduler] started")
+    # ── 시작 시 cleanup: 08:30 이전이면 config 의 failed 외부주문 정리 (1회) ──
+    _cleanup_failed_external_orders_at_startup()
     # [260423] WSS 무수신 watchdog 상태
     _process_start_ts = time.time()
     _wss_recv_alert_sent = False

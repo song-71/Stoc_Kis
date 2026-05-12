@@ -2,6 +2,16 @@
 
 ---
 
+## [2026-05-12] 2ec4aae
+- **Category**: fix
+- **Title**: 외부주문 auto 시간대 자동 매핑 + failed 처리 강건화
+- **Files**: `ws_realtime_trading.py`
+- **Changes**:
+  1. **`_exec_external_order`**: `ord_type="auto"` 또는 빈값 시 현재 시각 기준 자동 분기. `<08:55` → 대기, `08:55~15:30` → 시장가(01)/지정가(00), `15:30~15:40` → 대기, `15:40~16:00` → 장후시간외종가(06), `16:00~18:00` → 시간외단일가(07, target_price 없으면 REST inquire_price 로 stck_mxpr 상한가 자동조회), `>=18:00` → 대기. 명시 ord_type(`pre_market`/`post_market`/`overtime`)은 기존 동작 보존. `_last_error` 필드로 계좌별 마지막 에러 보존 → `failed` result 에 사유 합산.
+  2. **`_check_external_orders`**: `result.startswith("failed")` 분기 신규 추가 — `_failed_notified` 플래그로 1회만 텔레그램+로그 발송, config 유지. 실패 메시지에 종목명/수량/금액/result/재주문 가이드 포함. `result == "주문완료"` pop 직전 결과 로그 추가. 빈 result 재진입 시 `_failed_notified`/`_time_wait_logged` 플래그 reset.
+  3. **`_cleanup_failed_external_orders_at_startup` (신규)**: 프로그램 시작 시 1회, 08:30 이전이면 config.json 의 `failed` 외부주문 삭제 (각 건 로그, 0건이면 무로그). `scheduler_loop` 진입 직후 호출.
+- **Impact**: 사용자 의도한 동시호가(08:55~09:00) 매수가 시장가로 즉시 발주됨. failed 주문은 1회 텔레그램 알림 + config 유지로 추적 가능. 장 전 기동 시 전날 failed 잔재 자동 정리.
+
 ## [2026-05-12] afd1fa2
 - **Category**: chore(ops)
 - **Title**: 운영 토글 기본값 복원 (TARGET_DATE, OPTION)

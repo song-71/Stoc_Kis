@@ -2,6 +2,21 @@
 
 ---
 
+## [2026-05-12] 09380eb
+- **Category**: fix
+- **Title**: H0STCNI0 체결통보 복호화 누락 버그 수정 — 복호화 분기 강건화 + 진단 로그 추가
+- **Files**: `kis_auth_llm.py` (수정), `ws_realtime_trading.py` (수정), `test_wss_simple.py` (수정), `test_wss_subscribe.py` (신규)
+- **Changes**:
+  1. **버그 원인**: KIS H0STCNI0 (실시간 체결통보) 는 스펙상 항상 암호화 전송. 그러나 기존 코드는 `dm["encrypt"] == "Y"` 분기로만 복호화를 판단해, SUBSCRIBE 응답 파싱이 실패하면 `dm["encrypt"]` 가 미설정 상태가 되어 복호화를 건너뜀. 결과적으로 Base64 암호문이 `^` split 없이 첫 컬럼 cust_id 에 통째로 들어가고 나머지 필드는 모두 None.
+  2. **증상 (2026-05-12 종일)**: 체결통보 텔레그램 알림 미발송. 종가매수 9건 접수 후 체결 여부를 알 수 없는 상태. 잔고검증 폴백(`_run_closing_balance_verification`)이 자동 보완 — `[15:31_종가체결] 잔고검증 완료(4822) — 변동 없음` 정상 출력.
+  3. **그 외 WSS 정상 동작 확인**: H0STMKO0 시장상태 수신, ccnl_krx 체결가, exp_ccnl_krx 예상체결가 등 나머지 WSS 채널은 종일 정상 동작.
+  4. **복호화 분기 강건화 (`kis_auth_llm.py` `__subscriber`)**: `should_decrypt = (raw[0] == "1") or (dm["encrypt"] == "Y")` — KIS 프레임 헤더 raw[0]가 "1" 이면 dm 상태 무관하게 복호화 시도. key/iv 미등록 시 `logging.error` (tr_id 별 1회, `_decrypt_warn_emitted` 플래그) 후 `continue`. 복호화 예외도 `logging.error` 후 `continue`.
+  5. **진단 로그 (`kis_auth_llm.py`)**: `system_resp()` 전체 try/except 감싸기 + 파싱 실패 시 raw 첫 200자 로깅. H0STCNI0 SUBSCRIBE 응답 시 rt_cd/encrypt/iv_len/ekey_len 1회 로깅 (개인키 노출 방지 — 길이만). `add_data_map()` 호출 시 before/after 상태 진단 로그. `__subscriber` H0STCNI0 첫 프레임 도착 시 1회 진단 로깅 (`_h0stcni0_diag_logged` 플래그).
+  6. **H0STCNI0 핸들러 가드 (`ws_realtime_trading.py`)**: `_h0stcni0_decrypt_warn_sent` 플래그 추가. 핸들러 진입부에서 cust_id 가 Base64 형태(길이>20 또는 `/+=` 포함)이면 복호화 실패 정황으로 보고 텔레그램 1회 경고 발송.
+  7. **외부주문 체결 매칭 (`ws_realtime_trading.py`)**: `_external_order_track` / `_external_order_track_lock` 추가. 체결통보 수신 시 ordno 기반으로 외부주문 매칭 → 텔레그램 알림. `_format_external_order_intake_msg()` 헬퍼 함수 추가.
+  8. **진단 도구 (`test_wss_simple.py`, `test_wss_subscribe.py`)**: `ws_subscribe_send_test()` (핸드셰이크 + subscribe + 5초 응답 모니터링), `ws_force_cleanup_attempt()` (ALREADY IN USE 잔재 UNSUBSCRIBE → 재시도). `test_wss_subscribe.py` 신규 — 운영 본체와 동일 흐름으로 2종목/15초 dwell 독립 검증.
+- **Impact**: H0STCNI0 체결통보가 정상적으로 복호화되어 체결 알림 텔레그램 발송 재개. 향후 SUBSCRIBE 응답 파싱 실패가 발생해도 raw 헤더 기반으로 복호화 수행하므로 동일 사고 방지. 잔고검증 폴백은 여전히 백업 수단으로 유지.
+
 ## [2026-05-11] a8e1f49
 - **Category**: feat
 - **Title**: strategy_lab Phase 2.1 — 모멘텀 데이트레이딩 전략 + DAY_TRADE 액션

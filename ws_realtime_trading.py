@@ -145,7 +145,7 @@ OPEN_BUY_ORDER_CANCEL = True
 # 08:30~08:40 시간외 종가 추가 매수 (True: 전일 미매수 종목에 전일종가 지정가 ORD_DVSN=02 매수)
 MORNING_EXTRA_CLOSING_PR_BUY = False
 # 16:00~18:00 시간외 단일가 매수 (False: 16:01에 조기 종료)
-OVERTIME_SINGLE_PRICE_BUY = True
+OVERTIME_SINGLE_PRICE_BUY = False
 
 """
 실행/모니터링/종료 명령어
@@ -2320,6 +2320,11 @@ def _write_ccnl_notice_log(df, recv_ts: str) -> None:
 
 _closing_filled_by_code: dict[str, int] = {}  # code -> 체결 누적 수량 (H0STCNI0 체결 시 갱신)
 
+# ── H0STCNI0 복호화 실패 의심 경고 1회 발송 플래그 (260512) ──
+# cust_id 가 평문 HTS ID 가 아닌 Base64 형태이면 복호화가 실패한 정황으로 보고
+# 텔레그램으로 1회만 알림 (스팸 방지).
+_h0stcni0_decrypt_warn_sent: bool = False
+
 
 # ── H0STCNI0 종목별 구독 관리 ──────────────────────────────────────────────────
 _ccnl_notice_sub_codes: set[str] = set()  # 종목별 H0STCNI0 구독 중인 종목코드
@@ -2481,6 +2486,24 @@ def _on_ccnl_notice_filled(df, recv_ts: str) -> None:
                     _handle_uplimit_ccnl_fill(code, seln, qty, fill_pr, name_fill, recv_ts)
                 except Exception as _e:
                     logger.warning(f"{ts_prefix()} [uplimit_ccnl] {name_fill}({code}) 처리 오류: {_e}")
+
+            # 외부주문 체결 매칭 (ordno 가 _external_order_track 에 있을 때만 알림)
+            try:
+                _ext_ordno = str(row.get("oder_no") or row.get("odno") or row.get("ord_no") or "").strip()
+                if _ext_ordno:
+                    with _external_order_track_lock:
+                        _ext_info = _external_order_track.get(_ext_ordno)
+                    if _ext_info:
+                        _ext_amt = qty * fill_pr
+                        _ext_msg = (
+                            f"{ts_prefix()} [외부주문] #{_ext_info['no']} [{_ext_info['alias']}] 체결: "
+                            f"{_ext_info['action']} {_ext_info['name']}({_ext_info['code']}) "
+                            f"{qty}주 × {fill_pr:,.0f}원 = {_ext_amt:,.0f}원 ordno={_ext_ordno}"
+                        )
+                        _notify(_ext_msg, tele=True)
+                        logger.info(_ext_msg)
+            except Exception as _e:
+                logger.warning(f"{ts_prefix()} [외부주문] 체결 매칭 오류: {_e}")
 
             if seln in ("01", "1"):  # 매도
                 _closing_filled_by_code[code] = max(0, _closing_filled_by_code.get(code, 0) - qty)
@@ -4371,6 +4394,78 @@ def _check_strategy_swap() -> None:
 # ── 외부 주문 주입 (Phase 4-3) ───────────────────────────────────────────────
 _last_external_order_ts: float = 0.0
 
+# 외부주문 ordno → 매칭 정보 (체결통보 수신 시 식별용)
+# {ordno: {"no": int, "alias": str, "code": str, "name": str,
+#          "action": "매수"|"매도", "qty": int, "ord_dvsn": str, "price": float, "ts": float}}
+# TODO: 24시간 이상 오래된 항목은 다음 거래일 첫 사이클에 cleanup
+_external_order_track: dict[str, dict] = {}
+_external_order_track_lock = threading.Lock()
+
+
+def _format_external_order_intake_msg(order: dict, idx: int) -> str:
+    """외부주문 1차 접수 텔레그램 메시지 구성 (종목명/계좌/수량/가격 포함)."""
+    no = order.get("no", idx + 1)
+    sym = str(order.get("symbol", "")).strip()
+    order_type = int(order.get("order", 0) or 0)
+    action = "매수" if order_type == 1 else ("매도" if order_type == 2 else "?")
+    target = order.get("target", "all")
+    if isinstance(target, list):
+        target_desc = ",".join(str(t) for t in target)
+    else:
+        target_desc = str(target or "all")
+
+    # 종목명 lookup — 실패해도 절대 죽지 않음
+    name_part = sym
+    try:
+        parsed = _parse_codes(sym)
+        if parsed:
+            code = parsed[0]
+            nm = code_name_map.get(code, "") if isinstance(code_name_map, dict) else ""
+            if not nm:
+                try:
+                    nm = _code_name_map().get(code, "") or ""
+                except Exception:
+                    nm = ""
+            name_part = f"{nm}({code})" if nm else code
+    except Exception:
+        name_part = sym
+
+    # qty / amount
+    qty = int(order.get("qty", 0) or 0)
+    amount = float(order.get("amount", 0) or 0)
+    if qty > 0:
+        qty_part = f" qty={qty}"
+    elif amount > 0:
+        qty_part = f" amt={amount:,.0f}"
+    else:
+        qty_part = ""
+
+    # target_price
+    raw_tp = order.get("target_price", 0)
+    if isinstance(raw_tp, str):
+        _tp_str = raw_tp.strip()
+        if _tp_str in ("상한가", "하한가"):
+            price_part = f" price={_tp_str}"
+        else:
+            try:
+                _tp_num = float(_tp_str or 0)
+                price_part = " price=시장가" if _tp_num == 0 else f" price={_tp_num:,.0f}"
+            except Exception:
+                price_part = f" price={_tp_str}" if _tp_str else " price=시장가"
+    else:
+        try:
+            _tp_num = float(raw_tp or 0)
+            price_part = " price=시장가" if _tp_num == 0 else f" price={_tp_num:,.0f}"
+        except Exception:
+            price_part = " price=시장가"
+
+    # ord_type — 빈값/auto 면 생략
+    ot = str(order.get("ord_type", "")).strip()
+    ot_part = "" if ot == "" or ot.lower() == "auto" else f" ord_type={ot}"
+
+    return (f"{ts_prefix()} [외부주문] #{no} 접수: [{target_desc}] "
+            f"{action} {name_part}{qty_part}{price_part}{ot_part}")
+
 
 def _check_external_orders() -> None:
     """config.json의 external_orders 배열 모니터링 → 주문 실행.
@@ -4415,12 +4510,15 @@ def _check_external_orders() -> None:
             if result == "":
                 order["result"] = "접수"
                 changed = True
-                sym = str(order.get("symbol", "")).strip()
-                ot = str(order.get("ord_type", "")).strip()
-                ot_desc = f" [{ot}]" if ot else ""
                 logger.info(f"{ts_prefix()} [외부주문] config raw: {order}")
-                _notify(f"{ts_prefix()} [외부주문] #{order.get('no',idx+1)} 접수: "
-                        f"{'매수' if order.get('order')==1 else '매도'} {sym}{ot_desc}", tele=True)
+                try:
+                    _intake_msg = _format_external_order_intake_msg(order, idx)
+                except Exception as _e:
+                    sym = str(order.get("symbol", "")).strip()
+                    _intake_msg = (f"{ts_prefix()} [외부주문] #{order.get('no',idx+1)} 접수: "
+                                   f"{'매수' if order.get('order')==1 else '매도'} {sym}")
+                    logger.warning(f"{ts_prefix()} [외부주문] intake msg 구성 오류: {_e}")
+                _notify(_intake_msg, tele=True)
                 continue  # 다음 루프에서 실행
 
             # ── 실행 단계: "접수" → 주문 실행 → "주문완료" ──
@@ -4623,6 +4721,24 @@ def _exec_external_order(cfg: dict, order: dict, idx: int) -> None:
                 )
             except Exception:
                 pass
+
+            # 외부주문 ordno 추적 (체결통보 매칭용)
+            if ordno:
+                try:
+                    with _external_order_track_lock:
+                        _external_order_track[str(ordno).strip()] = {
+                            "no": order.get("no", idx + 1),
+                            "alias": alias,
+                            "code": code,
+                            "name": name,
+                            "action": action,
+                            "qty": qty,
+                            "ord_dvsn": ord_dvsn,
+                            "price": price_val,
+                            "ts": time.time(),
+                        }
+                except Exception as _e:
+                    logger.warning(f"{ts_prefix()} [외부주문] ordno 추적 등록 실패: {_e}")
 
         except Exception as e:
             logger.warning(f"{ts_prefix()} [외부주문] #{order.get('no',idx+1)} [{alias}] 실패: {e}")
@@ -10701,6 +10817,26 @@ def on_result(ws, tr_id, result, data_info):
     trid = str(tr_id)
     if trid == "H0STCNI0":
         recv_ts = datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S.%f")
+
+        # ── [260512] 복호화 실패 가드 (1회 텔레그램 알림) ──
+        # 정상: cust_id = 평문 HTS ID (영숫자 8~12자, 예: 'sywems12')
+        # 비정상: cust_id 가 Base64 암호문 (길이 >20 + '/', '+', '=' 포함)
+        # → 체결통보 미수신 위험을 사용자에게 즉시 통지
+        global _h0stcni0_decrypt_warn_sent
+        if not _h0stcni0_decrypt_warn_sent and len(result) > 0:
+            try:
+                sample_cust_id = str(result.row(0, named=True).get("cust_id") or "")
+                if len(sample_cust_id) > 20 or any(c in sample_cust_id for c in "/+="):
+                    _h0stcni0_decrypt_warn_sent = True
+                    warn_msg = (
+                        f"{ts_prefix()} ★★ [체결통보] H0STCNI0 복호화 실패 의심: "
+                        f"cust_id 가 평문 HTS ID 가 아닌 Base64 형태 — 체결통보 미수신 위험"
+                    )
+                    logger.error(warn_msg)
+                    _notify(warn_msg, tele=True)
+            except Exception:
+                pass
+
         _write_ccnl_notice_log(result, recv_ts)
         # ── 가독성 로그 ──
         for row in result.to_dicts():

@@ -624,22 +624,38 @@ def system_resp(data):
     tr_key = None
     encrypt, iv, ekey = None, None, None
 
-    rdic = json.loads(data)
+    try:
+        rdic = json.loads(data)
 
-    tr_id = rdic["header"]["tr_id"]
-    if tr_id != "PINGPONG":
-        tr_key = rdic["header"]["tr_key"]
-        encrypt = rdic["header"]["encrypt"]
-    if rdic.get("body", None) is not None:
-        isOk = True if rdic["body"]["rt_cd"] == "0" else False
-        tr_msg = rdic["body"]["msg1"]
-        # 복호화를 위한 key 를 추출
-        if "output" in rdic["body"]:
-            iv = rdic["body"]["output"]["iv"]
-            ekey = rdic["body"]["output"]["key"]
-        isUnSub = True if tr_msg[:5] == "UNSUB" else False
-    else:
-        isPingPong = True if tr_id == "PINGPONG" else False
+        tr_id = rdic["header"]["tr_id"]
+        if tr_id != "PINGPONG":
+            tr_key = rdic["header"]["tr_key"]
+            encrypt = rdic["header"]["encrypt"]
+        if rdic.get("body", None) is not None:
+            isOk = True if rdic["body"]["rt_cd"] == "0" else False
+            tr_msg = rdic["body"]["msg1"]
+            # 복호화를 위한 key 를 추출
+            if "output" in rdic["body"]:
+                iv = rdic["body"]["output"]["iv"]
+                ekey = rdic["body"]["output"]["key"]
+            isUnSub = True if tr_msg[:5] == "UNSUB" else False
+        else:
+            isPingPong = True if tr_id == "PINGPONG" else False
+
+        # ── [diag] H0STCNI0 SUBSCRIBE 응답 진단 로그 (key/iv 값은 로깅 금지, 길이만) ──
+        if tr_id == "H0STCNI0" and not isPingPong:
+            try:
+                rt_cd_val = rdic.get("body", {}).get("rt_cd") if rdic.get("body") else None
+                logging.info(
+                    f"[diag] H0STCNI0 SUBSCRIBE resp: rt_cd={rt_cd_val!r} "
+                    f"msg={tr_msg!r} encrypt={encrypt!r} "
+                    f"iv_len={len(iv) if iv else 0} ekey_len={len(ekey) if ekey else 0}"
+                )
+            except Exception as _diag_e:
+                logging.warning(f"[diag] H0STCNI0 SUBSCRIBE resp diag log 실패: {_diag_e}")
+    except Exception as e:
+        logging.error(f"[diag] H0STCNI0 system_resp 파싱 실패: {e} raw={str(data)[:200]}")
+        raise
 
     nt2 = namedtuple(
         "SysMsg",
@@ -703,6 +719,12 @@ def add_open_map(
 
 data_map: dict = {}
 
+# ── [diag] H0STCNI0 첫 프레임 도착 시 1회만 진단 로깅 (스팸 방지) ──
+_h0stcni0_diag_logged: bool = False
+
+# ── 복호화 불가 경고 1회 발송 추적 (tr_id 별로 1회만 logging.error) ──
+_decrypt_warn_emitted: dict = {}
+
 
 def add_data_map(
         tr_id: str,
@@ -711,6 +733,20 @@ def add_data_map(
         key: str = None,
         iv: str = None,
 ):
+    # ── [diag] H0STCNI0 호출 시 before 상태 캡처 (key/iv 는 길이만) ──
+    before_summary = None
+    if tr_id == "H0STCNI0":
+        try:
+            _before = data_map.get(tr_id) or {}
+            before_summary = {
+                "columns_len": len(_before.get("columns") or []),
+                "encrypt": _before.get("encrypt"),
+                "key_len": len(_before.get("key")) if _before.get("key") else 0,
+                "iv_len": len(_before.get("iv")) if _before.get("iv") else 0,
+            }
+        except Exception as _diag_e:
+            logging.warning(f"[diag] add_data_map H0STCNI0 before 캡처 실패: {_diag_e}")
+
     if data_map.get(tr_id, None) is None:
         data_map[tr_id] = {"columns": [], "encrypt": False, "key": None, "iv": None}
 
@@ -725,6 +761,24 @@ def add_data_map(
 
     if iv is not None:
         data_map[tr_id]["iv"] = iv
+
+    # ── [diag] H0STCNI0 호출 시 after 상태 + 호출 인자 로깅 ──
+    if tr_id == "H0STCNI0":
+        try:
+            _after = data_map.get(tr_id) or {}
+            after_summary = {
+                "columns_len": len(_after.get("columns") or []),
+                "encrypt": _after.get("encrypt"),
+                "key_len": len(_after.get("key")) if _after.get("key") else 0,
+                "iv_len": len(_after.get("iv")) if _after.get("iv") else 0,
+            }
+            logging.info(
+                f"[diag] add_data_map H0STCNI0 before={before_summary} after={after_summary} "
+                f"called_with encrypt={encrypt!r} "
+                f"key_len={len(key) if key else 0} iv_len={len(iv) if iv else 0}"
+            )
+        except Exception as _diag_e:
+            logging.warning(f"[diag] add_data_map H0STCNI0 after 로깅 실패: {_diag_e}")
 
 
 class KISWebSocket:
@@ -783,8 +837,44 @@ class KISWebSocket:
 
                     dm = data_map[tr_id]
                     d = d1[3]
-                    if dm.get("encrypt", None) == "Y":
-                        d = aes_cbc_base64_dec(dm["key"], dm["iv"], d)
+
+                    # ── [diag] H0STCNI0 첫 프레임 도착 시 1회만 진단 로깅 ──
+                    global _h0stcni0_diag_logged
+                    if tr_id == "H0STCNI0" and not _h0stcni0_diag_logged:
+                        try:
+                            logging.warning(
+                                f"[diag] H0STCNI0 first frame: raw[0]={raw[0]!r} "
+                                f"dm_encrypt={dm.get('encrypt')!r} "
+                                f"key_present={bool(dm.get('key'))} "
+                                f"iv_present={bool(dm.get('iv'))} "
+                                f"payload_len={len(d)} payload_prefix={d[:40]!r}"
+                            )
+                        except Exception as _diag_e:
+                            logging.warning(f"[diag] H0STCNI0 first frame 로깅 실패: {_diag_e}")
+                        _h0stcni0_diag_logged = True
+
+                    # ── 복호화 분기 강건화 (260512) ──
+                    # KIS 프레임 헤더 raw[0]=='1' 은 암호화 프레임. dm["encrypt"]=="Y" 와 OR 로 판단.
+                    # H0STCNI0 (체결통보) 는 KIS 스펙상 항상 암호화이므로,
+                    # SUBSCRIBE 응답 파싱이 실패해 dm["encrypt"] 가 미설정인 경우라도
+                    # raw[0]=='1' 만 보고 복호화 수행하여 첫 컬럼에 Base64 한 덩어리가 들어가는 사고 방지.
+                    should_decrypt = (raw[0] == "1") or (dm.get("encrypt") == "Y")
+                    if should_decrypt:
+                        if not dm.get("key") or not dm.get("iv"):
+                            # key/iv 가 없는데 KIS 가 암호화 프레임을 보냄 → 복호화 불가
+                            if not _decrypt_warn_emitted.get(tr_id):
+                                logging.error(
+                                    f"[ws] {tr_id} 암호화 프레임 수신했으나 key/iv 미등록 — 복호화 불가. "
+                                    f"raw[0]={raw[0]} dm_encrypt={dm.get('encrypt')!r}"
+                                )
+                                _decrypt_warn_emitted[tr_id] = True
+                            # 복호화 못 하므로 이 프레임은 스킵 (잘못된 데이터 파싱 방지)
+                            continue
+                        try:
+                            d = aes_cbc_base64_dec(dm["key"], dm["iv"], d)
+                        except Exception as e:
+                            logging.error(f"[ws] {tr_id} 복호화 실패: {e}")
+                            continue
 
                     # ── 여러 건 데이터 처리: KIS는 N건을 ^로 연결해서 보냄 ──
                     # 컬럼 수로 나눠 각 건을 개별 행으로 분리 (duplicate cols 방지)

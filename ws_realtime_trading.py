@@ -451,7 +451,7 @@ sys.modules["kis_auth"] = ka
 
 from domestic_stock_functions_ws import *  # noqa: F403,E402
 import json  # noqa: E402
-from kis_utils import is_holiday, load_config, load_symbol_master, save_config, calc_limit_up_price, price_minus_one_tick, price_plus_n_ticks, print_table, KRX_code_batch  # noqa: E402
+from kis_utils import is_holiday, load_config, load_symbol_master, save_config, calc_limit_up_price, price_minus_one_tick, price_plus_n_ticks, round_to_tick, print_table, KRX_code_batch  # noqa: E402  # [260513] uplimit 스톱주문 호가 반올림 누락 복구
 from ws_realtime_tr_str1 import (  # noqa: E402  (상한가 근접 매수 + 종가 폭락 필터 포함)
     check_opening_call_auction_sell, check_opening_call_auction_cancel, check_realtime_sell,
     vi_buy_strategy, vi_should_cancel, check_vi_sell,
@@ -10280,8 +10280,8 @@ def _check_uplimit_v4_from_tick(
                     last_5m_avg_vol_per_min=last5m_avg,
                     min_since_25pct_cross=min_since_cross,
                     vola_10d=_uplimit_vola_10d.get(code),
-                    bid_sum_top5=bid_sum,
-                    ask_sum_top5=ask_sum,
+                    bid_total=bid_total,           # [260513] NameError(bid_sum) 복구 → 함수 시그니처(bid_total) 와 일치
+                    ask_total=ask_total,           # [260513] NameError(ask_sum) 복구 → 함수 시그니처(ask_total) 와 일치
                     volume_power=volume_power,
                     frgn_3d_net=frgn_3d,
                     prev_day_prdy_ctrt=_uplimit_prev_day_ctrt.get(code, 0.0),

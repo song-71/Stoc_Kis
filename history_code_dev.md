@@ -2,6 +2,17 @@
 
 ---
 
+## [2026-05-13] db98da9
+- **Category**: fix
+- **Title**: 260513 1007 frame error 차단 + SDK 폭주 재시도 차단 (좀비 세션 근본 원인 차단)
+- **Files**: `ws_realtime_trading.py`
+- **Changes**:
+  - **인과 chain**: 오전 1007은 자동 회복. 15:26 이후 1007 직후 SDK `__runner`가 동일 `approval_key`로 1초 간격 8회 폭주 재시도 → KIS throttle(invalid approval storm) → 슬롯 잠금 → 자기보호중단. 1007 자체가 아니라 *후속 재시도 패턴*이 진짜 원인.
+  - **[A] UTF-8 lenient monkey-patch (L422~484)**: `WebSocketCommonProtocol.read_message` wrap → `UnicodeDecodeError` 발생 시 경고 로그 후 빈 문자열 반환. 추가로 `_ws_lp.codecs.getincrementaldecoder`를 lenient 버전으로 로컬 치환(글로벌 codecs 무변경) → fragmentation 경로에서도 `errors="replace"` 강제. 효과: 깨진 한글 1글자가 `?` 치환되어 1007 close 자체 발생 안 함.
+  - **[B] max_retries=10 → 1 (L11973)**: `KISWebSocket(max_retries=1)` — SDK `__runner`의 retry 루프가 인스턴스 수명 동안 리셋 안 됨. 1007 후 10초 폭주 발생 경로 차단. 이제 exception 즉시 `kws.start()` 반환 → outer `run_ws_forever` backoff+`auth_ws` 재발급 루프 진입.
+  - **[C] invalid approval → kws.close() 즉시 호출 (L12020~12035)**: `_on_system` 내 `"invalid approval"` 분기 끝에 `kws.close()` 추가. `_close_requested=True` 세팅으로 SDK `__runner` while 루프 즉시 종료 → KIS throttle 추가 악화 방지. max_retries=1의 이중 안전망.
+- **Impact**: 이 패치 적용 후엔 1007 발생 시에도 appkey 재발급 의식(매일 수동 확인) 없이 자동 회복되어야 함. 잔여 검증: 실제 1007 케이스에서 운영 로그의 `[utf8-lenient] decode skip` 출현 여부 모니터링.
+
 ## [2026-05-13] 386ded6
 - **Category**: fix
 - **Title**: 260513 잠복 NameError 2건 복구 (round_to_tick import / v5 qualify 호가 누적값)

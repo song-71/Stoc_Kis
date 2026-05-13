@@ -2,6 +2,20 @@
 
 ---
 
+## [2026-05-13] e3da250
+- **Category**: fix
+- **Title**: 260513 1007 → invalid approval throttle 사건 대응 — 장 중반 사망 + 재시작 불가 복구
+- **Files**: `ws_realtime_trading.py`
+- **Changes**:
+  - **사건 개요 (260513 15:26~15:28)**: KIS WSS 1007 frame error (`unexpected end of data at position 702`) → 동일 approval_key(`c91b6f6c-...`)로 invalid approval 8회 연속 수신 → handshake_fail 2회 → `_wss_self_stop` 호출 → `os._exit(0)` → `runner.sh`가 정상종료로 오인, 재시작 안 함 → 장 중반 프로세스 사망 방치.
+  - **직접 사망 원인**: `os._exit(0)` — runner.sh의 exit_code 분기에서 0은 "정상종료"로 처리되어 watchdog 재시작 로직 비진입.
+  - **수정 1** (`_wss_self_stop`, L≈11453): `os._exit(0)` → `os._exit(2)`. runner.sh의 `exit_code -eq 2` watchdog 강제종료 분기 진입 → 프로세스 재시작 보장.
+  - **수정 2** (`_on_system` 내부, L≈11934): `"invalid approval"` 키워드 감지 시 `_main_last_invalid_approval_ts` 기록 + 30s 스팸가드 텔레그램 알림 발송.
+  - **수정 3** (`run_ws_forever`, L≈11785): `attempt > 1` 재접속 분기에서 `auth_ws()` 호출 직전, `_main_last_invalid_approval_ts` 기준 60s 이내면 잔여 시간 backoff (0.1s 단위 stop_event 응답).
+  - **수정 4** (`HANDSHAKE_FAIL_SELF_STOP_LIMIT`, L≈4130): 2 → 4 완화. 1007 throttle 폭주가 2 burst 안에 회복 불가한 상황에서 4 burst(약 60초+)로 invalid approval backoff 동작 시간 확보.
+  - **수정 5** (전역, L≈4120): `_main_last_invalid_approval_ts: float = 0.0` 및 `MAIN_WSS_BACKOFF_INVALID_APPROVAL_SEC: float = 60.0` 신규 추가.
+- **Impact**: 1007 frame error → invalid approval 폭주 패턴에서 (a) 프로세스 종료 후 runner가 반드시 재시작, (b) 재접속 시 throttle 해소까지 대기하여 새 approval_key 발급 유도. 잔여 리스크: 60s backoff가 불충분할 경우 운영 모니터링 후 `MAIN_WSS_BACKOFF_INVALID_APPROVAL_SEC` 값 상향 조정 필요.
+
 ## [2026-05-12] 2ec4aae
 - **Category**: fix
 - **Title**: 외부주문 auto 시간대 자동 매핑 + failed 처리 강건화

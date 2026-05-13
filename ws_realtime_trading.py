@@ -4117,14 +4117,21 @@ _main_last_already_in_use_ts: float = 0.0
 # [260506] 핸드셰이크 실패(dwell<15s) 다발 시점. ALREADY IN USE 와는 별도로 추적해서
 # 로그/원인 진단을 정확히 분리한다. (예전엔 같은 변수 재사용해서 오인 진단 발생)
 _main_last_handshake_fail_ts: float = 0.0
+# [260513] invalid approval 감지 시점. 1007 frame error 직후 KIS 측이 동일 appkey 에
+# 같은 approval_key 를 짧게 재발급(throttle)하는 패턴 대응 — 감지 시 60s backoff 강제.
+_main_last_invalid_approval_ts: float = 0.0
 MAIN_WSS_BACKOFF_ALREADY_IN_USE_SEC: float = 90.0
+MAIN_WSS_BACKOFF_INVALID_APPROVAL_SEC: float = 60.0
 
 # [260506] WSS 자기보호 자동중단 — 핸드셰이크 N회 연속 실패 시 reconnect 중단 + 프로세스 종료
 # (KIS WSS 가 IP 단위 throttle 누적되기 전 자기측에서 끊어 IP 차단 자초 방지)
 # KRX 사이드카/서킷브레이커와는 무관 — KRX 정지 시 핸드셰이크는 정상이라 카운터 증가 안 함.
 # [260511] 임계 10 → 2 로 단축. SDK retry 10회 = 1 burst → dwell<15s 면 1 카운트.
 # 2 burst (약 22초) 안에 즉시 자체 종료 → ALREADY IN USE storm 의 origin 차단.
-HANDSHAKE_FAIL_SELF_STOP_LIMIT: int = 2
+# [260513] 2 → 4 완화. 260513 15:26 사건: 1007 frame error → invalid approval throttle 폭주로
+# 2 burst 안에 회복 불가 → 장 중반 사망. 4 burst (약 60초+) 안에 invalid approval backoff 가
+# 동작할 시간을 확보.
+HANDSHAKE_FAIL_SELF_STOP_LIMIT: int = 4
 
 # [260427] v5 진단 카운터 (5분 주기 INFO 로그) — 매수가 안 일어난 원인 추적
 _v5_diag_counters: dict[str, int] = {
@@ -11418,9 +11425,12 @@ def _set_runtime_status(status: int) -> None:
 
 # [260506] WSS 자기보호 자동중단 — 핸드셰이크 실패 N회 연속 시 호출
 def _wss_self_stop(reason: str, count: int) -> None:
+    # [260513] exit=0 → exit=2 변경. runner.sh 는 exit=0 을 "정상 종료"로 인식해
+    # 재시작하지 않았으므로 (260513 15:28 사건: 장 중반 사망 후 부활 불가),
+    # 비정상 종료(exit=2, watchdog 강제종료 분기)로 통일해 runner 가 재시작하도록 한다.
     msg = (
         f"{ts_prefix()} [ws][자기보호중단] KIS WSS 핸드셰이크 {count}회 연속 실패 → "
-        f"IP throttle 회피를 위해 reconnect 중단 + 프로세스 종료.\n"
+        f"IP throttle 회피를 위해 reconnect 중단 + 프로세스 종료 (exit=2, runner 재시작 유도).\n"
         f"  사유: {reason}\n"
         f"  ※ 시장 사이드카/서킷브레이커와 무관 — 자기측 connection 보호용"
     )
@@ -11443,7 +11453,7 @@ def _wss_self_stop(reason: str, count: int) -> None:
         pass
     _set_runtime_status(RUNTIME_STATUS_STOPPED)
     time.sleep(0.5)
-    os._exit(0)
+    os._exit(2)
 
 
 # =============================================================================
@@ -11737,6 +11747,7 @@ def _desired_subscription_map(now: datetime) -> dict:
 
 def run_ws_forever():
     global _close_force_stopped, _main_last_already_in_use_ts, _main_last_handshake_fail_ts
+    global _main_last_invalid_approval_ts
     backoff = 2
     attempt = 0
 
@@ -11774,6 +11785,22 @@ def run_ws_forever():
 
             # 재연결 시 접속키(approval_key) 갱신 - htsid 만료 방지
             if attempt > 1:
+                # [260513] invalid approval 직후엔 KIS 가 같은 approval_key 재발급(throttle)함.
+                # auth_ws 호출 전 충분히 대기하여 새 approval_key 가 나오도록 한다.
+                _elapsed_inv_appr = time.time() - _main_last_invalid_approval_ts
+                if _elapsed_inv_appr < MAIN_WSS_BACKOFF_INVALID_APPROVAL_SEC:
+                    _wait_inv = MAIN_WSS_BACKOFF_INVALID_APPROVAL_SEC - _elapsed_inv_appr
+                    logger.warning(
+                        f"{ts_prefix()} [ws] invalid approval 감지 후 "
+                        f"{_wait_inv:.1f}s backoff → throttle 해소 대기 (auth_ws 전)"
+                    )
+                    # 단계적 sleep (stop event 빠른 응답)
+                    for _ in range(int(_wait_inv * 10)):
+                        if _stop_event.is_set():
+                            break
+                        time.sleep(0.1)
+                    if _stop_event.is_set():
+                        break
                 try:
                     ka.auth_ws(svr="prod")
                     logger.info(f"{ts_prefix()} [ws] auth_ws 재발급 완료")
@@ -11879,7 +11906,7 @@ def run_ws_forever():
                 _active_kws = kws
 
             def _on_system(rsp):
-                global _main_last_already_in_use_ts
+                global _main_last_already_in_use_ts, _main_last_invalid_approval_ts
                 if rsp.isOk and rsp.tr_msg and "SUCCESS" in rsp.tr_msg:
                     if getattr(rsp, "tr_id", "") == "H0STCNI0" and attempt == 2:
                         _notify(f"{ts_prefix()} [체결통보] 재접속 완료", tele=True)
@@ -11907,6 +11934,22 @@ def run_ws_forever():
                         # [260428] ALREADY IN USE 감지 → 장기 backoff 트리거 (a2 와 동일 패턴)
                         if "ALREADY IN USE" in msg:
                             _main_last_already_in_use_ts = time.time()
+                        # [260513] invalid approval 감지 → 60s backoff 트리거.
+                        # 1007 frame error 직후 KIS 가 동일 appkey 에 같은 approval_key 를
+                        # 짧은 시간 내 반복 발급(throttle)하므로, 충분히 대기 후 재발급해야
+                        # 새 approval_key 가 나옴. 스팸 방지: 직전 30초 내 알림은 생략.
+                        elif "invalid approval" in msg.lower():
+                            _now_ts = time.time()
+                            _spam_gap = _now_ts - _main_last_invalid_approval_ts
+                            _main_last_invalid_approval_ts = _now_ts
+                            if _spam_gap > 30.0:
+                                _notify(
+                                    f"{ts_prefix()} [ws] ★ invalid approval 감지 "
+                                    f"(tr_id={rsp.tr_id}) → "
+                                    f"{MAIN_WSS_BACKOFF_INVALID_APPROVAL_SEC:.0f}s backoff 후 "
+                                    f"approval_key 재발급 예정",
+                                    tele=True,
+                                )
 
             kws.on_system = _on_system
 

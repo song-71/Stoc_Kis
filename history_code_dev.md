@@ -2,6 +2,16 @@
 
 ---
 
+## [2026-05-13] 386ded6
+- **Category**: fix
+- **Title**: 260513 잠복 NameError 2건 복구 (round_to_tick import / v5 qualify 호가 누적값)
+- **Files**: `ws_realtime_trading.py`
+- **Changes**:
+  - **[L454] `round_to_tick` import 누락 복구**: `_setup_stop_limit_orders` 함수에서 상한가 29.5% 도달 시 스톱 지정가 주문 가격 계산(29%/28%/27% 호가 반올림)에 사용. 호출 첫 줄에서 즉시 NameError로 실패했을 코드 경로.
+  - **[L10283~84] `check_uplimit_v5_qualify` 호출 키워드·변수명 교정**: `bid_sum_top5=bid_sum` → `bid_total=bid_total`, `ask_sum_top5=ask_sum` → `ask_total=ask_total`. 함수 실제 시그니처(`ws_realtime_tr_str1.py:691-692`)가 `bid_total`/`ask_total` 키워드를 받으며, `_check_uplimit_v4_from_tick` 내부 10142~10143에서 이미 `bid_total`/`ask_total`로 정의된 변수를 사용하도록 수정.
+  - 두 건 모두 live trading 경로, try/except 마스킹으로 조용히 실패해왔을 가능성 있음. Pylance 진단으로 사전 발견 (py_compile PASS).
+- **Impact**: 스톱 지정가 주문 가격 계산 정상화 + v5 매수 qualify 호가 누적값 정상 전달. 기존엔 해당 경로 진입 시 NameError로 try/except 흡수 후 매수 보류 상태였을 것.
+
 ## [2026-05-13] e3da250
 - **Category**: fix
 - **Title**: 260513 1007 → invalid approval throttle 사건 대응 — 장 중반 사망 + 재시작 불가 복구

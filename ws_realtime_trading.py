@@ -419,6 +419,69 @@ logger.addFilter(DropReceivedMessageFilter())
 # 라이브러리/모듈 로거에도 필터 적용 (WARNING:domestic_stock_functions_ws... 같은 것도 정리)
 logging.getLogger("domestic_stock_functions_ws").addFilter(DropReceivedMessageFilter())
 
+# [260513] websockets UTF-8 strict 디코딩 lenient 패치
+# ────────────────────────────────────────────────────────────────────────
+# KIS WSS 가 깨진 한글 바이트(invalid UTF-8 시퀀스)가 섞인 텍스트 프레임을 송신하면
+# python websockets 가 strict 디코딩에 실패 → UnicodeDecodeError → fail_connection
+# (close code 1007) → 연결 끊김. 1007 자체는 치명적이진 않으나 직후 SDK 재시도가
+# 폭주하면 KIS throttle 모드(invalid approval storm)로 빠짐. 깨진 1글자 손실을
+# 감수하고 errors="replace" 로 디코딩하여 1007 발생 자체를 차단한다.
+#
+# wrap 대상: WebSocketCommonProtocol.read_message
+#   - 단일 프레임 경로(라인 1030: frame.data.decode())
+#   - fragmentation 경로(라인 1036~1037: codecs.getincrementaldecoder("utf-8", errors="strict"))
+#   둘 다 read_message 안에서 발생하므로 한 번에 lenient 화 가능.
+#   read_data_frame 은 raw Frame 만 반환하므로 wrap 대상으로 부적합.
+#
+# site-packages 직접 수정은 금지(패키지 업데이트 시 사라짐) — monkey-patch 로 처리.
+try:
+    import codecs as _ws_codecs
+    import websockets.legacy.protocol as _ws_lp
+
+    _orig_read_message = _ws_lp.WebSocketCommonProtocol.read_message
+
+    async def _lenient_read_message(self):
+        try:
+            return await _orig_read_message(self)
+        except UnicodeDecodeError as e:
+            # 단일 프레임 경로에서 strict decode 실패 — 같은 데이터를 lenient 로 재시도 불가
+            # (이미 frame 이 소비됨). 빈 문자열 반환하여 상위 루프가 다음 메시지로 진행.
+            try:
+                logger.warning(
+                    f"{ts_prefix()} [ws][utf8-lenient] decode skip "
+                    f"({type(e).__name__}: {str(e)[:120]})"
+                )
+            except Exception:
+                pass
+            return ""
+
+    _ws_lp.WebSocketCommonProtocol.read_message = _lenient_read_message
+
+    # fragmentation 경로(read_message 내부의 incremental decoder)는 strict 디코더가
+    # decoder.decode() 시점에 UnicodeDecodeError 를 raise → 그 예외도 위 wrap 의
+    # except 에서 흡수됨(같은 read_message frame 안에서 발생). 추가 패치 불필요.
+    #
+    # 추가 안전망: getincrementaldecoder 호출을 lenient 로 강제 — fragment 도중 1007
+    # 으로 끊기지 않고 ? 치환 후 정상 메시지 일부 회수 가능.
+    _orig_get_inc_dec = _ws_codecs.getincrementaldecoder
+
+    def _lenient_get_inc_dec(encoding):
+        factory = _orig_get_inc_dec(encoding)
+        if encoding.lower().replace("_", "-") in ("utf-8", "utf8"):
+            def _factory(errors="strict"):
+                # websockets 가 errors="strict" 로 부르더라도 replace 로 강제
+                return factory(errors="replace")
+            return _factory
+        return factory
+
+    # NOTE: codecs.getincrementaldecoder 자체를 글로벌 치환하면 다른 모듈도 영향받음.
+    # → websockets.legacy.protocol 모듈 내의 codecs 참조만 치환.
+    _ws_lp.codecs.getincrementaldecoder = _lenient_get_inc_dec
+
+    logger.info(f"{ts_prefix()} [ws][utf8-lenient] monkey-patch applied (read_message + utf-8 incremental decoder)")
+except Exception as _patch_err:
+    logger.error(f"{ts_prefix()} [ws][utf8-lenient] monkey-patch FAILED: {_patch_err}")
+
 logger.info("=== WSS START ===")
 logger.info(f"[paths] parquet={FINAL_PARQUET_PATH}  parts={PART_DIR}  log={LOG_PATH}")
 
@@ -11900,7 +11963,14 @@ def run_ws_forever():
             # (open_map에 최신 codes가 이미 반영되었으므로 이전 이벤트는 무효)
             _ws_rebuild_event.clear()
 
-            kws = ka.KISWebSocket(api_url="", max_retries=10)
+            # [260513] max_retries=10 → 1 축소.
+            # SDK __runner 의 while self.retry_count < self.max_retries (kis_auth_llm_v0415.py:827)
+            # 은 connection exception 발생 시 1초 sleep 후 같은 approval_key 로 재연결을 반복함.
+            # 1007 frame error 후 이 루프가 10번 폭주(=10초 안에 8~10회) → KIS throttle(invalid
+            # approval storm) → 슬롯 잠금. retry_count 는 인스턴스 수명 동안 리셋되지 않으므로
+            # max_retries=1 이면 SDK 내부 재시도 없이 즉시 kws.start() 반환 → outer run_ws_forever
+            # 가 새 approval_key 재발급 후 재연결(이 outer loop 는 backoff + auth_ws 재호출 보유).
+            kws = ka.KISWebSocket(api_url="", max_retries=1)
             with _kws_lock:
                 global _active_kws
                 _active_kws = kws
@@ -11950,6 +12020,21 @@ def run_ws_forever():
                                     f"approval_key 재발급 예정",
                                     tele=True,
                                 )
+                            # [260513] SDK 내부 reconnect 루프 즉시 중단.
+                            # max_retries=1 로 줄였더라도, 한 번이라도 invalid approval 응답을
+                            # 받는 순간 같은 approval_key 로의 추가 시도는 KIS throttle 을 악화시킴.
+                            # kws.close() → _close_requested=True + ws.close() → __runner while
+                            # 루프 종료 → kws.start() 반환 → outer run_ws_forever 의 backoff 진입.
+                            try:
+                                kws.close()
+                                logger.warning(
+                                    f"{ts_prefix()} [ws] invalid approval → kws.close() 호출 "
+                                    f"(SDK 내부 reconnect 루프 즉시 중단)"
+                                )
+                            except Exception as _e_close:
+                                logger.warning(
+                                    f"{ts_prefix()} [ws] invalid approval kws.close 실패: {_e_close}"
+                                )
 
             kws.on_system = _on_system
 
@@ -11965,7 +12050,8 @@ def run_ws_forever():
             # [260506] dwell 이 짧으면 핸드셰이크 실패가 다발한 상태로 추정 → long backoff
             # 실제 원인은 보통 직전 세션의 좀비 reconnect 잔재(같은 appkey 재사용) 또는
             # 자기측 연결 lifecycle 미정리. 서버 거부로 단정하지 말 것.
-            # max_retries=10 + 각 retry 1초 sleep = 약 10~12초가 핸드셰이크 실패 다발 패턴의 상한.
+            # [260513] max_retries=1 로 축소: SDK 내부 재시도 없이 즉시 반환 → outer loop 가
+            # 새 approval_key 재발급 후 재연결. 핸드셰이크 실패 다발 패턴은 outer dwell<15s 로 측정.
             if _kws_dwell < 15.0:
                 if (time.time() - _main_last_handshake_fail_ts) >= 30.0:
                     _main_last_handshake_fail_ts = time.time()

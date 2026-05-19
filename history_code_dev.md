@@ -2,6 +2,21 @@
 
 ---
 
+## [2026-05-19] 57a1405
+- **Category**: feat
+- **Title**: 15:30 hot path 보호 + 08:30 시간외종가 재작성 + 계측 로그
+- **Files**: `kis_auth_llm.py`, `ws_realtime_trading.py`
+- **Changes**:
+  - **본 커밋의 실질 내용**: 15:30 hot path 보호 (1499ms spike 해소)
+  - **[15:30 hot path 보호]** `_calc_indicators`: CLOSE_REAL/OVERTIME_*/STOP/EXIT 모드 즉시 return. 잔고검증 15:31 → 15:32 지연 (구독전환 후 안정화). parquet flush 가드 15:30:00~15:31:00 (ingest+writer 양쪽).
+  - **[08:30 시간외종가 재작성]** 어제 state → 오늘 `_morning_target_codes`로 전환. False 시 결과 표도 함께 스킵. `_log_morning_extra_result` / `_morning_extra_placed` 신규 추가.
+  - **[print_table]** 전일 상한가 모니터링 대상 종목 print_table 시작 시 즉시 출력 (09:00 이전 텔레그램 발송 가드).
+  - **[hold_map 분리]** 시작 잔고조회 `hold_map` 분리: 표시=전계좌, hold_map=trade_enabled 만 (`hold_map_trade_only` 파라미터 신규).
+  - **[WSS / kis_auth_llm.py]** H0STCNI0 diag WARNING → INFO. `pl.read_csv quote_char=None` (따옴표 페이로드 차단). parse error 로그에 tr_id + raw_prefix 추가.
+  - **[계측 로그]** `[ingest_lag]` 30s, `[ind_calc]` 60s 성능 계측 로그 추가 (토글 가능).
+  - **[가독성]** `[종가매수주문완료]` 총 소요시간 표시, "rows save done" 통일.
+- **Impact**: 15:30 hot path에서 발생하던 1499ms spike 해소. 이 버전이 현재 안정적으로 운영되고 있는 파일.
+
 ## [2026-05-13] db98da9
 - **Category**: fix
 - **Title**: 260513 1007 frame error 차단 + SDK 폭주 재시도 차단 (좀비 세션 근본 원인 차단)

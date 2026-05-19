@@ -842,7 +842,7 @@ class KISWebSocket:
                     global _h0stcni0_diag_logged
                     if tr_id == "H0STCNI0" and not _h0stcni0_diag_logged:
                         try:
-                            logging.warning(
+                            logging.info(
                                 f"[diag] H0STCNI0 first frame: raw[0]={raw[0]!r} "
                                 f"dm_encrypt={dm.get('encrypt')!r} "
                                 f"key_present={bool(dm.get('key'))} "
@@ -901,6 +901,7 @@ class KISWebSocket:
                     df = pl.read_csv(
                         StringIO(d).read().encode(), has_header=False, separator="^",
                         new_columns=columns, infer_schema_length=0,
+                        quote_char=None,  # KIS WSS 는 따옴표 문법 없음 → quoted-field 파싱 비활성
                     )
 
                     show_result = True
@@ -931,7 +932,16 @@ class KISWebSocket:
 
             except Exception as e:
                 # ── 개별 메시지 파싱 에러: 해당 프레임만 스킵, 연결 유지 ──
-                logging.warning(f"[ws] message parse error (skipped): {e}")
+                _tr_id_dbg = locals().get("tr_id", "?")
+                _raw_prefix = ""
+                try:
+                    _raw_prefix = raw[:120].replace("\n", " ") if isinstance(raw, str) else str(raw)[:120]
+                except Exception:
+                    pass
+                logging.warning(
+                    f"[ws] message parse error (skipped): tr_id={_tr_id_dbg} "
+                    f"raw_prefix={_raw_prefix!r} err={e}"
+                )
                 continue
 
     async def __runner(self):

@@ -1066,7 +1066,8 @@ def _tele_balance_summary(title: str, now_str: str,
 
 
 def _query_and_print_balance(label: str, *, trade_only: bool = True,
-                              tele_label: str | None = None) -> dict[str, dict] | None:
+                              tele_label: str | None = None,
+                              hold_map_trade_only: bool = False) -> dict[str, dict] | None:
     """
     REST API(TTTC8434R) 잔고조회 → 상세 테이블 출력 → hold_map 반환.
 
@@ -1074,6 +1075,8 @@ def _query_and_print_balance(label: str, *, trade_only: bool = True,
       - dict: 조회 성공 (보유종목 없으면 빈 dict, 있으면 {종목코드: {qty, buy_price}})
       - None: 조회 실패 (예외/설정누락)
     tele_label: 텔레그램 전송 시 사용할 라벨. None이면 전송 안 함.
+    hold_map_trade_only: True 시 trade_enabled=False 계좌는 화면/텔레 표시만 하고
+      hold_map / _code_account_map 에는 포함하지 않음 (str1_sell 등 거래 로직 보호).
     """
     global _code_account_map
     try:
@@ -1094,6 +1097,9 @@ def _query_and_print_balance(label: str, *, trade_only: bool = True,
             cano = acct["cano"]
             acnt = acct.get("acnt_prdt_cd", "01") or "01"
             alias = acct.get("alias", acct.get("account_id", "?"))
+            # hold_map_trade_only=True 시 trade_enabled=False 계좌는 표시 전용 (거래 로직 제외)
+            acct_trade_enabled = acct.get("trade_enabled", True) is not False
+            include_in_hold_map = (not hold_map_trade_only) or acct_trade_enabled
             try:
                 client = _init_account_client(acct) if "appkey" in acct else (_top_client or _init_top_client())
             except Exception as e:
@@ -1116,7 +1122,7 @@ def _query_and_print_balance(label: str, *, trade_only: bool = True,
                         seen_codes_local.add(c)
                         row["_acct_alias"] = f"{alias}({cano})"
                         acct_rows.append(row)
-                        if c not in _code_account_map:
+                        if include_in_hold_map and c not in _code_account_map:
                             _code_account_map[c] = acct
                 if not ctx_fk.strip() and not ctx_nk.strip():
                     break
@@ -1127,6 +1133,7 @@ def _query_and_print_balance(label: str, *, trade_only: bool = True,
             per_account.append({
                 "alias": alias, "cano": cano,
                 "summary": acct_summary, "valid_rows": valid_rows,
+                "include_in_hold_map": include_in_hold_map,
             })
             logger.info(f"[{label}] {alias}({cano}) 조회 완료 (보유 {len(valid_rows)}건)")
 
@@ -1149,6 +1156,7 @@ def _query_and_print_balance(label: str, *, trade_only: bool = True,
             cano = acc["cano"]
             summary = acc["summary"] or {}
             valid_rows = acc["valid_rows"]
+            acc_include = acc.get("include_in_hold_map", True)
 
             def _f(key: str, _s=summary) -> float:
                 return float(str(_s.get(key, 0) or 0).replace(",", "") or 0)
@@ -1192,7 +1200,7 @@ def _query_and_print_balance(label: str, *, trade_only: bool = True,
                     elif prpr > 0 and hldg > 1 and abs(prpr - evlu) < 1:
                         prpr = evlu / hldg
                     qty    = psbl if psbl > 0 else hldg
-                    if code not in hold_map:
+                    if acc_include and code not in hold_map:
                         hold_map[code] = {"qty": qty, "buy_price": pchs}
                     tbl_rows.append({
                         "코드": code, "종목명": _raw_nm,
@@ -1245,8 +1253,16 @@ def _print_startup_balance() -> dict[str, dict]:
 
     반환: {종목코드(6자리): {"qty": 매도가능수량, "buy_price": 매입평균가}}
     실패 시 빈 dict 반환.
+
+    표시: 모든 활성 계좌(trade_enabled=False 포함) — 08:58 잔고조회와 동일
+    hold_map: trade_enabled=True 계좌만 — str1_sell 등 거래 로직이 비거래 계좌를 건드리지 않도록 보호
     """
-    hold_map = _query_and_print_balance("시작 잔고조회", trade_only=True, tele_label="시작잔고")
+    hold_map = _query_and_print_balance(
+        "시작 잔고조회",
+        trade_only=False,
+        tele_label="시작잔고",
+        hold_map_trade_only=True,
+    )
     if hold_map is None:
         _notify(f"{ts_prefix()} [시작잔고] 조회 실패", tele=True)
         return {}
@@ -3164,6 +3180,7 @@ def _run_closing_buy_orders() -> None:
         # 20건씩 배치 (KIS REST 20건/초 한도)
         batches = [_closing_buy_prepared[i:i+20] for i in range(0, len(_closing_buy_prepared), 20)]
         ledger_records = []  # ledger 후처리용
+        _t_total_start = time.perf_counter()  # 총 주문 처리 시간 측정 시작
 
         for batch_idx, batch in enumerate(batches):
             if batch_idx > 0:
@@ -3222,7 +3239,8 @@ def _run_closing_buy_orders() -> None:
                 stck_prpr=_last_stck_prpr.get(rec["code"], 0.0),
             )
         if _closing_buy_placed:
-            _notify(f"{ts_prefix()} [종가매수주문완료] {len(_closing_buy_placed)}건")
+            _t_total_elapsed = time.perf_counter() - _t_total_start
+            _notify(f"{ts_prefix()} [종가매수주문완료] {len(_closing_buy_placed)}건 | 총 소요시간 {_t_total_elapsed:.3f}s")
         # 주문 결과 state 저장
         order_records = []
         for o in _closing_buy_placed:
@@ -3247,114 +3265,87 @@ def _run_closing_buy_orders() -> None:
 
 def _run_morning_extra_closing_buy() -> None:
     """
-    08:30~08:40 시간외 종가: 전일 미체결 종목에 ORD_DVSN=05(장전시간외종가) 추가 매수. 가격 미입력(전일종가 자동매칭).
+    08:30~08:40 시간외 종가 추가 매수.
 
-    remain 계산 우선순위:
-      1) 시작잔고(_startup_balance_map): 실제 보유수량으로 filled 역산
-         → remain = max(0, order_qty - startup_held)
-      2) _get_closing_filled_for_remain(state): 체결통보+잔고조회 병합
-      3) JSON state remain_qty 마지막 fallback
+    소스: 오늘 아침 새로 리스트업된 _morning_target_codes (당일 전일 상한가 종목 리스트).
+          (※ 어제 15:20 closing_buy_state 는 사용하지 않음 — 사용자 지시.)
+    fallback: _morning_target_codes 비면 모듈 전역 codes 사용. 둘 다 비면 _notify 후 return.
+
+    수량 산출 (15:20 종가매수 _prepare_closing_buy_orders 패턴 차용, 단일계좌):
+      - main cfg 의 cano/acnt
+      - 가용현금 = _get_account_available_cash(client, cfg). 실패 시 max_invest 폴백
+      - n = len(target_codes), cash_per = (avail_cash / n) * 0.995
+      - 종목별 prev_close → limit_up = calc_limit_up_price(prev_close)
+      - qty_target = int(cash_per // limit_up)
+      - held = live_balance.get(code,{}).get("qty",0) 이미 보유분 차감
+      - remain = max(0, qty_target - held). remain<=0 이면 skip
     추가 보호:
-      - _str1_sell_state sold=True 종목 스킵 (이미 매도 완료)
-      - 이미 보유수량 >= 주문수량이면 스킵 (전량 체결 간주)
+      - _str1_sell_state sold=True 종목 스킵
+    추적: 주문 성공 시 _morning_extra_placed 에 append (08:41 print 함수가 사용).
     """
-    global _morning_extra_closing_done
+    global _morning_extra_closing_done, _morning_extra_placed
     if not MORNING_EXTRA_CLOSING_PR_BUY or _morning_extra_closing_done:
         return
     try:
-        from datetime import timedelta
-        yesterday = (datetime.now(KST) - timedelta(days=1)).strftime("%y%m%d")
-        state = _load_closing_buy_state_by_date(yesterday)
-        if not state or not state.get("orders"):
+        # ── 1) 대상 종목 산출: _morning_target_codes 우선, 폴백 codes ─────────
+        target_codes: list[str] = []
+        if _morning_target_codes:
+            target_codes = [str(c).zfill(6) for c in _morning_target_codes]
+            src_label = "morning_target_codes"
+        elif codes:
+            target_codes = [str(c).zfill(6) for c in codes]
+            src_label = "module.codes(fallback)"
+        else:
             _morning_extra_closing_done = True
-            logger.info(f"{ts_prefix()} [08:30시간외종가] 전일 closing_buy_state 없음 → 스킵")
+            _notify(f"{ts_prefix()} [08:30시간외종가] 대상 종목 없음 → 스킵", tele=True)
             return
 
-        # ── 체결수량 계산: 병합된 filled_map 사용 (체결통보 + 잔고조회) ────────
-        filled_map = _get_closing_filled_for_remain(state)
+        logger.info(
+            f"{ts_prefix()} [08:30시간외종가] 진입 source={src_label} target={len(target_codes)}건"
+        )
 
-        # ── 시작잔고: 이미 보유 중인 실제 수량 ──────────────────────────────
-        # _startup_balance_map은 main 블록에서 이미 취득했으나, 전역 접근 불가
-        # → _get_balance_holdings() 재사용 (시간외종가 시점에 다시 조회하는 게 더 정확)
+        # ── 2) 잔고/매도완료 종목 ───────────────────────────────────────────
         try:
             live_balance = _get_balance_holdings()
         except Exception:
             live_balance = {}
 
-        # ── Str1 매도 완료 종목 집합 ─────────────────────────────────────────
         with _str1_sell_state_lock:
             sold_codes = {c for c, st in _str1_sell_state.items() if st.get("sold")}
 
-        to_order: list[dict] = []
-        skip_lines: list[str] = []
-        for o in state["orders"]:
-            code = str(o.get("code", "")).zfill(6)
-            if not code:
-                continue
-            name = o.get("name", code_name_map.get(code, code))
-            order_qty = int(o.get("order_qty", o.get("qty", 0)))
-            if order_qty <= 0:
-                continue
-
-            # 이미 매도 완료된 종목 스킵
-            if code in sold_codes:
-                skip_lines.append(f"  {name}({code}) → 매도완료(sold=True), 매수 스킵")
-                continue
-
-            # remain 계산 — 실제 보유수량 우선
-            if live_balance:
-                lb_val = live_balance.get(code, {})
-                held = lb_val.get("qty", 0) if isinstance(lb_val, dict) else lb_val
-                # 이미 전량 보유 중이면 체결 완료로 간주
-                if held >= order_qty:
-                    skip_lines.append(f"  {name}({code}) → 잔고보유={held} >= 주문={order_qty}, 전량체결 간주")
-                    continue
-                remain = max(0, order_qty - held)
-            else:
-                # 잔고조회 실패 시 filled_map 사용
-                filled = max(
-                    int(o.get("filled_qty", 0)),
-                    filled_map.get(code, 0),
-                )
-                remain = max(0, order_qty - filled)
-                if remain <= 0:
-                    remain = max(0, order_qty - int(o.get("filled_qty", 0)))
-
-            if remain <= 0:
-                skip_lines.append(f"  {name}({code}) → 잔여수량=0, 스킵")
-                continue
-
-            o2 = dict(o)
-            o2["remain_qty"] = remain
-            lb_val2 = live_balance.get(code, {}) if live_balance else {}
-            o2["actual_held"] = lb_val2.get("qty", 0) if isinstance(lb_val2, dict) else (lb_val2 if lb_val2 else -1)
-            to_order.append(o2)
-
-        # ── 스킵 내역 출력 ────────────────────────────────────────────────────
-        if skip_lines:
-            _notify(f"{ts_prefix()} [08:30시간외종가] 제외 {len(skip_lines)}건:\n" + "\n".join(skip_lines))
-
-        if not to_order:
-            _morning_extra_closing_done = True
-            _notify(f"{ts_prefix()} [08:30시간외종가] 추가 매수 대상 없음")
-            return
-
-        _morning_extra_closing_done = True  # 1회만 실행 (이중주문 방지)
-
+        # ── 3) 단일계좌 cfg + 가용현금 ────────────────────────────────────────
         cfg = _read_cfg() or load_config(str(CONFIG_PATH))
         cano = str(cfg.get("cano", "")).strip()
         acnt = str(cfg.get("acnt_prdt_cd", "01")).strip() or "01"
         if not cano:
-            logger.warning(f"{ts_prefix()} [08:30시간외종가] config cano 없음")
+            _morning_extra_closing_done = True
+            logger.warning(f"{ts_prefix()} [08:30시간외종가] config cano 없음 → 스킵")
             return
         client = _top_client or _init_top_client()
-        code_info = state.get("code_info") or {}
 
-        _notify(f"{ts_prefix()} [08:30시간외종가] 추가 매수 시작 {len(to_order)}건")
+        # 가용현금 — 단일계좌이므로 main cfg 자체를 acct dict 로 활용
+        try:
+            avail_cash = _get_account_available_cash(client, cfg)
+        except Exception as _ce:
+            logger.warning(f"{ts_prefix()} [08:30시간외종가] 가용현금 조회 실패: {_ce}")
+            max_inv = float(str(cfg.get("max_invest", "0") or 0).replace("_", "") or 0)
+            avail_cash = max(0.0, max_inv)
 
+        if avail_cash <= 0:
+            _morning_extra_closing_done = True
+            _notify(f"{ts_prefix()} [08:30시간외종가] 가용현금=0 → 스킵", tele=True)
+            return
+
+        n = len(target_codes)
+        cash_per = (avail_cash / n) * 0.995
+        _notify(
+            f"{ts_prefix()} [08:30시간외종가] 가용현금={int(avail_cash):,}원, "
+            f"종목당 배분={int(cash_per):,}원 (n={n})"
+        )
+
+        # ── 4) 종목별 전일종가 사전 조회 (병렬) ──────────────────────────────
         from concurrent.futures import ThreadPoolExecutor, as_completed
 
-        # 전일종가 사전 조회 (병렬)
         def _resolve_prev_close(code: str) -> float:
             pc = 0.0
             for _attempt in range(3):
@@ -3365,8 +3356,8 @@ def _run_morning_extra_closing_buy() -> None:
             return _get_prev_close_from_1d([code]).get(code, 0) or 0.0
 
         pc_map: dict[str, float] = {}
-        with ThreadPoolExecutor(max_workers=min(20, max(1, len(to_order)))) as ex:
-            fmap = {ex.submit(_resolve_prev_close, str(o["code"]).zfill(6)): str(o["code"]).zfill(6) for o in to_order}
+        with ThreadPoolExecutor(max_workers=min(20, max(1, n))) as ex:
+            fmap = {ex.submit(_resolve_prev_close, c): c for c in target_codes}
             for fut in as_completed(fmap):
                 c = fmap[fut]
                 try:
@@ -3374,13 +3365,74 @@ def _run_morning_extra_closing_buy() -> None:
                 except Exception:
                     pc_map[c] = 0.0
 
-        def _send_one_830(o: dict):
-            code = str(o["code"]).zfill(6)
-            remain = int(o.get("remain_qty", 0))
-            held = int(o.get("actual_held", -1))
-            info = code_info.get(code, {})
-            name = o.get("name", info.get("name", code))
+        # ── 5) 종목별 수량 산출 + 스킵 판정 ───────────────────────────────────
+        to_order: list[dict] = []
+        skip_lines: list[str] = []
+        for code in target_codes:
+            name = code_name_map.get(code, code)
+
+            # 매도완료 스킵
+            if code in sold_codes:
+                skip_lines.append(f"  {name}({code}) → 매도완료(sold=True), 매수 스킵")
+                continue
+
             prev_close = pc_map.get(code, 0.0)
+            if prev_close <= 0:
+                skip_lines.append(f"  {name}({code}) → 전일종가 없음, 스킵")
+                continue
+
+            limit_up = calc_limit_up_price(prev_close)
+            if limit_up <= 0:
+                skip_lines.append(f"  {name}({code}) → 상한가 계산 실패, 스킵")
+                continue
+
+            qty_target = int(cash_per // limit_up)
+            if qty_target <= 0:
+                skip_lines.append(
+                    f"  {name}({code}) → 상한가({limit_up:,.0f}) > 배분액({cash_per:,.0f}), 수량=0 스킵"
+                )
+                continue
+
+            lb_val = live_balance.get(code, {}) if live_balance else {}
+            held = lb_val.get("qty", 0) if isinstance(lb_val, dict) else (lb_val or 0)
+            remain = max(0, qty_target - int(held or 0))
+            if remain <= 0:
+                skip_lines.append(
+                    f"  {name}({code}) → 잔고보유={held} >= 목표={qty_target}, 추가매수 0 스킵"
+                )
+                continue
+
+            to_order.append({
+                "code": code,
+                "name": name,
+                "remain": remain,
+                "qty_target": qty_target,
+                "held": int(held or 0),
+                "prev_close": prev_close,
+                "limit_up": limit_up,
+            })
+
+        if skip_lines:
+            _notify(f"{ts_prefix()} [08:30시간외종가] 제외 {len(skip_lines)}건:\n" + "\n".join(skip_lines))
+
+        if not to_order:
+            _morning_extra_closing_done = True
+            _notify(
+                f"{ts_prefix()} [08:30시간외종가] 완료 placed=0건 skip={len(skip_lines)}건 (대상 없음)",
+                tele=True,
+            )
+            return
+
+        _morning_extra_closing_done = True  # 1회만 실행 (이중주문 방지)
+        _notify(f"{ts_prefix()} [08:30시간외종가] 추가 매수 시작 {len(to_order)}건")
+
+        # ── 6) 주문 발사 (20건/sec 배치 병렬) ─────────────────────────────────
+        def _send_one_830(o: dict):
+            code = o["code"]
+            remain = int(o["remain"])
+            held = int(o["held"])
+            name = o["name"]
+            prev_close = float(o["prev_close"])
             if remain <= 0 or prev_close <= 0:
                 return code, name, remain, held, prev_close, False, "전일종가없음" if prev_close <= 0 else "수량0"
             try:
@@ -3393,7 +3445,6 @@ def _run_morning_extra_closing_buy() -> None:
             except Exception as e:
                 return code, name, remain, held, prev_close, False, str(e)
 
-        # 20건/초 배치 병렬 발송
         batches = [to_order[i:i+20] for i in range(0, len(to_order), 20)]
         for bi, batch in enumerate(batches):
             if bi > 0:
@@ -3413,11 +3464,77 @@ def _run_morning_extra_closing_buy() -> None:
                             f"  수량={remain}{held_txt}  전일종가={prev_close:,.0f}  ORD_DVSN=05(장전시간외종가)",
                             tele=True,
                         )
+                        _morning_extra_placed.append({
+                            "code": code,
+                            "name": name,
+                            "qty": remain,
+                            "prev_close": prev_close,
+                            "ts": time.time(),
+                        })
                     else:
                         logger.warning(f"{ts_prefix()} [08:30시간외종가실패] {code}: {err}")
                         _notify(f"{ts_prefix()} [08:30시간외종가실패] {name}({code}) {err}", tele=True)
+
+        _notify(
+            f"{ts_prefix()} [08:30시간외종가] 완료 placed={len(_morning_extra_placed)}건 "
+            f"skip={len(skip_lines)}건",
+            tele=True,
+        )
     except Exception as e:
         logger.warning(f"{ts_prefix()} [08:30시간외종가] 실패: {e}")
+
+
+def _log_morning_extra_result() -> None:
+    """08:41 — _run_morning_extra_closing_buy 가 당일 발사한 주문에 한해 결과 표 출력.
+
+    소스: _morning_extra_placed (당일 주문 성공 항목).
+    체결수량: min(주문수량, _closing_filled_by_code.get(code, 0)).
+    """
+    if not _morning_extra_placed:
+        _notify(f"{ts_prefix()} [08:30~08:40 종료] 추가 매수 주문 없음", tele=True)
+        return
+
+    table_rows: list[dict] = []
+    total_ord, total_filled, total_remain = 0, 0, 0
+    for o in _morning_extra_placed:
+        code = str(o.get("code", "")).zfill(6)
+        name = o.get("name", code_name_map.get(code, code))
+        ord_q = int(o.get("qty", 0))
+        filled = min(ord_q, max(0, int(_closing_filled_by_code.get(code, 0))))
+        remain = max(0, ord_q - filled)
+        total_ord += ord_q
+        total_filled += filled
+        total_remain += remain
+        table_rows.append({
+            "종목명": name,
+            "코드": code,
+            "주문": str(ord_q),
+            "체결": str(filled),
+            "미체결": str(remain),
+        })
+
+    title = f"{ts_prefix()} [08:30~08:40 종료] 추가 매수 결과 (당일 주문 {len(table_rows)}건)"
+    print(f"\n{title}")
+    print_table(
+        table_rows,
+        columns=["종목명", "코드", "주문", "체결", "미체결"],
+        align={"종목명": "left", "코드": "left", "주문": "right", "체결": "right", "미체결": "right"},
+    )
+    print(f"  합계: 주문={total_ord} 체결={total_filled} 미체결={total_remain}\n")
+    logger.info(f"{title} | 합계: 주문={total_ord} 체결={total_filled} 미체결={total_remain}")
+
+    # 텔레그램 (stdout 이중 출력 방지: tmsg 직접 호출)
+    tele_lines = [f"[08:30~08:40 종료] 추가 매수 결과 (당일 주문 {len(table_rows)}건)"]
+    for r in table_rows:
+        tele_lines.append(
+            f"  {r['종목명']}({r['코드']}) 주문={r['주문']} 체결={r['체결']} 미체결={r['미체결']}"
+        )
+    tele_lines.append(f"  합계: 주문={total_ord} 체결={total_filled} 미체결={total_remain}")
+    if tmsg is not None:
+        try:
+            tmsg(f"{ts_prefix()}\n" + "\n".join(tele_lines), "-t")
+        except Exception:
+            pass
 
 
 _morning_extra_closing_done = False
@@ -3425,6 +3542,8 @@ _afternoon_extra_closing_done = False
 _morning_extra_logged_done = False
 _afternoon_extra_logged_done = False
 _sell_state_supplement_done = False
+# 08:30~08:40 시간외 종가 추가매수 — 당일 실제 발사한 주문 기록 (08:41 결과 표 소스)
+_morning_extra_placed: list[dict] = []
 
 # ── 잔고조회 스케줄러 (Phase 2-2) ──
 _closing_balance_1531_done = False
@@ -4121,8 +4240,81 @@ def _code_name_map() -> dict[str, str]:
         return {}
 
 
+def _print_morning_target_table(codes_in: list[str]) -> None:
+    """장 시작 전 전일 상한가 모니터링 대상 종목을 표로 출력 + 텔레그램 전송.
+
+    소스: symulation/Select_Tr_target_list.csv 의 last_date 행에서 codes_in 필터링.
+    컬럼: 종목명 / 코드 / 어제종가 / 등락율(%) (tdy_ctrt 가 0.xxx 형태이므로 ×100).
+    """
+    csv_path = Path("/home/ubuntu/Stoc_Kis/symulation/Select_Tr_target_list.csv")
+    if not csv_path.exists():
+        logger.warning(f"{ts_prefix()} [morning_target_table] CSV 없음: {csv_path}")
+        return
+    df = pd.read_csv(csv_path, dtype=str, encoding="utf-8-sig")
+    if df.empty or "date" not in df.columns or "symbol" not in df.columns:
+        logger.warning(f"{ts_prefix()} [morning_target_table] CSV 비어있음/필수컬럼 누락")
+        return
+    last_date = df["date"].max()
+    csv_df = df[df["date"] == last_date].copy()
+    csv_df["symbol"] = csv_df["symbol"].str.strip().str.zfill(6)
+    codes_norm = [str(c).zfill(6) for c in codes_in]
+
+    rows: list[dict] = []
+    for c in codes_norm:
+        r = csv_df[csv_df["symbol"] == c]
+        if r.empty:
+            continue
+        row = r.iloc[0]
+        try:
+            close_v = float(str(row.get("close", "0") or 0).replace(",", "") or 0)
+        except (ValueError, TypeError):
+            close_v = 0.0
+        try:
+            ctrt_v = float(str(row.get("tdy_ctrt", "0") or 0).replace(",", "") or 0)
+        except (ValueError, TypeError):
+            ctrt_v = 0.0
+        rows.append({
+            "종목명": str(row.get("name", c)),
+            "코드": c,
+            "어제종가": f"{close_v:,.0f}",
+            "등락율(%)": f"{ctrt_v * 100:+.2f}",
+        })
+
+    if not rows:
+        logger.info(f"{ts_prefix()} [전일 상한가 모니터링 대상 종목] CSV({last_date}) 매칭 종목 없음")
+        return
+
+    title = (f"{ts_prefix()} [전일 상한가 모니터링 대상 종목] {len(rows)}건 "
+             f"(소스: Select_Tr_target_list.csv {last_date})")
+    print(f"\n{title}")
+    print_table(
+        rows,
+        columns=["종목명", "코드", "어제종가", "등락율(%)"],
+        align={"종목명": "left", "코드": "left", "어제종가": "right", "등락율(%)": "right"},
+    )
+    logger.info(title)
+
+    # 텔레그램 전송 (stdout 이중 출력 방지: tmsg 직접 호출)
+    # 시간 가드: 09:00 이전에만 발송 (장중 재시작 시 노이즈 방지)
+    if datetime.now(KST).time() >= dtime(9, 0):
+        logger.info(f"{ts_prefix()} [morning_target_table] 09:00 이후 → 텔레그램 발송 스킵")
+        return
+    tele_lines = [f"[전일 상한가 모니터링 대상 종목] {len(rows)}건 (CSV {last_date})"]
+    for r in rows:
+        tele_lines.append(f"  {r['종목명']}({r['코드']}) 종가={r['어제종가']} 등락율={r['등락율(%)']}%")
+    if tmsg is not None:
+        try:
+            tmsg(f"{ts_prefix()}\n" + "\n".join(tele_lines), "-t")
+        except Exception:
+            pass
+
+
 _morning_target_codes = _load_morning_target_codes()
 if _morning_target_codes:
+    try:
+        _print_morning_target_table(_morning_target_codes)
+    except Exception as _e:
+        logger.warning(f"[morning_target_table] {_e}")
     _code_text_codes = _morning_target_codes
 else:
     _code_text_codes = _parse_codes(CODE_TEXT)
@@ -5091,22 +5283,23 @@ def scheduler_loop():
                                 warn_msg = f"{ts_prefix()} [체결통보] 08:29:59 구독 스킵: my_htsid 미설정!"
                                 logger.warning(warn_msg)
                                 _notify(warn_msg, tele=True)
-            # 08:30~08:40 시간외 종가: 전일 미매수 종목 추가 매수 (ORD_DVSN=02)
-            if dtime(8, 30) <= now.time() < dtime(8, 41):
-                try:
-                    _run_morning_extra_closing_buy()
-                except Exception as e:
-                    logger.warning(f"{ts_prefix()} [08:30시간외종가] {e}")
-            # 08:30~08:40 종료 후 주문내역·결과 로그
-            if dtime(8, 41) <= now.time() < dtime(8, 42):
-                global _morning_extra_logged_done
-                if not _morning_extra_logged_done:
+            # 08:30~08:40 시간외 종가: 당일 _morning_target_codes 기준 추가 매수 (ORD_DVSN=05)
+            # MORNING_EXTRA_CLOSING_PR_BUY=False 이면 매수/결과출력 모두 스킵
+            if MORNING_EXTRA_CLOSING_PR_BUY:
+                if dtime(8, 30) <= now.time() < dtime(8, 41):
                     try:
-                        yesterday = (now - timedelta(days=1)).strftime("%y%m%d")
-                        _log_closing_result_after_window("08:30~08:40", yesterday)
-                        _morning_extra_logged_done = True
+                        _run_morning_extra_closing_buy()
                     except Exception as e:
-                        logger.warning(f"{ts_prefix()} [08:30시간외종가 로그] {e}")
+                        logger.warning(f"{ts_prefix()} [08:30시간외종가] {e}")
+                # 08:30~08:40 종료 후 — 당일 발사한 주문에 한해 결과 표 출력
+                if dtime(8, 41) <= now.time() < dtime(8, 42):
+                    global _morning_extra_logged_done
+                    if not _morning_extra_logged_done:
+                        try:
+                            _log_morning_extra_result()
+                            _morning_extra_logged_done = True
+                        except Exception as e:
+                            logger.warning(f"{ts_prefix()} [08:30시간외종가 로그] {e}")
             # 08:42~08:57 매도 상태 보충: 시작잔고에서 누락된 포지션 재탐색 (1회)
             if dtime(8, 42) <= now.time() < dtime(8, 58):
                 global _sell_state_supplement_done
@@ -5217,15 +5410,15 @@ def scheduler_loop():
                 except Exception as e:
                     logger.warning(f"{ts_prefix()} [종가매수체결알림] {e}")
             # ── 잔고조회 스케줄러: 체결통보 누락분 보완 ──
-            # 15:31 — 종가 체결 결과 검증
-            if dtime(15, 31, 0) <= now.time() <= dtime(15, 31, 5):
+            # 15:32 — 종가 체결 결과 검증 (15:31 → 15:32 지연: 15:30:00 구독전환 후 hot path 안정화 대기)
+            if dtime(15, 32, 0) <= now.time() <= dtime(15, 32, 5):
                 global _closing_balance_1531_done
                 if not _closing_balance_1531_done:
                     _closing_balance_1531_done = True
                     try:
-                        _run_closing_balance_verification("15:31_종가체결")
+                        _run_closing_balance_verification("15:32_종가체결")
                     except Exception as e:
-                        logger.warning(f"{ts_prefix()} [잔고검증15:31] {e}")
+                        logger.warning(f"{ts_prefix()} [잔고검증15:32] {e}")
             # 15:58 — 시간외 종가 체결 결과 검증
             if dtime(15, 58, 0) <= now.time() <= dtime(15, 58, 5):
                 global _closing_balance_1558_done
@@ -5674,13 +5867,13 @@ def _print_counts():
 
 def _emit_save_done(rows: int) -> None:
     # stdout: 현재 제자리 출력 오른쪽에 붙여서 한 줄로 종료
-    sys.stdout.write(f"=> [{LOG_ID}] [save] {rows} rows done\n")
+    sys.stdout.write(f"=> [{LOG_ID}] [save] {rows} rows save done\n")
     sys.stdout.flush()
     # 로그: 마지막 수신통계와 save 정보를 한 줄로 기록 (스크립트 로그에서도 수신상태 추적 가능)
     if _last_status_line:
-        logger.info(f"{_last_status_line} => [save] {rows} rows done")
+        logger.info(f"{_last_status_line} => [save] {rows} rows save done")
     else:
-        logger.info(f"{_fmt_now_prefix()} [save] {rows} rows done")
+        logger.info(f"{_fmt_now_prefix()} [save] {rows} rows save done")
 
 ## Phase 3-7: 수신건수 디버그 로그 제거 (광동(0/1255) 등)
 def _format_full_entries() -> list[str]:
@@ -5719,6 +5912,19 @@ _bb_sq_sum: dict[str, float] = {}
 _last_recv_ts: dict[str, float] = {c: 0.0 for c in codes}
 _code_added_ts: dict[str, float] = {c: time.time() for c in codes}  # 종목별 추가 시점 (watchdog 3분 기준)
 _last_summary_ts = time.time()
+
+# ── ingest_loop 처리 지연 측정 (30s 주기 1회 로그) ──
+_ingest_lag_max_ms: float = 0.0
+_ingest_lag_sum_ms: float = 0.0
+_ingest_lag_count: int = 0
+_ingest_lag_last_print_ts: float = 0.0
+
+# ── _calc_indicators 자체 소요시간 측정 (60s 주기, 토글로 끌 수 있음) ──
+_ind_calc_t_sum: float = 0.0
+_ind_calc_t_max: float = 0.0
+_ind_calc_t_n: int = 0
+_ind_calc_last_print_ts: float = 0.0
+_ind_calc_measure_enabled: bool = True   # 사용자가 직접 False 로 끌 수 있음
 
 # ── 장중 미수신 감시 상태 ──
 _last_stale_check_ts: dict[str, float] = {}  # 종목별 마지막 REST 상태확인 시각
@@ -9590,7 +9796,20 @@ def _calc_indicators(code: str, price: float) -> dict:
     EMA: alpha = 2/(period+1), 첫 틱은 가격 그대로 초기값으로 설정.
     BB:  price_buf 누적값으로 rolling std 계산 (기간 미달 시 None).
     반환: {ma3, ma50, ..., bb_mid, bb_upper, bb_lower, bb_width} dict.
+
+    ※ 1회용 성능측정: _ind_calc_measure_enabled=True 시 60s 주기 max/avg/n 로그.
+       측정이 필요 없어지면 `_ind_calc_measure_enabled = False` 로 끌 수 있음.
+
+    ※ CLOSE_REAL(15:30~) 이후 모드에서는 매매 판단에 지표 불필요 → 계산 스킵.
+       hot path 부담 감소 + 15:30 구독전환 시점 ingest_lag spike 완화.
     """
+    # 15:30 이후 모드: 지표 계산 불필요 → 즉시 반환 (hot path 비용 제거)
+    if _current_mode in (RunMode.CLOSE_REAL, RunMode.OVERTIME_EXP,
+                         RunMode.OVERTIME_REAL, RunMode.STOP, RunMode.EXIT):
+        return {}
+
+    _t0 = time.perf_counter() if _ind_calc_measure_enabled else 0.0
+
     buf = _price_buf.get(code)
     if buf is None:
         return {}
@@ -9658,6 +9877,30 @@ def _calc_indicators(code: str, price: float) -> dict:
         bb_vals["bb_upper"] = None
         bb_vals["bb_lower"] = None
         bb_vals["bb_width"] = None
+
+    # ── [측정] 1tick 처리 소요시간 — 60s 주기 max/avg/n 로그 ──
+    # 측정 자체가 본함수 반환을 방해하지 않도록 try/except 로 감쌈
+    if _ind_calc_measure_enabled:
+        try:
+            _dt = (time.perf_counter() - _t0) * 1e6   # 마이크로초
+            global _ind_calc_t_sum, _ind_calc_t_max, _ind_calc_t_n, _ind_calc_last_print_ts
+            _ind_calc_t_sum += _dt
+            if _dt > _ind_calc_t_max:
+                _ind_calc_t_max = _dt
+            _ind_calc_t_n += 1
+            now_t = time.time()
+            if now_t - _ind_calc_last_print_ts >= 60.0:
+                avg = _ind_calc_t_sum / max(1, _ind_calc_t_n)
+                logger.info(
+                    f"{ts_prefix()} [ind_calc] 1tick 소요 max={_ind_calc_t_max:.1f}us "
+                    f"avg={avg:.2f}us n={_ind_calc_t_n} (직전 60s)"
+                )
+                _ind_calc_t_sum = 0.0
+                _ind_calc_t_max = 0.0
+                _ind_calc_t_n = 0
+                _ind_calc_last_print_ts = now_t
+        except Exception:
+            pass
 
     return {**ema_vals, **bb_vals}
 
@@ -11002,7 +11245,10 @@ def writer_loop():
                 with _part_buffer_lock:
                     has_data = bool(_part_buffer)
                 if has_data:
-                    _flush_part_buffer("periodic", force_full=True)
+                    # 15:30:00~15:31:00: 구독전환 hot path 보호 → periodic flush 가드
+                    _now_t = datetime.now(KST).time()
+                    if not (dtime(15, 30, 0) <= _now_t < dtime(15, 31, 0)):
+                        _flush_part_buffer("periodic", force_full=True)
             # ── 지표 스냅샷 주기 저장 (5분 간격) ──
             now_ts = time.time()
             if now_ts - _last_snapshot_ts >= SNAPSHOT_INTERVAL_SEC:
@@ -11155,6 +11401,8 @@ def ingest_loop():
             continue
         if item is None:
             break
+        # ── [측정] item 1건 처리 시작 시각 (30s 주기 1회 max/avg/n 로그) ──
+        _proc_t0 = time.perf_counter()
         result, trid, kind, is_real, recv_ts = item
         if kind == "unknown":
             kind = "unknown"
@@ -11401,8 +11649,11 @@ def ingest_loop():
                     total_n = sum(len(c) for c in chunks)
                     _part_buffer_rows += total_n
                 # 1500행 도달 시 오래된 1000행 flush
+                # 15:30:00~15:31:00 구간은 구독전환과 동시 발생 시 hot path 차단 → flush 가드
                 if _part_buffer_rows >= PART_FLUSH_THRESHOLD:
-                    _flush_part_buffer("1000rows")
+                    _now_t = datetime.now(KST).time()
+                    if not (dtime(15, 30, 0) <= _now_t < dtime(15, 31, 0)):
+                        _flush_part_buffer("1000rows")
             except Exception:
                 logger.error("[ingest] part buffer append failed")
                 logger.error(traceback.format_exc())
@@ -11462,6 +11713,29 @@ def ingest_loop():
         if (now - _last_full_status_ts) >= FULL_STATUS_EVERY_SEC:
             _log_full_progress()
             _last_full_status_ts = now
+
+        # ── [측정] item 1건 처리 종료 — 30s 주기 max/avg/n 로그 ──
+        # 측정 자체가 hot path 를 부수지 않도록 try/except 로 감쌈
+        try:
+            _proc_dt_ms = (time.perf_counter() - _proc_t0) * 1000.0
+            global _ingest_lag_max_ms, _ingest_lag_sum_ms, _ingest_lag_count, _ingest_lag_last_print_ts
+            if _proc_dt_ms > _ingest_lag_max_ms:
+                _ingest_lag_max_ms = _proc_dt_ms
+            _ingest_lag_sum_ms += _proc_dt_ms
+            _ingest_lag_count += 1
+            if now - _ingest_lag_last_print_ts >= 30.0:
+                qsz = _ingest_queue.qsize()
+                avg = _ingest_lag_sum_ms / max(1, _ingest_lag_count)
+                logger.info(
+                    f"{ts_prefix()} [ingest_lag] qsize={qsz} 처리시간 max={_ingest_lag_max_ms:.1f}ms "
+                    f"avg={avg:.2f}ms n={_ingest_lag_count} (직전 30s 기준)"
+                )
+                _ingest_lag_max_ms = 0.0
+                _ingest_lag_sum_ms = 0.0
+                _ingest_lag_count = 0
+                _ingest_lag_last_print_ts = now
+        except Exception:
+            pass
     logger.info("[ingest] stopped")
 
 # =============================================================================

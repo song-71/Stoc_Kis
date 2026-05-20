@@ -1555,3 +1555,29 @@
   6. `OVERTIME_SINGLE_PRICE_BUY` 플래그 신설: False 시 16:01 조기 종료 + 관련 시간외 로직 전부 게이팅
   7. `_backup_log_file()` 추가: 종료 시 `wss_realtime_trading_YYMMDD.out` 날짜별 백업
 - **Impact**: 종가매매 전환 시 WSS 재연결 없이 안정적으로 구독 전환. 텔레그램 메시지 별도 파일로 사후 추적 가능
+
+## [2026-05-20] e120fef
+- **Category**: fix
+- **Title**: 1007 근원 차단 — websockets asyncio API lenient 패치 + 시초 backoff 단축
+- **Files**: `ws_realtime_trading.py`, `ws_monitoring_research_260520.md` (신규)
+- **Changes**:
+  1. **[Part A] websockets asyncio API UTF-8 lenient 패치 (1007 실효 차단)**
+     - 기존 legacy(read_message) 패치는 KIS SDK 가 실제로 쓰는 경로를 잡지 못함.
+       SDK(kis_auth_llm.py:818)는 websockets 15.x 의 asyncio API (`websockets.connect()` → `ws.recv()`)를 사용.
+       260513~260520 실측: legacy 패치 catch 0건, 1007 오류 9건 → 경로 불일치 확정.
+     - 1007 발생 경로: `Assembler.get()` → `data.decode()` strict → `UnicodeDecodeError`
+       → `Connection.recv`가 `protocol.fail(CloseCode.INVALID_DATA)` 호출 → 연결 종료.
+     - `Assembler.get` monkey-patch 신설: 정상 프레임은 strict 그대로(동작·성능 불변),
+       깨진 프레임만 `errors="replace"` 로 ? 치환 + 30s rate-limit 경고 로그 후 연결 유지.
+     - `get_iter` 안전망: 모듈 전역 `UTF8Decoder` 도 lenient factory 로 치환.
+     - 버전 가드: `websockets 15.x` 에서만 적용, 구조 불일치 위험 차단.
+     - legacy(read_message) 패치는 `[legacy]` 태그 + 현 SDK 미사용 주석으로 유지(무해 안전망).
+  2. **[Part B] 시초 near-open 핸드셰이크 실패 backoff 단축 (90s → 15s)**
+     - 260520 사건: 08:59:46 handshake-fail(dwell<15s) → 90s long backoff → 09:01:16 까지 무수신.
+       시초 VI 후보 구간 전체를 잃음.
+     - `MAIN_WSS_BACKOFF_NEAR_OPEN_SEC = 15.0` 상수 신설.
+     - 핸드셰이크 실패 다발 분기에서만 `08:55 ≤ now < 09:02` 구간 backoff 15s 로 단축, `near-open 단축` 로그.
+     - `ALREADY IN USE` 분기는 KIS 측 stale session 정리에 실제 시간 필요 → 단축 제외.
+  3. **분석 문서 추가**: `ws_monitoring_research_260520.md` — 260520 handshake storm 원인 분석,
+     legacy 패치 0-catch 실증, asyncio API 경로 확인, Part A/B 검증 기록.
+- **Impact**: 깨진 UTF-8 바이트로 인한 WSS 1007 단절 근원 차단. 개장 직전 handshake 실패 시 시초 구간 손실 방지.

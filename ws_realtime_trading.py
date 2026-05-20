@@ -478,9 +478,92 @@ try:
     # → websockets.legacy.protocol 모듈 내의 codecs 참조만 치환.
     _ws_lp.codecs.getincrementaldecoder = _lenient_get_inc_dec
 
-    logger.info(f"{ts_prefix()} [ws][utf8-lenient] monkey-patch applied (read_message + utf-8 incremental decoder)")
+    logger.info(f"{ts_prefix()} [ws][utf8-lenient][legacy] monkey-patch applied (read_message — 현 SDK 미사용 경로, 무해 안전망)")
 except Exception as _patch_err:
-    logger.error(f"{ts_prefix()} [ws][utf8-lenient] monkey-patch FAILED: {_patch_err}")
+    logger.error(f"{ts_prefix()} [ws][utf8-lenient][legacy] monkey-patch FAILED: {_patch_err}")
+
+# [260520] websockets *새 asyncio API* UTF-8 lenient 패치 (1007 근원 차단 — 실효 버전)
+# ────────────────────────────────────────────────────────────────────────
+# 위 legacy(read_message) 패치는 KIS SDK 가 실제로 쓰지 않는 경로다. SDK(kis_auth_llm.py:818)
+# 는 websockets.connect() → await ws.recv() → websockets.asyncio API 를 사용한다(websockets 15.x).
+# 이 경로의 UTF-8 strict 디코드는 Assembler.get() 의 `data.decode()` 에서 발생하며, 깨진 한글
+# 바이트에서 UnicodeDecodeError → Connection.recv 가 protocol.fail(CloseCode.INVALID_DATA) 호출
+# → "sent 1007 (invalid frame payload data) invalid start byte at position N" 로 연결이 끊긴다.
+#   ※ 260513~260520 로그 실측: legacy 패치 0건 catch, 1007 은 9건 발생 → 경로 불일치 확정.
+# 정상 프레임은 strict 그대로(동작/성능 불변) 두고, 깨진 프레임에서만 errors="replace" 로
+# 1글자만 버려 연결을 유지한다. site-packages 직접 수정 금지 → monkey-patch.
+# 버전 가드: Assembler.get 본문을 복제하므로 구조가 다른 버전에서는 적용하지 않는다.
+try:
+    import codecs as _ws_codecs2
+    import websockets as _ws_pkg
+    import websockets.asyncio.messages as _ws_msgs
+
+    _ws_ver = getattr(_ws_pkg, "__version__", "0")
+    if not _ws_ver.startswith("15."):
+        logger.warning(
+            f"{ts_prefix()} [ws][utf8-lenient-asyncio] websockets={_ws_ver} (15.x 아님) → "
+            f"Assembler.get 패치 skip (본문 구조 불일치 위험)"
+        )
+    else:
+        _last_lenient_skip_ts = [0.0]  # rate-limit 용 (mutable closure)
+
+        async def _lenient_assembler_get(self, decode=None):
+            # 원본 websockets.asyncio.messages.Assembler.get(15.0.1) 본문 복제 —
+            # 마지막 텍스트 디코드만 lenient 처리. 그 외 로직은 원본과 동일.
+            if self.get_in_progress:
+                raise _ws_msgs.ConcurrencyError("get() or get_iter() is already running")
+            self.get_in_progress = True
+            try:
+                frame = await self.frames.get(not self.closed)
+                self.maybe_resume()
+                assert frame.opcode is _ws_msgs.OP_TEXT or frame.opcode is _ws_msgs.OP_BINARY
+                if decode is None:
+                    decode = frame.opcode is _ws_msgs.OP_TEXT
+                frames = [frame]
+                while not frame.fin:
+                    try:
+                        frame = await self.frames.get(not self.closed)
+                    except _ws_msgs.asyncio.CancelledError:
+                        self.frames.reset(frames)
+                        raise
+                    self.maybe_resume()
+                    assert frame.opcode is _ws_msgs.OP_CONT
+                    frames.append(frame)
+            finally:
+                self.get_in_progress = False
+            data = b"".join(frame.data for frame in frames)
+            if decode:
+                try:
+                    return data.decode()                        # 정상 프레임: 기존과 100% 동일
+                except UnicodeDecodeError as _e:
+                    _now_ts = time.time()
+                    if _now_ts - _last_lenient_skip_ts[0] >= 30.0:  # 30s 1회 rate-limit
+                        _last_lenient_skip_ts[0] = _now_ts
+                        try:
+                            logger.warning(
+                                f"{ts_prefix()} [ws][utf8-lenient-asyncio] decode skip "
+                                f"({_e.reason} at {_e.start}) → ?치환 후 연결 유지 (1007 차단)"
+                            )
+                        except Exception:
+                            pass
+                    return data.decode("utf-8", "replace")      # 깨진 바이트만 ? — 연결 유지
+            else:
+                return data
+
+        _ws_msgs.Assembler.get = _lenient_assembler_get
+
+        # get_iter(스트리밍 프래그먼트) 안전망: 모듈 전역 UTF8Decoder 를 lenient factory 로 치환.
+        # SDK recv() 는 get 만 쓰지만 완성도 위해 함께 처리.
+        def _lenient_utf8_decoder_factory(errors="replace"):
+            return _ws_codecs2.getincrementaldecoder("utf-8")(errors="replace")
+        _ws_msgs.UTF8Decoder = _lenient_utf8_decoder_factory
+
+        logger.info(
+            f"{ts_prefix()} [ws][utf8-lenient-asyncio] monkey-patch applied "
+            f"(Assembler.get + UTF8Decoder, websockets={_ws_ver})"
+        )
+except Exception as _patch_err2:
+    logger.error(f"{ts_prefix()} [ws][utf8-lenient-asyncio] monkey-patch FAILED: {_patch_err2}")
 
 logger.info("=== WSS START ===")
 logger.info(f"[paths] parquet={FINAL_PARQUET_PATH}  parts={PART_DIR}  log={LOG_PATH}")
@@ -4377,6 +4460,11 @@ _main_last_handshake_fail_ts: float = 0.0
 _main_last_invalid_approval_ts: float = 0.0
 MAIN_WSS_BACKOFF_ALREADY_IN_USE_SEC: float = 90.0
 MAIN_WSS_BACKOFF_INVALID_APPROVAL_SEC: float = 60.0
+# [260520] 개장 직전/직후(시초) 핸드셰이크 실패 시 90s long backoff 가 09:00 시초 구간을
+# 통째로 날리는 문제(260520 09:00 사건: 08:59:46 dwell<15s → 90s backoff → 09:01:16 까지 무수신)
+# → near-open 구간(08:55~09:02)에 한해 backoff 단축. ALREADY IN USE 는 KIS 측 stale session
+# 정리에 실제 시간이 필요(단축 시 재유발)하므로 단축 대상이 아니다.
+MAIN_WSS_BACKOFF_NEAR_OPEN_SEC: float = 15.0
 
 # [260506] WSS 자기보호 자동중단 — 핸드셰이크 N회 연속 실패 시 reconnect 중단 + 프로세스 종료
 # (KIS WSS 가 IP 단위 throttle 누적되기 전 자기측에서 끊어 IP 차단 자초 방지)
@@ -12451,11 +12539,19 @@ def run_ws_forever():
             elapsed_fail = time.time() - _main_last_handshake_fail_ts
             elapsed_already = time.time() - _main_last_already_in_use_ts
             if elapsed_already < 30.0 or elapsed_fail < 30.0:
-                wait = MAIN_WSS_BACKOFF_ALREADY_IN_USE_SEC
-                cause = (
-                    "ALREADY IN USE 감지" if elapsed_already < 30.0
-                    else "핸드셰이크 실패 다발 (dwell<15s)"
-                )
+                if elapsed_already < 30.0:
+                    # ALREADY IN USE: KIS 측 stale session 정리에 실제 시간 필요 → 단축 안 함
+                    wait = MAIN_WSS_BACKOFF_ALREADY_IN_USE_SEC
+                    cause = "ALREADY IN USE 감지"
+                else:
+                    # 핸드셰이크 실패 다발(dwell<15s): 개장 직전/직후면 시초 손실 방지 위해 단축
+                    cause = "핸드셰이크 실패 다발 (dwell<15s)"
+                    _now_open = datetime.now(KST).time()
+                    if dtime(8, 55) <= _now_open < dtime(9, 2):
+                        wait = MAIN_WSS_BACKOFF_NEAR_OPEN_SEC
+                        cause += " · near-open 단축"
+                    else:
+                        wait = MAIN_WSS_BACKOFF_ALREADY_IN_USE_SEC
                 logger.warning(
                     f"{ts_prefix()} [ws] {cause} → "
                     f"long backoff {wait:.0f}s (storm 차단)"

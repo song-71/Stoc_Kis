@@ -2,6 +2,19 @@
 
 ---
 
+## [2026-05-21] 25f936e
+- **Category**: perf
+- **Title**: str1 매도 핫패스 지연 ~2.5초 제거 (REST 재조회 + 텔레그램 동기전송 제거)
+- **Files**: `ws_realtime_trading.py`, `telegMsg.py`
+- **Changes**:
+  - **근본 원인**: 260521 아이진(185490) 매도 로그 분석 → 발동(큐 등록) 28.136 → KIS 주문 ~30.660, 내부 ~2.5초 직렬 지연. 원인 = 주문 직전 핫패스의 REST 잔고 재조회 ~1.5초 + 텔레그램 동기 전송 ~1.0초.
+  - **[ws_realtime_trading.py] REST 잔고 재조회 제거**: `_str1_sell_worker` 매도 직전 `_get_balance_holdings()` 호출(TTTC8434R 페이지네이션 ×활성계좌) 삭제. 매도 수량은 `req["qty"]`(`_str1_sell_state`/시작 `balance_map` 시드값) 그대로 사용. 수량초과(APBK0400) 안전망(미체결 매도주문 취소→재주문 except 경로)은 유지.
+  - **[ws_realtime_trading.py] 주문 직전 텔레그램 동기전송 제거**: `_notify(api_call_msg, tele=True)` + 중복 `logger.info` → `logger.info` 1회로 교체.
+  - **[ws_realtime_trading.py] 주문 후 통지 비동기화**: 접수완료 통지를 `_notify_async` (신규 헬퍼)로 변경. 파일 로그 + TELE_LOG_PATH(시간정보 포함) 기록은 동기 즉시 유지, 텔레그램 HTTP 전송만 데몬 스레드 fire-and-forget → 워커가 다음 매도 요청 즉시 처리.
+  - **[ws_realtime_trading.py] `_notify_async` 신규**: 스레드 생성 실패 시 동기 fallback 경로 포함. 데몬 스레드이므로 프로세스 종료 시 자동 회수.
+  - **[telegMsg.py] `tmsg` timeout 추가**: `requests.post(...)` 에 `timeout=(3, 3)` (connect 3초/read 3초) 추가. 텔레그램 장애 시 어떤 호출처에서도 무한 블록되지 않도록 방어.
+- **Impact**: 발동→KIS 주문 구간에서 ~2.5초 직렬 블로킹 제거. 동시다발 매도 신호 발생 시 다음 종목 처리 지연도 해소. 텔레그램 통지 및 파일 로그 누락 없음(동기 기록 보장).
+
 ## [2026-05-19] 57a1405
 - **Category**: feat
 - **Title**: 15:30 hot path 보호 + 08:30 시간외종가 재작성 + 계측 로그

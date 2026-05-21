@@ -2,6 +2,25 @@
 
 ---
 
+## [2026-05-21] ab5465c
+- **Category**: perf
+- **Title**: 매도 발동→주문 내부 지연 계측([sell_latency]) + 핫패스 운영 원칙 KPI 명문화
+- **Files**: `ws_realtime_trading.py`, `rules/trading_project_main_plan.md`
+- **Changes**:
+  1. **[계측] `_enqueue_str1_sell` — `enq_ts: time.time()` 큐 항목에 추가**
+     - 매도 발동 시각을 큐 dict 에 기록. 워커 측 지연 계산의 기준점.
+  2. **[계측] `_str1_sell_worker` — `_sell_order_cash` 호출 직전 [sell_latency] 로그 출력**
+     - `[sell_latency] {종목}({코드}) 발동→주문 {ms}ms` 형식으로 ms 단위 계측.
+     - enq_ts 가 없는 기존 잔여 항목은 안전하게 무시(`.get("enq_ts")` 조건 분기).
+     - 목적: 핫패스에 블로킹 REST/텔레그램 동기 호출이 재유입되는 회귀를 상시 감시.
+  3. **[문서] `rules/trading_project_main_plan.md` — "주문 핫패스 지연 금지" 운영 원칙 추가**
+     - 금지 항목 명시: REST 잔고조회 동기 호출, 텔레그램 동기 전송, 기타 블로킹 네트워크 작업.
+     - KPI: 발동→주문 내부 지연 목표 ≤50ms. 수백 ms 이상 = 블로킹 회귀 WARN.
+     - 관측점: `[sell_latency]` 로그, log_monitor 비정상 대기값 감지 시 WARN.
+     - KPI 모니터링 표에 `[sell_latency] 수백 ms 이상 → WARN` 항목 추가.
+     - 변경 이력 섹션에 원칙 수립 경위(배경: 아이진 2.5초 지연, 커밋 25f936e) 추가.
+- **Impact**: 핫패스 블로킹 회귀를 실시간 수치로 탐지 가능. 주문 지연 원인 불명 구간 없음. "금지 원칙 + KPI" 가 문서화되어 향후 코드 리뷰 기준으로 활용 가능.
+
 ## [2026-05-21] 25f936e
 - **Category**: perf
 - **Title**: str1 매도 핫패스 지연 ~2.5초 제거 (REST 재조회 + 텔레그램 동기전송 제거)

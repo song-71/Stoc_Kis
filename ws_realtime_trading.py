@@ -326,6 +326,42 @@ def _notify(msg: str, tele: bool = False) -> None:
                 pass
 
 
+def _notify_async(msg: str) -> None:
+    """[260521] 핫패스 보호용 비동기 텔레그램 통지.
+
+    - 파일 로그(logger) + TELE_LOG_PATH 기록(시간정보 포함)은 **동기**로 즉시 남긴다
+      (프로젝트 규칙: 텔레그램 메시지는 자체 로그에 시간정보와 함께 반드시 기록).
+    - 실제 텔레그램 HTTP 전송(tmsg)만 데몬 스레드로 fire-and-forget 하여,
+      네트워크 지연/장애가 호출 스레드(예: _str1_sell_worker)를 막지 않게 한다.
+    - 단발 주문 직후 통지에 사용. 매매 안전성과 무관한 부가 동작 전용.
+    """
+    logger.info(msg)
+    sys.stdout.write("\r\033[2K" + msg + "\n")
+    sys.stdout.flush()
+    # TELE_LOG_PATH 기록은 동기로 즉시 (누락 방지)
+    try:
+        with open(TELE_LOG_PATH, "a", encoding="utf-8") as _tf:
+            _tf.write(f"{datetime.now(KST).strftime('%Y-%m-%d %H:%M:%S')} | {msg}\n")
+    except Exception:
+        pass
+    # 텔레그램 HTTP 전송만 스레드로 분리 (timeout은 telegMsg.tmsg 내부에서 보장)
+    if tmsg is not None:
+        def _send() -> None:
+            try:
+                tmsg(msg, "-t")
+            except Exception:
+                pass
+        try:
+            threading.Thread(target=_send, name="tele-notify", daemon=True).start()
+        except Exception as _te:
+            # 스레드 생성 실패 시 최후수단으로 동기 전송 (드문 케이스)
+            logger.warning(f"_notify_async 스레드 생성 실패, 동기 전송 fallback: {_te}")
+            try:
+                tmsg(msg, "-t")
+            except Exception:
+                pass
+
+
 # =============================================================================
 # 경로
 # =============================================================================
@@ -1993,23 +2029,11 @@ def _str1_sell_worker() -> None:
                 logger.warning(f"[str1_sell] config cano 없음 → {code} 매도 스킵")
                 continue
 
-            # ── 매도 직전 수량 재검증 (hldg_qty vs ord_psbl_qty 불일치 방지) ──
-            try:
-                _bal = _get_balance_holdings()
-                _bal_info = _bal.get(code, {})
-                _sellable = _bal_info.get("qty", 0) if isinstance(_bal_info, dict) else _bal_info
-                if 0 < _sellable < qty:
-                    logger.warning(
-                        f"{ts_prefix()} [str1_sell] {name}({code}) 매도수량 보정: "
-                        f"state={qty} → 실매도가능={_sellable}"
-                    )
-                    qty = _sellable
-                    with _str1_sell_state_lock:
-                        if code in _str1_sell_state:
-                            _str1_sell_state[code]["qty"] = qty
-            except Exception as _be:
-                logger.warning(f"{ts_prefix()} [str1_sell] {code} 잔고재조회 실패(매도 계속): {_be}")
-
+            # [260521] 핫패스 지연 제거: 매도 직전 REST 잔고 재조회(_get_balance_holdings,
+            # TTTC8434R 페이지네이션 ×활성계좌, ~1.5초)를 삭제. 매도 수량은 이미
+            # req["qty"](= _str1_sell_state/시작 balance_map 시드값)로 알고 있으므로 그대로 사용.
+            # 수량초과(APBK0400) 안전망은 아래 except 경로(미체결 매도주문 취소 후 재주문)가
+            # 그대로 담당한다.
             is_stop_limit = (ord_dvsn == "22")
             is_opening_call_auction = reason.startswith("str1_시초가하락_예상")
             sell_label = "스톱지정가매도" if is_stop_limit else ("동시호가매도" if is_opening_call_auction else "매도")
@@ -2024,7 +2048,9 @@ def _str1_sell_worker() -> None:
                 f"  tr_id=TTTC0801U  수량={qty}  주문방식={ord_dvsn_name}({ord_dvsn}){price_info}"
                 f"  사유={reason}"
             )
-            _notify(api_call_msg, tele=True)
+            # [260521] 핫패스 보호: 주문 직전에는 빠른 파일 로그만 남긴다.
+            # (텔레그램 동기 전송 ~1.0초 제거 + 중복 logger.info 제거 →
+            #  발동→주문 지연 단축. 텔레그램 통지는 주문 후 _notify_async로 비동기 전송.)
             logger.info(api_call_msg)
             j = _sell_order_cash(
                 client, cano, acnt, code, qty,
@@ -2071,8 +2097,10 @@ def _str1_sell_worker() -> None:
                 f"  주문방식={ord_dvsn_name}({ord_dvsn}){price_info}"
                 f"  사유={reason}{pnl_txt}{opening_call_auction_suffix}"
             )
-            _notify(msg, tele=True)
-            logger.info(msg)
+            # [260521] 주문 후 통지는 비동기로 (텔레그램 HTTP가 워커를 막아 다음 매도 처리를
+            # 지연시키지 않게). _notify_async 가 파일 로그 + TELE_LOG_PATH 기록은 동기로 즉시
+            # 남기므로 별도 logger.info 중복 호출은 불필요.
+            _notify_async(msg)
             # 매도 성공 시 EMA 데드크로스 상태 해제
             _ema_sell_cond.pop(code, None)
             _up_trend_state.pop(code, None)

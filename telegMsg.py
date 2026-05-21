@@ -35,7 +35,9 @@ def tmsg(msg, mode=None):
         url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
         payload = {"chat_id": CHAT_ID, "text": msg_}
         
-        response = requests.post(url, json=payload)
+        # [260521] timeout 추가: 텔레그램 장애 시 어떤 호출처에서도 무한 블록되지 않도록.
+        # (connect 3초 / read 3초)
+        response = requests.post(url, json=payload, timeout=(3, 3))
         
         # 콘솔 출력 (mode가 '-t'가 아닐 때만)
         if mode != '-t':

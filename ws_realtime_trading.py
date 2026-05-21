@@ -2052,6 +2052,14 @@ def _str1_sell_worker() -> None:
             # (텔레그램 동기 전송 ~1.0초 제거 + 중복 logger.info 제거 →
             #  발동→주문 지연 단축. 텔레그램 통지는 주문 후 _notify_async로 비동기 전송.)
             logger.info(api_call_msg)
+            # [260521] 발동→주문 내부 지연 계측: 큐등록(enq_ts)부터 KIS 주문 전송 직전까지.
+            # 핫패스 블로킹 회귀(REST/텔레그램 등) 감시용. 목표 수~수십 ms.
+            _enq_ts = req.get("enq_ts")
+            if _enq_ts:
+                logger.info(
+                    f"{ts_prefix()} [sell_latency] {name}({code}) "
+                    f"발동→주문 {(time.time() - _enq_ts) * 1000:.1f}ms"
+                )
             j = _sell_order_cash(
                 client, cano, acnt, code, qty,
                 price=sell_price, ord_dvsn=ord_dvsn, cndt_pric=cndt_pric,
@@ -2381,6 +2389,8 @@ def _enqueue_str1_sell(
         "code": code, "qty": qty, "reason": reason,
         "ref_price": ref_price, "name": name,
         "ord_dvsn": ord_dvsn, "price": price, "cndt_pric": cndt_pric,
+        # [260521] 발동(큐등록)→주문 전송 내부 지연 계측용 (sell_latency 로그)
+        "enq_ts": time.time(),
     })
 
 

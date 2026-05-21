@@ -1,6 +1,6 @@
 # Stoc_Kis Trading Project — Main Plan
 
-_Last updated: 2026-04-10 (by: initial draft)_
+_Last updated: 2026-05-21 (by: intent-tracker)_
 _Source: `ws_realtime_trading.py` 운영 흐름 + 사용자 의도_
 
 이 문서는 Stoc_Kis 프로젝트의 **운영 의도·방향·판정 기준**의 단일 소스다.
@@ -29,6 +29,21 @@ _Source: `ws_realtime_trading.py` 운영 흐름 + 사용자 의도_
 - 커밋 시 `.env`, `config.json`, 토큰 파일(`kis_token_*.json`) 푸시
 - `git add -A` / `git add .` 남용 (민감 파일 혼입 위험)
 - 매도완료 T+2 결제 전 `hldg_qty` 만으로 보유 판단 (반드시 `ord_psbl_qty` 체크)
+
+### 성능 원칙 — 주문 핫패스 지연 금지
+
+**원칙**: 매도/매수 **주문 발동 → KIS 주문 전송** 사이의 핫패스에는 **블로킹 동기 호출을 두지 않는다.**
+
+**금지 항목**:
+- REST 잔고조회(`_get_balance_holdings` 등 TTTC8434R)를 주문 직전 동기 호출 금지. 수량 검증은 사후 APBK0400 예외처리 안전망에 위임
+- 텔레그램 동기 전송(`_notify(tele=True)`, `requests.post`)을 주문 직전 호출 금지. 통지는 주문 **이후** `_notify_async`(비동기, fire-and-forget)로
+- 기타 네트워크/디스크 블로킹 작업을 주문 직전 경로에 추가 금지
+
+**KPI**: 발동(매도 큐 등록) → 주문 전송 내부 지연 **목표 ≤ 50ms**. 수백 ms 이상이면 블로킹 회귀로 간주하고 즉시 조사. _(임계값은 운영자가 조정 가능)_
+
+**관측 로그**: 매도 워커가 `[sell_latency] {종목}({코드}) 발동→주문 {ms}ms` 를 주문 직전 출력 (`_enqueue_str1_sell` 의 `enq_ts` 기준). `log_monitor` 가 비정상 대기값 감지 시 WARN.
+
+**배경**: 2026-05-21 아이진(185490) 매도 — 발동 28.136 → 실제 주문 ~30.660 (~2.5초). 원인 = 주문 직전 REST 잔고 재조회 (~1.5초) + 텔레그램 동기 전송 (~1.0초). 커밋 25f936e 에서 핫패스 제거 확정.
 
 ---
 
@@ -145,6 +160,7 @@ _Source: `ws_realtime_trading.py` 운영 흐름 + 사용자 의도_
 | 07:58 | `[07:58 잔고조회(NXT)]` 출력 | 미출력 = WARN |
 | 08:00 | NXT 프리마켓 대상 표기 tdy_ctrt ≥ +28% | 미달 종목 포함 = WARN |
 | 09:00~15:20 | 분당 체결 수신 건수 > 0 | 5분 0건 = CRITICAL |
+| 09:00~15:20 | `[sell_latency]` 수백 ms 이상 | WARN (블로킹 회귀 의심) |
 | 15:20 | 종가매수 대상 전환 로그 | 미출력 = WARN |
 | 20:00~20:01 | 정상 종료 로그 | 15:30 이전 종료 = CRITICAL |
 
@@ -160,3 +176,4 @@ _신규 항목은 `changelog-manager` 에이전트가 append._
 - 2026-04-10 — 이슈 3 (e6c04b9): SIGSEGV 원인 제거 — `faulthandler.dump_traceback_later(60)` 삭제 (C 확장 스택 순회 → signal 11, 4/10 3회 확인)
 - 2026-04-10 — 이슈 4 (e6c04b9): 데드락 근본 수정 — `kis_auth_llm.send_request()` `fut.result()` → `fut.result(timeout=5)` (`_kws_lock` 내 asyncio 무한대기 → 4/9 silent hang 9시간 원인)
 - 2026-04-10 — 이슈 5 (d564b23): 자동 재시작 래퍼 `ws_realtime_trading_runner.sh` 추가 — SIGSEGV/데드락 등 비정상 사망 시 Telegram 알림 + 자동 복구 (20:10 이후/20회 초과 시 중단). crontab을 runner.sh 경유로 변경 필요
+- 2026-05-21 (intent-tracker) — 주문 핫패스 지연 금지 원칙 수립 (목표 ≤50ms, 수백 ms = 블로킹 회귀 WARN). 배경: 아이진 매도 2.5초 지연 (커밋 25f936e)

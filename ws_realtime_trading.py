@@ -11610,7 +11610,7 @@ def ingest_loop():
                             except Exception:
                                 pass
                         logger.info(
-                            f"{ts_prefix()} [WSS전환후 시세 정상수신] {name}({code}){_price}"
+                            f"{ts_prefix()} [WSS전환후 첫 시세 정상수신] {name}({code}){_price}"
                         )
                     _last_trid_per_code[code] = trid
                     # 57/59 종목이 H0STCNT0(실시간체결) 수신 → 30분 단일가 아님 → 일반종목 전환

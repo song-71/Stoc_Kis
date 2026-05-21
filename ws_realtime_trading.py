@@ -11597,7 +11597,8 @@ def ingest_loop():
                     _last_recv_ts[code] = now
                     _last_any_recv_ts = now
                     _no_data_rebuild_count = 0  # 데이터 수신 → 재구독 실패 카운터 리셋
-                    # 종목별 구독 전환 후 첫 체결가 수신 로깅
+                    # 종목별 구독 전환 후 첫 실시간 시세 정상 수신 로깅
+                    # (시장 시세 stck_prpr=현재가. 내 주문 체결[체결통보-체결]과 무관 — 혼동 방지 위해 용어 분리)
                     prev_trid = _last_trid_per_code.get(code)
                     if prev_trid and prev_trid != trid:
                         name = code_name_map.get(code, code)
@@ -11605,11 +11606,11 @@ def ingest_loop():
                         _price = ""
                         if _pr_col and _pr_col in df_code.columns:
                             try:
-                                _price = f" 체결가={int(float(str(df_code[_pr_col][-1]).replace(',', '') or 0)):,}"
+                                _price = f" 현재가={int(float(str(df_code[_pr_col][-1]).replace(',', '') or 0)):,}"
                             except Exception:
                                 pass
                         logger.info(
-                            f"{ts_prefix()} [체결가 수신] {name}({code}){_price}"
+                            f"{ts_prefix()} [WSS전환후 시세 정상수신] {name}({code}){_price}"
                         )
                     _last_trid_per_code[code] = trid
                     # 57/59 종목이 H0STCNT0(실시간체결) 수신 → 30분 단일가 아님 → 일반종목 전환

@@ -4661,7 +4661,7 @@ def _log_mode_transition(prev: RunMode | None, cur: RunMode) -> None:
         _notify(f"{ts_prefix()} 15:30 종가 체결가 구독 전환")
     elif cur == RunMode.OVERTIME_EXP:
         if prev == RunMode.OVERTIME_REAL:
-            _notify(f"{ts_prefix()} [시간외] 체결가 수신 완료 → 예상체결가 복귀")
+            _notify(f"{ts_prefix()} [시간외] 10분단위 실시간체결가 구독 종료 → 예상체결가 복귀")
         else:
             _notify(f"{ts_prefix()} [시간외] 예상체결가 구독 시작", tele=True)
     elif cur == RunMode.OVERTIME_REAL:

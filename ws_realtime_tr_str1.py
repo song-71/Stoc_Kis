@@ -4,7 +4,7 @@ Str1 실전 실시간 매도 전략 + 상한가 근접 매수 전략 모듈
 == 기존 전략 ==
 - 08:29~09:00 사전 모니터링 매도 / 09:00 이후 실시간 매도 (check_realtime_sell)
 - VI 매수 / VI 매도 (vi_buy_strategy / check_vi_sell)
-- 수수료·세금 포함 실수익 계산 (calc_sell_pnl)
+- (수수료·세금 상수 FEE_RATE_*, 실수익 계산 calc_sell_pnl 은 kis_utils 로 이전 — 공용 유틸)
 
 == 상한가 근접 매수 전략 (문서: docs/01. up_limit_buy_str_260420.md) ==
 - 25~28% 구간 다중 필터 AND 통과 시 매수
@@ -21,13 +21,9 @@ Str1 실전 실시간 매도 전략 + 상한가 근접 매수 전략 모듈
    실제 주문·상태 관리는 ws_realtime_trading.py 에서 수행.
 """
 from __future__ import annotations
-from kis_utils import round_to_tick, price_plus_n_ticks  # 호가단위 유틸 (kis_utils 통합)
-
-# ── 수수료·세금 상수 ──────────────────────────────────────────────────────────
-FEE_RATE_MARKET_BUY  = 0.0015   # 시장가 매수 수수료+세금+슬리피지 0.15%
-FEE_RATE_MARKET_SELL = 0.0035   # 시장가 매도 수수료+세금+슬리피지 0.35%
-FEE_RATE_LIMIT_BUY   = 0.00015  # 지정가 매수 수수료 0.015%
-FEE_RATE_LIMIT_SELL  = 0.002    # 지정가 매도 수수료+세금 0.2%
+# 호가단위·수수료·손익 계산은 kis_utils 단일 출처 (전략파일=전략 판단만)
+# FEE_RATE_* / calc_sell_pnl 은 kis_utils 로 이전됨.
+from kis_utils import round_to_tick, price_plus_n_ticks  # noqa: F401
 
 
 # ── 핵심 전략 판단 함수 ────────────────────────────────────────────────────────
@@ -257,40 +253,7 @@ def check_vi_sell(
 
 # ── 수익 계산 ──────────────────────────────────────────────────────────────────
 
-def calc_sell_pnl(
-    buy_price: float,
-    sell_price: float,
-    qty: int,
-    market: str = "KOSPI",
-) -> dict:
-    """
-    매도 수익·손익 계산 (수수료·세금 포함).
-
-    buy_price  : 실제 매수 체결가 (전일 종가)
-    sell_price : 매도 주문 기준가 (bidp1 또는 시장가)
-    qty        : 수량
-
-    Returns dict:
-        actual_sell_price : 슬리피지 반영 실 매도가
-        buy_amt           : 매수 비용 (수수료 포함)
-        sell_amt          : 매도 수익 (수수료·세금 포함)
-        pnl               : 손익 (sell_amt - buy_amt)
-        ret_pct           : 수익률 (%)
-    """
-    actual_sell_price = round_to_tick(
-        sell_price * (1 - FEE_RATE_MARKET_SELL), market
-    )
-    buy_amt  = buy_price * qty * (1 + FEE_RATE_LIMIT_BUY)
-    sell_amt = actual_sell_price * qty
-    pnl      = sell_amt - buy_amt
-    ret_pct  = (actual_sell_price / buy_price - 1) * 100 if buy_price > 0 else 0.0
-    return {
-        "actual_sell_price": actual_sell_price,
-        "buy_amt":  buy_amt,
-        "sell_amt": sell_amt,
-        "pnl":      pnl,
-        "ret_pct":  ret_pct,
-    }
+# calc_sell_pnl → kis_utils 로 이전 (수수료·손익 계산은 전략 무관 공용 유틸, 단일 출처).
 
 
 # =============================================================================

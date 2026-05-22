@@ -633,11 +633,10 @@ sys.modules["kis_auth"] = ka
 
 from domestic_stock_functions_ws import *  # noqa: F403,E402
 import json  # noqa: E402
-from kis_utils import is_holiday, load_config, load_symbol_master, save_config, calc_limit_up_price, price_minus_one_tick, price_plus_n_ticks, round_to_tick, print_table, KRX_code_batch  # noqa: E402  # [260513] uplimit 스톱주문 호가 반올림 누락 복구
+from kis_utils import is_holiday, load_config, load_symbol_master, save_config, calc_limit_up_price, price_minus_one_tick, price_plus_n_ticks, round_to_tick, print_table, KRX_code_batch, calc_sell_pnl  # noqa: E402  # [260513] uplimit 스톱주문 호가 반올림 누락 복구 / [260522] calc_sell_pnl kis_utils 이전
 from ws_realtime_tr_str1 import (  # noqa: E402  (상한가 근접 매수 + 종가 폭락 필터 포함)
     check_opening_call_auction_sell, check_opening_call_auction_cancel, check_realtime_sell,
     vi_buy_strategy, vi_should_cancel, check_vi_sell,
-    calc_sell_pnl, FEE_RATE_MARKET_SELL,
     # 상한가 근접 매수 전략 (docs/01. up_limit_buy_str_260420.md):
     uplimit_approach_buy_signal, uplimit_approach_exit,
     closing_crash_filter_signal, closing_next_day_exit,
@@ -4749,11 +4748,11 @@ def _check_strategy_swap() -> None:
         mod = importlib.import_module(module_name)
         importlib.reload(mod)
         # 리로드된 함수를 글로벌에 반영
-        global check_opening_call_auction_sell, check_opening_call_auction_cancel, check_realtime_sell, calc_sell_pnl
+        # calc_sell_pnl 은 kis_utils 공용 유틸로 이전 — 전략 스왑 대상 아님 (재바인딩 제외)
+        global check_opening_call_auction_sell, check_opening_call_auction_cancel, check_realtime_sell
         check_opening_call_auction_sell = getattr(mod, "check_opening_call_auction_sell", check_opening_call_auction_sell)
         check_opening_call_auction_cancel = getattr(mod, "check_opening_call_auction_cancel", check_opening_call_auction_cancel)
         check_realtime_sell = getattr(mod, "check_realtime_sell", check_realtime_sell)
-        calc_sell_pnl = getattr(mod, "calc_sell_pnl", calc_sell_pnl)
         # config에 적용 완료 기록
         cfg["strategy_swap"] = {
             "status": "applied",

@@ -1005,6 +1005,54 @@ def price_plus_n_ticks(price: float, n: int = 1, market: str = "KOSPI") -> float
     return round_to_tick(price + tick * n, market)
 
 
+# ── 수수료·세금 상수 (전략·실행·시뮬 공용 단일 출처) ──────────────────────────
+FEE_RATE_MARKET_BUY  = 0.0015   # 시장가 매수 수수료+세금+슬리피지 0.15%
+FEE_RATE_MARKET_SELL = 0.0035   # 시장가 매도 수수료+세금+슬리피지 0.35%
+FEE_RATE_LIMIT_BUY   = 0.00015  # 지정가 매수 수수료 0.015%
+FEE_RATE_LIMIT_SELL  = 0.002    # 지정가 매도 수수료+세금 0.2%
+
+
+def get_tick_size(price: float, market: str = "KOSPI") -> int:
+    """호가단위 공개 래퍼 (내부 _kr_tick_size)."""
+    return _kr_tick_size(price, market)
+
+
+def calc_sell_pnl(
+    buy_price: float,
+    sell_price: float,
+    qty: int,
+    market: str = "KOSPI",
+) -> dict:
+    """
+    매도 수익·손익 계산 (수수료·세금 포함). [str1 → kis_utils 이전: 전략 무관 공용 유틸]
+
+    buy_price  : 실제 매수 체결가 (전일 종가)
+    sell_price : 매도 주문 기준가 (bidp1 또는 시장가)
+    qty        : 수량
+
+    Returns dict:
+        actual_sell_price : 슬리피지 반영 실 매도가
+        buy_amt           : 매수 비용 (수수료 포함)
+        sell_amt          : 매도 수익 (수수료·세금 포함)
+        pnl               : 손익 (sell_amt - buy_amt)
+        ret_pct           : 수익률 (%)
+    """
+    actual_sell_price = round_to_tick(
+        sell_price * (1 - FEE_RATE_MARKET_SELL), market
+    )
+    buy_amt  = buy_price * qty * (1 + FEE_RATE_LIMIT_BUY)
+    sell_amt = actual_sell_price * qty
+    pnl      = sell_amt - buy_amt
+    ret_pct  = (actual_sell_price / buy_price - 1) * 100 if buy_price > 0 else 0.0
+    return {
+        "actual_sell_price": actual_sell_price,
+        "buy_amt":  buy_amt,
+        "sell_amt": sell_amt,
+        "pnl":      pnl,
+        "ret_pct":  ret_pct,
+    }
+
+
 def calc_limit_down_price(prev_close: float, market: str = "KOSPI") -> float:
     """KRX 공식 하한가: 변동폭(기준가×30%)을 호가단위로 절사 → 기준가-변동폭을 호가단위로 올림(ceil)."""
     if prev_close is None or prev_close != prev_close or prev_close <= 0:

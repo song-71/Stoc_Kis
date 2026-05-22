@@ -2,6 +2,35 @@
 
 ---
 
+## [2026-05-22] fbe62d3
+- **Category**: fix
+- **Title**: H0STMKO0 keepalive 활성화 + WSS 연결 후 재구독 + CB/사이드카 처리 분리
+- **Files**: `ws_realtime_trading.py`, `rules/trading_project_main_plan.md`
+- **Changes**:
+  1. **[A] `_mkstatus_sub_add` 보류 처리 (`_mkstatus_pending` 신설)**
+     - WSS 미연결 시점(예: 08:28:10 보유종목 H0STMKO0 구독 호출)에 `_active_kws is None`이면
+       조용히 no-op이 되어 구독이 영영 안 됐던 버그 수정.
+     - WSS 미연결 시 신규 세트 `_mkstatus_pending`에 보류 후 `[H0STMKO0] WSS 미연결 → N건 보류` 로깅.
+     - 연결 시 `run_ws_forever` open_map 빌드에서 흡수.
+  2. **[B] `run_ws_forever` open_map 빌드에 H0STMKO0 명시 (재)구독 추가**
+     - `_MKT_KEEPALIVE_INITIAL`(삼성전자/카카오게임즈)은 정의만 있고 실제 구독 코드가 없는
+       dead config였음. 부팅·재연결마다 keepalive(KOSPI/KOSDAQ 각 1) + 보류분 + 기존 동적코드를
+       `H0STMKO0_MAX_SLOTS(5)` cap·우선순위(보유>VI>keepalive>기타) 적용해 `market_status_krx`로 구독.
+     - keepalive 부작용 방지: `_code_market_map.setdefault`, 허위 `[VI해제]` 차단용
+       `_vi_cls_cache.setdefault(c, "0")`, `_last_mkop_event.setdefault` 추가.
+  3. **[C] `_on_market_status_krx` CB/사이드카 처리 분리**
+     - 사이드카(187/397=매수·매도 프로그램매매 호가효력정지, 388/398 해제)는 개인 매매와 무관.
+       정보성 로그·텔레그램 알림만 남기고 시장 전파(REST 폴링 생략/재개) 발동을 제거.
+     - 시장 전파는 서킷브레이커류(174=발동, 184=개시, 164=시장임시정지 / 해제: 175·185)만 발동.
+     - 사이드카 해제(388/398) 수신 시 CB 시장전파 해제 로직에 진입하던 잠재버그 수정.
+  4. **`rules/trading_project_main_plan.md`**: H0STMKO0 운영 원칙(CB 감지 목적, 사이드카 vs CB 처리 분리) + mkop별 처리 기준 표 추가(intent-tracker).
+- **Impact**:
+  - 부팅 후·재연결 후 항상 H0STMKO0 최소 2종목(keepalive) 구독 보장 → CB 감지 채널 단절 근원 차단.
+  - 사이드카 수신 시 REST 폴링 생략이 발동되던 오동작 제거 → 사이드카 중에도 시장 정상 시세 수신 유지.
+  - 5/21·5/22 코스닥 매수 사이드카 미감지 원인(H0STMKO0 장중 0) 3중 버그 수정.
+
+---
+
 ## [2026-05-22] 7ca46d3
 - **Category**: refactor
 - **Title**: `[시간외] 체결가 수신 완료` 로그 문구 정리 → `[시간외] 10분단위 실시간체결가 구독 종료`

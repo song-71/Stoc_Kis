@@ -2,6 +2,25 @@
 
 ---
 
+## [2026-05-22] 521f211
+- **Category**: refactor
+- **Title**: kis_utils 공용유틸 일원화 — 수수료 상수·손익계산을 단일 출처로 이전
+- **Files**: `kis_utils.py`, `ws_realtime_tr_str1.py`, `ws_realtime_trading.py`
+- **Changes**:
+  1. **kis_utils.py — 공용 심볼 신규 추가**
+     - `FEE_RATE_MARKET_BUY/SELL`, `FEE_RATE_LIMIT_BUY/SELL` 상수 (수수료·세금·슬리피지, 전략·실행·시뮬 공용 단일 출처)
+     - `get_tick_size(price, market)` 공개 래퍼 신설 (`_kr_tick_size` 내부 함수 노출)
+     - `calc_sell_pnl(buy_price, sell_price, qty, market)` 함수 str1에서 이전 (price_plus_n_ticks 다음에 배치)
+  2. **ws_realtime_tr_str1.py — 전략 판단만 원칙 적용**
+     - `FEE_RATE_MARKET/LIMIT_BUY/SELL` 상수 정의 4개 제거 (kis_utils 이전)
+     - `calc_sell_pnl` 함수 정의 제거 (kis_utils 이전)
+     - import 주석·모듈 docstring 갱신 (round_to_tick/price_plus_n_ticks만 유지)
+  3. **ws_realtime_trading.py — import 정비 + 핫스왑 정리**
+     - kis_utils import에 `calc_sell_pnl` 추가 (직접 참조)
+     - str1 import 블록에서 `calc_sell_pnl`, `FEE_RATE_MARKET_SELL` dead-import 제거
+     - `_check_strategy_swap` 핫스왑에서 `calc_sell_pnl` 재바인딩 제거 (공용 유틸은 전략 스왑 대상 아님)
+- **Impact**: Str2 서버 포팅 선결 조건 충족. 전략 교체 시 수수료·손익 계산 결합 문제 제거. 향후 신규 전략 파일은 kis_utils에서 import만 하면 되며 중복 정의 불필요.
+
 ## [2026-05-22] fbe62d3
 - **Category**: fix
 - **Title**: H0STMKO0 keepalive 활성화 + WSS 연결 후 재구독 + CB/사이드카 처리 분리

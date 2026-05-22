@@ -1,6 +1,6 @@
 # Stoc_Kis Trading Project — Main Plan
 
-_Last updated: 2026-05-21 (by: intent-tracker)_
+_Last updated: 2026-05-22 (by: intent-tracker)_
 _Source: `ws_realtime_trading.py` 운영 흐름 + 사용자 의도_
 
 이 문서는 Stoc_Kis 프로젝트의 **운영 의도·방향·판정 기준**의 단일 소스다.
@@ -29,6 +29,16 @@ _Source: `ws_realtime_trading.py` 운영 흐름 + 사용자 의도_
 - 커밋 시 `.env`, `config.json`, 토큰 파일(`kis_token_*.json`) 푸시
 - `git add -A` / `git add .` 남용 (민감 파일 혼입 위험)
 - 매도완료 T+2 결제 전 `hldg_qty` 만으로 보유 판단 (반드시 `ord_psbl_qty` 체크)
+
+### 장운영정보(H0STMKO0) 구독 원칙
+
+- **실질 목적은 서킷브레이커(CB) 감지다.** keepalive 구독(KOSPI/KOSDAQ 각 1종목 상시 유지)도 CB 감지 보장을 위한 것이며, WSS 연결 후 재구독 포함.
+- **사이드카(mkop 187=매수/397=매도/388·398 등)는 프로그램매매 호가효력 정지이며 개인 매매에는 영향이 없다.**
+  - 처리: 정보성 로그 + 텔레그램 알림만 남긴다.
+  - **시장 단위 동작(REST 폴링 생략/재개 등)을 발동시키지 않는다.** 사이드카 중에도 시장은 정상 거래되므로 폴링을 끊으면 안 된다.
+- **서킷브레이커류(mkop 174=발동, 184=개시, 164=시장임시정지 / 해제: 175·185)는 시장 단위 동작을 발동시킨다.**
+  - CB 발동 시 REST 시세가 갱신되지 않으므로 폴링 생략이 타당하다.
+  - CB 해제 수신 시 폴링 재개.
 
 ### 성능 원칙 — 주문 핫패스 지연 금지
 
@@ -153,6 +163,17 @@ _Source: `ws_realtime_trading.py` 운영 흐름 + 사용자 의도_
 - `no data for.*resubscribe`
 - `| WARNING |` 레벨 로그
 
+### 장운영정보(H0STMKO0) 감지 기준
+| mkop 코드 | 의미 | 처리 방향 |
+|---|---|---|
+| 174 | 서킷브레이커 발동 | CRITICAL 알림 + REST 폴링 생략 |
+| 184 | 서킷브레이커 개시 | CRITICAL 알림 + REST 폴링 생략 |
+| 164 | 시장임시정지 | CRITICAL 알림 + REST 폴링 생략 |
+| 175 / 185 | 서킷브레이커 해제 | INFO 알림 + REST 폴링 재개 |
+| 187 / 397 / 388 / 398 | 사이드카(매수/매도) | INFO 로그 + 텔레그램 알림만. 시장 동작 변경 없음 |
+
+- H0STMKO0 수신 0건(keepalive 종목도 포함해서)이 장중 지속되면 → **WARN** (WSS 구독 누락 의심)
+
 ### 시간대별 특이 체크
 | 시간대 | 체크 포인트 | 위반 severity |
 |---|---|---|
@@ -177,3 +198,4 @@ _신규 항목은 `changelog-manager` 에이전트가 append._
 - 2026-04-10 — 이슈 4 (e6c04b9): 데드락 근본 수정 — `kis_auth_llm.send_request()` `fut.result()` → `fut.result(timeout=5)` (`_kws_lock` 내 asyncio 무한대기 → 4/9 silent hang 9시간 원인)
 - 2026-04-10 — 이슈 5 (d564b23): 자동 재시작 래퍼 `ws_realtime_trading_runner.sh` 추가 — SIGSEGV/데드락 등 비정상 사망 시 Telegram 알림 + 자동 복구 (20:10 이후/20회 초과 시 중단). crontab을 runner.sh 경유로 변경 필요
 - 2026-05-21 (intent-tracker) — 주문 핫패스 지연 금지 원칙 수립 (목표 ≤50ms, 수백 ms = 블로킹 회귀 WARN). 배경: 아이진 매도 2.5초 지연 (커밋 25f936e)
+- 2026-05-22 (intent-tracker) — H0STMKO0 운영 원칙 수립: 실질 목적=CB 감지. 사이드카는 정보성 로그/알림만(시장 동작 변경 없음), CB류만 REST 폴링 생략/재개 발동. mkop별 처리 기준 표 추가

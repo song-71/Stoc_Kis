@@ -1659,6 +1659,22 @@
   7. `_backup_log_file()` 추가: 종료 시 `wss_realtime_trading_YYMMDD.out` 날짜별 백업
 - **Impact**: 종가매매 전환 시 WSS 재연결 없이 안정적으로 구독 전환. 텔레그램 메시지 별도 파일로 사후 추적 가능
 
+## [2026-05-23] d1864da
+- **Category**: feat
+- **Title**: 전일 상한가 Str2 전략 서버 라이브 wiring — 기본 비활성(STR2_ENABLED=False)
+- **Files**: `ws_realtime_tr_str2.py` (신규), `ws_realtime_trading.py`
+- **Changes**:
+  1. **ws_realtime_tr_str2.py 신규**: per-tick 판단 함수 14개 + `Str2State`(dataclass) + 상수. kis_utils 의존만. 로컬 검증 완료 코드 서버에 그대로 이식.
+  2. **STR2_ENABLED=False 플래그(145행)**: config로만 활성화 가능. 기본 OFF 상태에서 str1/v5/VI/종가 거동 100% 불변 격리 확인.
+  3. **신규 스트리밍 지표**: `_str2_compute_stoch_k`(1500틱), `_str2_update_bb_hi_max`(rolling600), `_str2_baked_bb`(ddof=0).
+  4. **상태 영속화**: `_save_str2_state` / `_restore_str2_state_on_startup` — 재시작 시 Str2 포지션 복원.
+  5. **동기 주문**: `_str2_place_buy` / `_str2_place_sell` / `_str2_place_cancel` / `_str2_qty` + 체결처리 `_handle_str2_ccnl_fill`.
+  6. **드라이버**: `_check_str2_from_tick`(11480) — tick 수신 시마다 매수/매도/취소 판단. `_check_str2_carry_premarket`(11721) — 장 시작 전 익일 carry 처리. ingest dispatch 게이트(12549) — STR2_ENABLED OFF 시 dispatch 자체 스킵.
+  7. **체결통보 hook 분기**: `_on_ccnl_notice_filled`(2728) str2 종목 분기, str2 종목을 str1에 자동등록 차단(2805, `_is_str2_code` 가드) — STR2_ENABLED=False 시 기존과 동일.
+  8. **게이트**: `_refresh_str2_enabled`(4778) + `_check_strategy_swap`(4831) — config 변경 감지 후 str2 모듈핸들 재바인딩.
+  9. **검증**: py_compile 3파일(ws_realtime_trading / ws_realtime_tr_str2 / kis_utils) 통과, `import ws_realtime_tr_str2` OK, 게이트 전수 확인.
+- **Impact**: 전일 상한가 종목 대상 Str2 전략을 서버 라이브에 완전 wiring. STR2_ENABLED=False 기본값으로 기존 전략 완전 격리. config 한 줄로 전략 활성화 가능.
+
 ## [2026-05-20] e120fef
 - **Category**: fix
 - **Title**: 1007 근원 차단 — websockets asyncio API lenient 패치 + 시초 backoff 단축

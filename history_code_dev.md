@@ -2,6 +2,63 @@
 
 ---
 
+## [2026-05-26] dc4a9fa
+- **Category**: feat
+- **Title**: 휴일 가드 추가 — 휴장일 idle 프로세스 방지
+- **Files**: `kis_1m_API_to_Parquet_NXT.py`, `ws_log_monitor.py`
+- **Changes**:
+  1. **kis_1m_API_to_Parquet_NXT.py**: main() 진입 직후 `is_holiday()` 검사.
+     휴장일이면 다운로드 생략 + 텔레그램 통지 후 return.
+     `is_holiday()` 예외 시 경고 로그만 남기고 정상 진행(안전망).
+  2. **ws_log_monitor.py**: `run()` 시작부에 `is_holiday()` 검사.
+     휴장일이면 텔레그램 통지 후 즉시 return — 종일 idle 루프 방지.
+- **Impact**: 휴장일에 불필요하게 기동된 다운로드/모니터 프로세스가 아무 것도 하지 않고 깔끔하게 종료됨.
+
+## [2026-05-26] 04f9e92
+- **Category**: fix
+- **Title**: 5/26 09:01 WSS 56분 두절 근본수정 — scheduler 정지 시에도 watchdog/재시작 보장
+- **Files**: `kis_auth_llm.py`, `ws_realtime_trading.py`
+- **Changes**:
+  1. **kis_auth_llm.py — send_request timeout 추가** (line 1069):
+     `fut.result()` → `fut.result(timeout=10.0)`.
+     asyncio 루프 wedge 시 10초 후 TimeoutError 발생, `_send_subscribe` 의 try/except 가 잡아 락 해제.
+  2. **ws_realtime_trading.py — 4가지 수정**:
+     - `_trigger_ws_rebuild` 연속실패 카운터(`_rebuild_consecutive_fail_count` / `_REBUILD_FAIL_EXIT_LIMIT=5`).
+       임계 초과 시 텔레그램 통지 + `os._exit(2)` → runner 자동재시작 유도 (rebuild 무한루프 탈출).
+     - 무수신 watchdog `_wss_norecv_watchdog_loop` 을 독립 데몬 스레드로 분리.
+       scheduler_loop 정지와 무관하게 `_last_any_recv_ts` 만 보고 독자 판정.
+     - watchdog 활성 시간창 `dtime(9,30)` → `dtime(9,0)` 확대 (개장 직전 구독 분리 사각지대 제거).
+     - [체결통보-체결] 매도 발송부에 매수가/PNL/사유 첨부.
+       `_str1_sell_state[code]["buy_price"]` / `["sell_reason"]` 조회 후 텔레그램 본문에 추가.
+- **Impact**:
+  - scheduler_loop 가 wedge 되어도 watchdog 독립 스레드가 180초 무수신 시 `os._exit(2)` 보장.
+  - send_request timeout 으로 락 점유 무한 블로킹 제거 → 정상 케이스에서 10초 내 복구.
+  - 매도 텔레그램에 사유/매수가/PNL 이 함께 표시되어 수동 확인 불필요.
+
+## [2026-05-26] 6f0c2b6
+- **Category**: chore
+- **Title**: ws_realtime_watchdog.py 좀비 인스턴스 reaper 스크립트 추가
+- **Files**: `scripts/cron_start_watchdog.sh` (신규)
+- **Changes**:
+  - 매일 KST 08:25(UTC 23:25, 월~금) cron 실행 wrapper.
+  - 기존 누적 인스턴스를 SIGTERM → 5초 대기 → SIGKILL 로 정리 후 새 인스턴스 nohup 기동.
+  - cron_start_log_monitor.sh 패턴을 그대로 차용.
+  - crontab 등록(`25 23 * * 0-4`)은 시스템 crontab이라 git 추적 외.
+- **Impact**: 워치독 프로세스 좀비 누적 차단 — 매일 교체 기동으로 메모리 누수·슬롯 충돌 예방.
+
+## [2026-05-26] 54b9be6
+- **Category**: docs
+- **Title**: 5/26 WSS 56분 두절 근본원인 분석 문서 추가
+- **Files**: `ws_monitoring_research_260526.md` (신규)
+- **Changes**:
+  - research-analyst 산출물. 사고 로그(PID 1495038) 기반 원인 4개 분류:
+    Issue 1 — `send_request` 영구 블로킹 (핵심 원인).
+    Issue 2 — watchdog 이 scheduler 와 같은 스레드여서 동반 정지.
+    Issue 3 — `_trigger_ws_rebuild` timeout 반복 무한루프 탈출 조건 없음.
+    Issue 4 — 광진실업 매도 체결 통보에 사유/매수가 누락.
+  - fix(wss-recovery) 커밋의 설계 근거 문서로 보관.
+- **Impact**: 재발 방지 설계 검증 자료 및 향후 유사 사고 진단 참고 기록.
+
 ## [2026-05-22] 521f211
 - **Category**: refactor
 - **Title**: kis_utils 공용유틸 일원화 — 수수료 상수·손익계산을 단일 출처로 이전

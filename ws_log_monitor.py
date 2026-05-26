@@ -18,6 +18,7 @@ from collections import defaultdict
 SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
 from telegMsg import tmsg
+from kis_utils import is_holiday
 
 KST = timezone(timedelta(hours=9))
 PROGRAM_NAME = Path(__file__).name
@@ -403,6 +404,23 @@ class LogMonitor:
 
     # ─── 메인 루프 ──────────────────────────────────────────────────
     def run(self):
+        # 휴일 가드 — 휴장일이면 감시할 거래 로그가 없으므로 종일 idle 방지 위해 즉시 종료
+        try:
+            if is_holiday():
+                msg = f"{ts_prefix()} {PROGRAM_NAME} => 휴일이므로 로그 모니터링을 종료합니다."
+                print(msg)
+                _monitor_log(f"[TELE] {msg}")
+                if not DRY_RUN:
+                    try:
+                        tmsg(msg, "-t")
+                    except Exception:
+                        pass
+                return
+        except Exception as e:
+            # 휴일 판정 실패 시 감시는 진행하되 경고만 남김
+            print(f"[monitor][WARN] 휴일 판정 실패, 감시 계속 진행: {e}")
+            _monitor_log(f"[WARN] 휴일 판정 실패, 감시 계속 진행: {e}")
+
         start_msg = f"{ts_prefix()} {PROGRAM_NAME} => 로그 모니터링을 시작합니다. (감시대상: {LOG_PATH.name})"
         print(start_msg)
         _monitor_log(f"[TELE] {start_msg}")

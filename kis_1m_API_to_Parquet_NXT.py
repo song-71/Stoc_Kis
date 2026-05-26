@@ -33,7 +33,7 @@ import boto3
 
 sys.path.extend(['../..', '.'])
 import kis_auth as ka
-from kis_utils import LogManager, load_kis_data_layout, load_symbol_master, print_table, stQueryDB
+from kis_utils import LogManager, load_kis_data_layout, load_symbol_master, print_table, stQueryDB, is_holiday, send_telegram
 from inquire_time_itemchartprice import inquire_time_itemchartprice
 
 logging.basicConfig(level=logging.INFO)
@@ -163,6 +163,17 @@ def main():
         logging.info("%s", out)
 
     _log("[1m_NXT] 프로그램 시작")
+
+    # 휴일 가드 — 휴장일이면 다운로드 생략하고 종료
+    try:
+        if is_holiday():
+            msg = f"[{Path(__file__).name}(1m NXT data download)] => 휴일로 프로그램을 종료합니다."
+            _log(msg)
+            send_telegram(msg)
+            return
+    except Exception as e:
+        # 휴일 판정 실패 시 다운로드는 진행하되 경고만 남김
+        _log(f"[1m_NXT][WARN] 휴일 판정 실패, 다운로드 계속 진행: {e}")
 
     any_written = False
     summary_rows = []

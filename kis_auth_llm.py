@@ -1066,12 +1066,19 @@ class KISWebSocket:
         except KeyboardInterrupt:
             print("Closing by KeyboardInterrupt")
 
-    def send_request(self, request, tr_type: str, data, kwargs: dict | None = None):
+    def send_request(self, request, tr_type: str, data, kwargs: dict | None = None, timeout: float = 10.0):
+        """[260526] asyncio 루프 wedge 방어용 timeout 추가.
+        기존: fut.result() — 타임아웃 없음 → 루프가 wedge 되면 호출 스레드를 영구 블로킹.
+              (5/26 09:01 사고: scheduler_loop 가 _kws_lock 든 채 무한 대기 → watchdog/재구독
+               동일 스레드에 있어 56분 두절). 같은 파일 close() 의 timeout 과 동일하게 10.0s 적용.
+        timeout 발생 시 concurrent.futures.TimeoutError 가 호출자에 그대로 전달되어
+        _send_subscribe 의 try/except 가 잡고 락을 풀게 한다.
+        """
         if self._ws is None or self._loop is None:
             raise RuntimeError("WebSocket not connected")
         coro = self.send_multiple(self._ws, request, tr_type, data, kwargs)
         fut = asyncio.run_coroutine_threadsafe(coro, self._loop)
-        return fut.result()
+        return fut.result(timeout=timeout)
 
     def close(self, timeout: float = 10.0):
         """[260427] close frame 전송 완료까지 동기 대기.

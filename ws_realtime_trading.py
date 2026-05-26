@@ -4607,7 +4607,15 @@ def _v5_diag_dump_if_due() -> None:
 
 
 def _trigger_ws_rebuild():
-    """종목 변경 시 즉시 동적 구독/해제 적용 (재연결 없이)."""
+    """종목 변경 시 즉시 동적 구독/해제 적용 (재연결 없이).
+
+    [260526] 연속 timeout 시 os._exit(2) 에스컬레이션 추가.
+    배경: 5/26 09:03~09:59 동안 동일 timeout 이 16회 반복되며 runner 재시작이 발동하지 못함.
+          원인은 dead socket 이 아니라 scheduler_loop 가 _kws_lock 을 점유한 채 멈춰 있던 것.
+          어느 쪽이든 임계(_REBUILD_FAIL_EXIT_LIMIT=5) 초과 시 프로세스를 종료해 runner 가 재기동.
+    """
+    global _rebuild_consecutive_fail_count
+
     def _do():
         with _kws_lock:
             if _active_kws is not None:
@@ -4620,12 +4628,47 @@ def _trigger_ws_rebuild():
     if t.is_alive():
         # timeout → _do 스레드가 _kws_lock 들고 dead socket에 send() 중 블로킹 가능
         # dead socket 강제 종료 → send() 에러로 _kws_lock 해제 → scheduler_loop 교착 방지
-        logger.warning(f"{ts_prefix()} [ws] _trigger_ws_rebuild timeout(5s) — dead socket 의심, 강제 종료")
+        _rebuild_consecutive_fail_count += 1
+        logger.warning(
+            f"{ts_prefix()} [ws] _trigger_ws_rebuild timeout(5s) "
+            f"({_rebuild_consecutive_fail_count}/{_REBUILD_FAIL_EXIT_LIMIT}) — "
+            f"dead socket/락점유 의심, 강제 종료"
+        )
         try:
             if _active_kws is not None:
                 _request_ws_close(_active_kws)
         except Exception:
             pass
+        if _rebuild_consecutive_fail_count >= _REBUILD_FAIL_EXIT_LIMIT:
+            try:
+                _notify(
+                    f"{ts_prefix()} [ws] _trigger_ws_rebuild "
+                    f"{_rebuild_consecutive_fail_count}회 연속 실패 → "
+                    f"os._exit(2) 하드종료 (runner 재시작 유도)",
+                    tele=True,
+                )
+            except Exception:
+                pass
+            try:
+                logger.error(
+                    f"{ts_prefix()} [ws] rebuild "
+                    f"{_rebuild_consecutive_fail_count}회 연속 실패 → os._exit(2)"
+                )
+            except Exception:
+                pass
+            try:
+                _set_runtime_status(RUNTIME_STATUS_STOPPED)
+            except Exception:
+                pass
+            time.sleep(0.5)
+            os._exit(2)
+    else:
+        if _rebuild_consecutive_fail_count > 0:
+            logger.info(
+                f"{ts_prefix()} [ws] _trigger_ws_rebuild 성공 → 연속실패 카운터 리셋 "
+                f"(이전={_rebuild_consecutive_fail_count})"
+            )
+        _rebuild_consecutive_fail_count = 0
 
     # ── [주석] 재연결 방식 (동적 구독 문제 시 아래 주석 해제, 위 블록 주석 처리) ──
     # _ws_rebuild_event.set()
@@ -5409,6 +5452,73 @@ def _exec_external_order(cfg: dict, order: dict, idx: int) -> None:
         order["result"] = f"failed: {len(target_accounts)}계좌 전부 실패" + (f" ({_err_tail})" if _err_tail else "")
 
 
+# [260526] WSS 무수신 watchdog — 독립 데몬 스레드.
+# 배경: 종전 watchdog 은 scheduler_loop while 안에 있어 scheduler 가 _kws_lock 무한대기로
+#       정지하면 watchdog 도 동반 정지(5/26 사고). 이를 분리해 scheduler 와 무관하게 자체
+#       sleep 루프로 _last_any_recv_ts 만 보고 판정 → 임계 도달 시 os._exit(2).
+WSS_NO_RECV_EXIT_SEC = 180.0     # 180초 무수신 시 os._exit(2)
+WSS_NO_RECV_ALERT_SEC = 90.0     # 90초 무수신 시 텔레그램 경고 1회
+WSS_WATCHDOG_GRACE_SEC = 120.0   # 프로세스 시작 직후 120초는 유예
+
+
+def _wss_norecv_watchdog_loop():
+    """[260526] WSS 무수신 watchdog (독립 데몬).
+    - 시간창: 09:00 ~ 15:20 (종전 09:30 → 09:00 으로 확대: 개장 직후 구독 분리 사각지대 제거).
+    - 임계: 90초 알림 1회 → 180초 os._exit(2).
+    - _last_any_recv_ts 만 읽으므로 lock 불요(단일 float 갱신은 GIL 보호).
+    """
+    _process_start_ts = time.time()
+    _alert_sent = False
+    while not _stop_event.is_set():
+        try:
+            _now_t = datetime.now(KST).time()
+            if (dtime(9, 0) <= _now_t < dtime(15, 20)
+                and (time.time() - _process_start_ts) > WSS_WATCHDOG_GRACE_SEC):
+                _idle_sec = time.time() - _last_any_recv_ts if _last_any_recv_ts > 0 else 0
+                if _idle_sec >= WSS_NO_RECV_ALERT_SEC and not _alert_sent:
+                    try:
+                        _notify(
+                            f"{ts_prefix()} [wss_watchdog] ★ WSS {int(_idle_sec)}초 무수신 감지 "
+                            f"({int(WSS_NO_RECV_EXIT_SEC - _idle_sec)}초 후 프로세스 강제 종료 예정)",
+                            tele=True,
+                        )
+                    except Exception:
+                        pass
+                    _alert_sent = True
+                if _idle_sec >= WSS_NO_RECV_EXIT_SEC:
+                    try:
+                        _notify(
+                            f"{ts_prefix()} [wss_watchdog] ★★ WSS {int(_idle_sec)}초 무수신 "
+                            f"→ os._exit(2) 로 프로세스 종료 (runner 재시작 유도)",
+                            tele=True,
+                        )
+                    except Exception:
+                        pass
+                    try:
+                        logger.error(f"{ts_prefix()} [wss_watchdog] idle={int(_idle_sec)}s → os._exit(2)")
+                    except Exception:
+                        pass
+                    try:
+                        _set_runtime_status(RUNTIME_STATUS_STOPPED)
+                    except Exception:
+                        pass
+                    time.sleep(1.0)
+                    os._exit(2)
+                # 수신 재개 시 alert 플래그 리셋
+                if _idle_sec < 10 and _alert_sent:
+                    _alert_sent = False
+                    try:
+                        logger.info(f"{ts_prefix()} [wss_watchdog] 수신 재개, alert 리셋")
+                    except Exception:
+                        pass
+        except Exception as _we:
+            try:
+                logger.debug(f"[wss_watchdog] 예외: {_we}")
+            except Exception:
+                pass
+        time.sleep(1.0)
+
+
 def scheduler_loop():
     global _current_mode, _last_rebuild_ts, _last_no_data_warn_ts, _no_data_rebuild_count
     global _overtime_real_active, _overtime_real_last_progress_ts, _vi_delayed_codes, _vi_delay_until, _last_overtime_real_slot
@@ -5416,44 +5526,11 @@ def scheduler_loop():
     logger.info(f"{ts_prefix()} [scheduler] started")
     # ── 시작 시 cleanup: 08:30 이전이면 config 의 failed 외부주문 정리 (1회) ──
     _cleanup_failed_external_orders_at_startup()
-    # [260423] WSS 무수신 watchdog 상태
-    _process_start_ts = time.time()
-    _wss_recv_alert_sent = False
-    WSS_NO_RECV_EXIT_SEC = 180.0     # 180초 무수신 시 os._exit(2)
-    WSS_NO_RECV_ALERT_SEC = 90.0     # 90초 무수신 시 텔레그램 경고 1회
-    WSS_WATCHDOG_GRACE_SEC = 120.0   # 프로세스 시작 직후 120초는 유예
+    # [260526] WSS 무수신 watchdog 은 독립 데몬 스레드(_wss_norecv_watchdog_loop)로 분리됨.
     _last_per_code_log_ts = 0.0      # [260423] 종목별 수신 분포 주기 로그
     while not _stop_event.is_set():
         try:
             now = datetime.now(KST)
-            # [260423] WSS 무수신 watchdog — 09:30~15:20 장 시간대, 시작 유예 120초
-            try:
-                _now_t = now.time()
-                if (dtime(9, 30) <= _now_t < dtime(15, 20)
-                    and (time.time() - _process_start_ts) > WSS_WATCHDOG_GRACE_SEC):
-                    _idle_sec = time.time() - _last_any_recv_ts if _last_any_recv_ts > 0 else 0
-                    if _idle_sec >= WSS_NO_RECV_ALERT_SEC and not _wss_recv_alert_sent:
-                        _notify(
-                            f"{ts_prefix()} [wss_watchdog] ★ WSS {int(_idle_sec)}초 무수신 감지 "
-                            f"({int(WSS_NO_RECV_EXIT_SEC - _idle_sec)}초 후 프로세스 강제 종료 예정)",
-                            tele=True,
-                        )
-                        _wss_recv_alert_sent = True
-                    if _idle_sec >= WSS_NO_RECV_EXIT_SEC:
-                        _notify(
-                            f"{ts_prefix()} [wss_watchdog] ★★ WSS {int(_idle_sec)}초 무수신 "
-                            f"→ os._exit(2) 로 프로세스 종료 (runner 재시작 유도)",
-                            tele=True,
-                        )
-                        logger.error(f"{ts_prefix()} [wss_watchdog] idle={int(_idle_sec)}s → os._exit(2)")
-                        time.sleep(1.0)
-                        os._exit(2)
-                    # 수신 재개 시 alert 플래그 리셋
-                    if _idle_sec < 10 and _wss_recv_alert_sent:
-                        _wss_recv_alert_sent = False
-                        logger.info(f"{ts_prefix()} [wss_watchdog] 수신 재개, alert 리셋")
-            except Exception as _we:
-                logger.debug(f"[wss_watchdog] 예외: {_we}")
 
             # [260423] 종목별 WSS 수신 분포 주기 로그 (5분) — 수신 감소 원인 진단용
             try:
@@ -6020,6 +6097,10 @@ _last_any_recv_ts = 0.0
 _last_rebuild_ts = 0.0
 _last_no_data_warn_ts = 0.0
 _no_data_rebuild_count = 0   # 재구독 연속 실패 횟수 (데이터 수신 시 리셋)
+# [260526] _trigger_ws_rebuild 연속 timeout 카운터 (성공 시 0 리셋).
+# 임계 초과 시 os._exit(2) 로 runner 재시작 유도 (rebuild 무한루프 방지).
+_rebuild_consecutive_fail_count = 0
+_REBUILD_FAIL_EXIT_LIMIT = 5
 
 # 직전 parquet 저장 이후 초당 수신건수 통계 (최대/평균/현재 표기용)
 _per_sec_max_since_save = 0
@@ -12216,14 +12297,22 @@ def on_result(ws, tr_id, result, data_info):
                     price = int(float(str(row.get("cntg_unpr", 0) or 0).replace(",", "") or 0))
                     rmn = int(float(str(row.get("rmn_qty", 0) or 0).replace(",", "") or 0))
                     pnl_txt = ""
-                    if seln in ("01", "1") and price > 0:  # 매도체결 → PNL 계산
+                    reason_txt = ""
+                    buy_txt = ""
+                    if seln in ("01", "1") and price > 0:  # 매도체결 → PNL/사유/매수가 첨부
+                        # [260526] 매도 통보에 사유/매수가 누락되어 있어 부가 정보 추가
+                        # (str1_sell 이 _str1_sell_state[code]["sell_reason"]/["buy_price"] 에 기록함)
                         with _str1_sell_state_lock:
                             st = _str1_sell_state.get(code, {})
                             bp = float(st.get("buy_price") or 0)
+                            sell_reason = str(st.get("sell_reason") or "").strip()
                         if bp > 0:
                             pnl_info = calc_sell_pnl(bp, price, qty)
                             pnl_txt = f" | PNL≈{pnl_info['pnl']:+,.0f}원({pnl_info['ret_pct']:+.2f}%)"
-                    _notify(f"{ts_prefix()} [체결통보-체결] {side} {label} {qty}주 x {price:,}원 | 잔여={rmn} | 주문번호={oder_no}{pnl_txt}", tele=True)
+                            buy_txt = f" | 매수가={int(bp):,}원"
+                        if sell_reason:
+                            reason_txt = f" | 사유={sell_reason}"
+                    _notify(f"{ts_prefix()} [체결통보-체결] {side} {label} {qty}주 x {price:,}원 | 잔여={rmn} | 주문번호={oder_no}{buy_txt}{pnl_txt}{reason_txt}", tele=True)
             except Exception:
                 pass
         _on_ccnl_notice_filled(result, recv_ts)
@@ -13514,6 +13603,10 @@ if __name__ == "__main__":
     # 스케줄러 시작
     t_sched = threading.Thread(target=scheduler_loop, daemon=True)
     t_sched.start()
+
+    # [260526] WSS 무수신 watchdog 독립 데몬 (scheduler 정지와 무관하게 os._exit(2) 보장)
+    t_wss_wd = threading.Thread(target=_wss_norecv_watchdog_loop, name="wss-norecv-watchdog", daemon=True)
+    t_wss_wd.start()
 
     # REST 요청 워커
     t_rest = threading.Thread(target=_rest_worker, daemon=True)

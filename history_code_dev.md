@@ -2,6 +2,31 @@
 
 ---
 
+## [2026-06-01] 6babd24
+- **Category**: fix
+- **Title**: 260601 WSS 종일 두절 근본수정 — approval_key 계좌별 캐시 분리 + 무효키 self-heal
+- **Files**: `kis_auth_llm.py`, `ws_realtime_trading.py`, `rules/trading_project_main_plan.md`
+- **Changes**:
+  1. **근본원인 (260601 격리 재현 확정)**:
+     - KIS는 같은 appkey로 새 approval_key 발급 시 직전 키를 즉시 무효화(최신 1개만 유효).
+     - 기존 캐시가 날짜별 단일 파일(`KIS_approval_YYYYMMDD`)이라 a1/a2 두 계좌가 동일 파일을 서로 덮어써 키 충돌 → 무효 키로 WSS 접속 시도 → `invalid approval` → bare 1006 (dwell≈1.1s) 영구 반복. 재시작해도 동일 캐시 파일을 재사용하므로 복구 불가.
+  2. **kis_auth_llm.py**:
+     - approval_key 캐시를 **appkey(계좌)별+날짜별 분리** 저장(`config/approval/KIS_approval_{md5(appkey)[:12]}_{YYYYMMDD}`).
+     - **원자적 쓰기(temp→os.replace)** 적용 — 반쪽 읽기 방지.
+     - `auth_ws(force_new=True)` 파라미터 추가: 재발급 전 파일 재읽기 가드 — 다른 주체가 이미 갱신 시 채택(교차무효화 핑퐁 방지), 파일이 stale과 동일할 때만 실제 발급.
+     - 모듈 lock(`_auth_ws_lock`) 추가로 동일 프로세스 내 발급 직렬화.
+     - `_approval_appkey_tag` / `_approval_tmp_path` / `save_approval_key` / `read_approval_key` 가 appkey 인자 받도록 수정.
+  3. **ws_realtime_trading.py**:
+     - `run_ws_forever`: `dwell<15s` (무효 키 의심) 감지 시 `run_ws_forever._force_new_approval=True` 세트 → 다음 재접속에서 `ka.auth_ws(force_new=True)` 강제 재발급 (self-heal).
+     - `[REST보충]` 로그에 `temp_stop_yn` 값 출력 추가 (VI 감지 진단용).
+  4. **rules/trading_project_main_plan.md**:
+     - "WSS approval_key 관리 표준 (260601 사고 후 수립) — ★WSS 두절 시 1순위 점검" 섹션 추가 (증상식별 방법 + 원리 + 4규칙).
+- **Impact**:
+  - a1/a2 계좌가 서로의 approval_key를 무효화하는 교차 충돌 영구 제거.
+  - dwell<15s 반복 시 다음 재접속에서 자동 강제 재발급 → invalid approval 상태에서 수동 개입 없이 self-heal 가능.
+  - 원자적 쓰기로 동시 쓰기 경쟁 상태 제거. 모듈 lock으로 동일 프로세스 내 중복 발급 차단.
+  - **검증**: py_compile 통과(본체 + 의존 스크립트 3종). 격리테스트: appkey별 캐시 발급/재사용/force_new 신규발급→접속 SUBSCRIBE SUCCESS (5초 생존, 1006 없음) / 핑퐁가드 정상.
+
 ## [2026-05-26] dc4a9fa
 - **Category**: feat
 - **Title**: 휴일 가드 추가 — 휴장일 idle 프로세스 방지

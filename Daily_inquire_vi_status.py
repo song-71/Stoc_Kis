@@ -130,13 +130,18 @@ def _on_ws_result(ws, tr_id, df, data_info) -> None:
     if tr_id != "H0STMKO0":
         return
     try:
-        for _, row in df.iterrows():
+        # [260601] SDK 가 넘기는 df 는 polars DataFrame → pandas .iterrows() 없음(파싱오류 원인).
+        # polars .iter_rows(named=True)(=dict) 로 순회. pandas 도 들어올 수 있어 방어적으로 처리.
+        rows = df.iter_rows(named=True) if hasattr(df, "iter_rows") else (r for _, r in df.iterrows())
+        for row in rows:
+            row = dict(row)
             code = str(row.get("mksc_shrn_iscd", "")).strip().zfill(6)
             vi_cls = str(row.get("vi_cls_code", "")).strip()
+            name = _code_name.get(code, code)
+            # [260601] H0STMKO0 가 실제 무엇을 주는지 전체 필드 로깅 (VI 테스트/감지 로직 설계용)
+            _vi_log(f'[장운영정보] {name}({code}) {row}')
             if not vi_cls:
                 continue
-            name = _code_name.get(code, code)
-            _vi_log(f'[장운영정보] {name}({code}) VI_CLS_CODE: {vi_cls}')
             # VI 해제 통보 → 구독 종료 (40슬롯 한도 관리)
             if vi_cls == "N":
                 _mk_subscribe_remove(code, name)
@@ -435,7 +440,11 @@ if __name__ == "__main__":
     client = _init_client()
 
     # ── a2 계좌 H0STMKO0 WSS 백그라운드 시작 ──
-    _init_ws_a2()
+    # [260601] 비활성화: 장운영정보(H0STMKO0) 수신·처리는 ws_realtime_trading.py 가 담당
+    #   (_on_market_status_krx, market_status_krx 구독, 슬롯관리) → 여기서 중복 수신 불필요.
+    #   이 파일은 REST VI현황 CSV 저장만 수행. 장운영정보 관찰/실험은 test_vi_wss_cycle.py 로.
+    #   (_kws 가 None 이면 _mk_subscribe_add 도 자동 no-op. WSS 함수들은 미사용 dormant.)
+    # _init_ws_a2()
 
     date_full = now.strftime("%Y%m%d")  # API 조회용 YYYYMMDD
     start_time = datetime(today.year, today.month, today.day, 9, 0, 0, tzinfo=KST)

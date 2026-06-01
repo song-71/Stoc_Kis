@@ -2,6 +2,29 @@
 
 ---
 
+## [2026-06-01] 05144e0
+- **Category**: fix
+- **Title**: Daily_vi 장운영정보 파싱오류 수정 + WSS 중복구독 비활성화, VI 사이클 점검 테스트 추가
+- **Files**: `Daily_inquire_vi_status.py`, `test_vi_wss_cycle.py` (신규)
+- **Changes**:
+  1. **Daily_inquire_vi_status.py — `_on_ws_result` 파싱오류 수정**:
+     - 기존 `df.iterrows()` (pandas API) → SDK가 넘기는 df는 polars DataFrame이라 매 수신마다 `'DataFrame' object has no attribute 'iterrows'` 예외 발생.
+     - `df.iter_rows(named=True)` (polars) + pandas 폴백으로 교체. 기존엔 장운영정보 수신 0건 + 구독 해제 불가 → MAX SUBSCRIBE OVER 누적이 근본 원인이었음.
+     - 수신 시 전체 필드(dict) 로깅 추가 — H0STMKO0 실제 컬럼 구조 파악 및 VI 발동 필드 확인용.
+  2. **Daily_inquire_vi_status.py — `_init_ws_a2()` 호출 비활성화**:
+     - H0STMKO0 수신·처리는 `ws_realtime_trading.py`(`_on_market_status_krx`, `result.to_dicts()`, 슬롯관리)가 담당. 260529 정상일 로그로 메인 핸들러 파싱예외 0건 확인.
+     - 이 파일에서 중복 구독 불필요 → `_init_ws_a2()` 주석처리. 이 파일은 REST VI현황 CSV 저장 전담.
+     - `_kws=None`이므로 `_mk_subscribe_add`도 자동 no-op. WSS 함수들은 dormant 상태(추후 완전삭제 가능).
+  3. **test_vi_wss_cycle.py 신규 (219줄)**:
+     - VI 발동/해제 사이클 WSS 검증 전용 테스트. 운영 무영향.
+     - 최신 vi_status CSV 발동중 종목 자동선택 → REST 현재가 `temp_stop_yn` 등 VI 관련 필드 확인 → H0STMKO0(장운영정보) + H0STANC0(예상체결) 구독 → 수신 전체 필드 타임스탬프 로깅 → VI 해제 감지 시 H0STCNT0(실시간체결) 전환 → 해제 직후 체결 도착 검증.
+     - 계정 기본 a2(syw_2), `out/logs/test_vi_wss_*.log`로 기록.
+     - approval_key 충돌 주의사항 주석 명시 (단독 실행 권장).
+- **Impact**:
+  - Daily_inquire_vi_status.py 장운영정보 수신 0건 버그 수정 — 단, 메인이 담당하므로 이 파일의 WSS는 비활성화 상태.
+  - MAX SUBSCRIBE OVER 누적 원인 제거 (파싱 실패로 `_mk_subscribe_remove` 미호출되던 문제 해소 — 단 WSS 비활성화로 완전 무관).
+  - test_vi_wss_cycle.py로 VI 발동/해제 전체 사이클을 라이브 환경에서 점검 가능한 독립 도구 확보.
+
 ## [2026-06-01] 6babd24
 - **Category**: fix
 - **Title**: 260601 WSS 종일 두절 근본수정 — approval_key 계좌별 캐시 분리 + 무효키 self-heal

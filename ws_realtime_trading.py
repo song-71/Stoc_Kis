@@ -8377,7 +8377,7 @@ def _handle_stale_check_result(code: str, output: dict) -> None:
     _halted_codes.discard(code)
     _enqueue_rest_price_row(code, output)
     pr_fmt = f"{float(str(pr).replace(',', '') or 0):,.0f}" if pr else "0"
-    logger.info(f"{ts_prefix()} [REST보충] {name}({code}) 현재가={pr_fmt}")
+    logger.info(f"{ts_prefix()} [REST보충] {name}({code}) 현재가={pr_fmt} temp_stop_yn={temp_stop}")
 
 
 def _is_vi_suspect(code: str, now_t) -> bool:
@@ -13100,8 +13100,15 @@ def run_ws_forever():
                     if _stop_event.is_set():
                         break
                 try:
-                    ka.auth_ws(svr="prod")
-                    logger.info(f"{ts_prefix()} [ws] auth_ws 재발급 완료")
+                    # [260601][C] 직전 연결이 dwell<15s(무효 approval_key 의심)였으면 강제 재발급.
+                    # auth_ws(force_new=True)는 재발급 전 파일을 다시 읽어 다른 주체가 이미
+                    # 갱신했으면 그걸 채택(핑퐁 방지)하고, 동일할 때만 새 키를 발급한다.
+                    _force_new_ak = bool(getattr(run_ws_forever, "_force_new_approval", False))
+                    ka.auth_ws(svr="prod", force_new=_force_new_ak)
+                    run_ws_forever._force_new_approval = False
+                    logger.info(
+                        f"{ts_prefix()} [ws] auth_ws {'강제 재발급' if _force_new_ak else '재발급'} 완료"
+                    )
                 except Exception as ae:
                     logger.warning(f"{ts_prefix()} [ws] auth_ws 재발급 실패: {ae}")
 
@@ -13334,12 +13341,16 @@ def run_ws_forever():
             # [260513] max_retries=1 로 축소: SDK 내부 재시도 없이 즉시 반환 → outer loop 가
             # 새 approval_key 재발급 후 재연결. 핸드셰이크 실패 다발 패턴은 outer dwell<15s 로 측정.
             if _kws_dwell < 15.0:
+                # [260601][C] dwell<15s = 무효 approval_key(invalid approval) 의심 → 다음
+                # 재접속에서 approval_key 강제 재발급(force_new). 260601 재현: 무효 캐시 키를
+                # 계속 재사용하면 invalid approval→bare 1006 영구 반복 → 이 플래그로 self-heal.
+                run_ws_forever._force_new_approval = True
                 if (time.time() - _main_last_handshake_fail_ts) >= 30.0:
                     _main_last_handshake_fail_ts = time.time()
                     logger.warning(
                         f"{ts_prefix()} [ws] kws.start dwell={_kws_dwell:.2f}s < 15s "
-                        f"→ 핸드셰이크 실패 다발 추정 (long backoff 트리거, "
-                        f"좀비 reconnect 잔재 또는 자기측 lifecycle 미정리 가능성)"
+                        f"→ 핸드셰이크 실패 다발 추정 (invalid approval_key 의심 → 다음 재접속 "
+                        f"강제 재발급, 좀비 reconnect 잔재 또는 자기측 lifecycle 미정리 가능성)"
                     )
                 # [260506] 자기보호 자동중단 카운터 — 연속 N회 핸드셰이크 실패 시 reconnect 중단
                 run_ws_forever._handshake_fail_count = (

@@ -12914,12 +12914,16 @@ def _shutdown(reason: str):
         kws_snap = _active_kws
         _active_kws = None  # 다른 스레드의 추가 send 방지
     if kws_snap is not None:
-        # close 자체도 dead socket 에서 hang 가능 → 별도 thread + 5초 timeout
+        # close 자체도 dead socket 에서 hang 가능 → 별도 thread + timeout
+        # [260602] 5s→13s: 기존 5s 는 UNSUBSCRIBE(타입별 1s) + close frame(최대 10s) 합을 못 채워
+        #   매 재시작 종료 시 5s timeout → close frame 미완료 → KIS 가 abnormal close 로 인식 →
+        #   세션 잔재 → 재시작 직후 새 접속 1006(no close frame). close 완료 시간을 충분히 부여.
+        #   (정상적으로 빨리 끝나면 join 은 즉시 반환하므로 정상 케이스 추가비용 없음.)
         _close_t = threading.Thread(target=_request_ws_close, args=(kws_snap,), daemon=True)
         _close_t.start()
-        _close_t.join(timeout=5.0)
+        _close_t.join(timeout=13.0)
         if _close_t.is_alive():
-            logger.warning(f"[shutdown] _request_ws_close 5s timeout — dead socket 추정, 계속 진행")
+            logger.warning(f"[shutdown] _request_ws_close 13s timeout — dead socket 추정, 계속 진행")
     t_wss = time.time()
     logger.info(f"[shutdown] (1/4) WSS 종료 완료 (+{t_wss-t0:.2f}s)")
     # ── 메모리 데이터 저장 (WSS 종료 후, 큐 소진 대기 → flush → snapshot) ──

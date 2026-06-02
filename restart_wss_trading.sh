@@ -31,12 +31,6 @@ if [ "$EXITED" -eq 0 ]; then
     sleep 1
 fi
 
-# [260602] KIS WSS 서버측 세션 해제 대기 (settle) — 이전 프로세스 종료 직후 같은 approval_key 로
-#   곧바로 재접속하면 직전 세션 잔재로 1006(no close frame) 핸드셰이크 실패가 발생한다.
-#   서버가 슬롯을 반환하도록 잠시 대기한 뒤 기동 → 재시작 1006 방지.
-echo "[restart] KIS WSS 세션 해제 대기 (settle 7초)..."
-sleep 7
-
 echo "[restart] runner를 통해 새 프로세스 시작 (log_mode=append: 기존 .out 에 이어서 기록)..."
 nohup bash "$RUNNER_SCRIPT" append > /dev/null 2>&1 &
 sleep 2

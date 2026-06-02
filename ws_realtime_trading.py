@@ -891,8 +891,23 @@ def _get_balance_page(client, cano: str, acnt_prdt_cd: str, tr_id: str,
     }
     headers = client._headers(tr_id=tr_id)
     headers["tr_cont"] = tr_cont          # 초기 "" / 연속 "N"
-    r = requests.get(url, headers=headers, params=params, timeout=10)
-    r.raise_for_status()
+    # [260602] KIS inquire-balance 는 기동 직후/세션 churn 시 첫 호출에 간헐 500(Internal Server Error)을
+    #   반환한다(실측: 재시작 3회 모두 a1 첫 잔고호출 500). idempotent GET 이므로 최대 3회 재시도(1.5s 간격).
+    r = None
+    last_err = None
+    for _attempt in range(3):
+        try:
+            r = requests.get(url, headers=headers, params=params, timeout=10)
+            r.raise_for_status()
+            last_err = None
+            break
+        except requests.RequestException as e:
+            last_err = e
+            r = None
+            if _attempt < 2:
+                time.sleep(1.5)
+    if last_err is not None:
+        raise last_err
     j = r.json()
     if str(j.get("rt_cd")) != "0":
         raise RuntimeError(f"잔고조회 실패: {j.get('msg1')} raw={j}")

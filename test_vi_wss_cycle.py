@@ -25,8 +25,11 @@ test_vi_wss_cycle.py — VI 발동/해제 사이클 WSS 검증 (별도 테스트
   - 라이브 검증은 장중(VI 발생 시간대) 수행. 장 마감 후엔 접속/구독 구조만 확인됨.
 
 실행:
-  ./venv/bin/python test_vi_wss_cycle.py                      # a2, 최신 vi_status 발동중 자동선택, 10분
-  ./venv/bin/python test_vi_wss_cycle.py --account main --code 005930 --minutes 5
+  ./venv/bin/python test_vi_wss_cycle.py                      # a2, 시작시점 vi_status '발동중 전 종목' 스냅샷 모니터링, 10분
+  ./venv/bin/python test_vi_wss_cycle.py --code 005930 --minutes 5   # 단일 종목 지정
+  ※ 종목 집합은 시작 1회 스냅샷으로 고정 — 실행 중 새로 발동되는 VI 는 추가하지 않음(무한 누적 방지).
+  ※ 종목별 독립 사이클: 발동→예상체결(H0STANC0) / 해제(vi_cls='N')→실시간체결(H0STCNT0) /
+     재발동(vi_cls='Y')→예상체결 재전환. 해제 후 60초 관찰하면 종목별 완료, 전 종목 완료 시 종료.
 """
 import argparse
 import asyncio
@@ -112,24 +115,22 @@ def _latest_vi_csv() -> str | None:
     return files[-1] if files else None
 
 
-def latest_active_vi_code():
-    """최신 vi_status CSV 에서 '발동중' 종목 중 발동시간이 가장 늦은(=마지막) 종목."""
+def active_vi_rows() -> list[dict]:
+    """최신 vi_status CSV 의 '발동중' 종목 전체 (발동시간 오름차순)."""
     newest = _latest_vi_csv()
     if not newest:
-        return None
-    best = None
-    with open(newest, encoding="utf-8-sig") as f:
-        for row in csv.DictReader(f):
-            if row.get("상태", "").strip() == "발동중":
-                t = row.get("발동시간", "0")
-                if best is None or t > best.get("발동시간", "0"):
-                    best = row
-    log(f"[vi_status] 파일={os.path.basename(newest)} → 발동중 마지막 종목={best}")
-    return best
+        return []
+    rows = [r for r in csv.DictReader(open(newest, encoding="utf-8-sig"))
+            if r.get("상태", "").strip() == "발동중"]
+    rows.sort(key=lambda r: r.get("발동시간", ""))
+    log(f"[vi_status] 파일={os.path.basename(newest)} → 발동중 {len(rows)}종목")
+    return rows
 
 
-def rest_price_check(acct, code):
-    """FHKST01010100 현재가 — 장운영/VI 관련 필드 best-effort 로깅."""
+def rest_price_check(acct, code) -> str:
+    """① 현재가조회(FHKST01010100) → vi_cls_code 로 VI 감지 가능한지 확인.
+    실전 감지흐름의 1순위: 틱 끊김 시 현재가조회의 장운영(vi_cls_code)로 VI 판별.
+    반환: vi_cls_code (감지 실패/오류 시 '')."""
     try:
         ka.auth(svr="prod")
         base = ka.getTREnv().my_url if hasattr(ka.getTREnv(), "my_url") else "https://openapi.koreainvestment.com:9443"
@@ -140,11 +141,14 @@ def rest_price_check(acct, code):
                          headers=headers, params={"FID_COND_MRKT_DIV_CODE": "J", "FID_INPUT_ISCD": code},
                          timeout=10)
         o = (r.json() or {}).get("output", {})
-        fields = {k: o.get(k) for k in ("stck_prpr", "temp_stop_yn", "iscd_stat_cls_code",
-                                        "mrkt_warn_cls_code", "vi_cls_code", "antc_cnpr")}
-        log(f"[REST현재가] {code} → {fields}")
+        vi = str(o.get("vi_cls_code") or "").strip()
+        verdict = "VI 발동 감지 ✓" if vi not in ("", "N", "0") else f"VI 미감지(vi_cls_code={vi!r})"
+        log(f"   ①[{code}] 현재가조회 vi_cls_code={vi!r} stck_prpr={o.get('stck_prpr')} "
+            f"antc_cnpr={o.get('antc_cnpr')} temp_stop_yn={o.get('temp_stop_yn')} → {verdict}")
+        return vi
     except Exception as e:
-        log(f"[REST현재가] 실패(무시): {type(e).__name__}: {e}")
+        log(f"   ①[{code}] 현재가조회 실패(무시): {type(e).__name__}: {e}")
+        return ""
 
 
 def parse_data_frame(raw):
@@ -162,6 +166,15 @@ def parse_data_frame(raw):
     ncols = len(cols)
     if ncols <= 0:
         return tr_id, [{"_raw_fields": fields}]
+    # ── [#1 진단] 멀티레코드인데 컬럼 수의 배수가 아님 → 정렬 어긋남(또는 KIS 불규칙/손상 프레임) ──
+    #   260602 10:38:15 VI 버스트 때 예상(ANC) 파싱이 쓰레기값을 뱉은 현상의 원인 확정용. raw 덤프.
+    #   ※ 단일 레코드가 컬럼보다 짧은 경우(예: H0STMKO0 10/11, EXCH_CLS_CODE 미전송)는 KIS 의
+    #     정상적 마지막컬럼 생략 → 패딩으로 흡수(정상, 노이즈 제외). 진짜 이상은 '멀티레코드 + 배수 아님'.
+    if len(fields) > ncols and len(fields) % ncols != 0:
+        cnt = parts[2] if len(parts) > 2 else "?"
+        rr = raw if len(raw) <= 1000 else (raw[:600] + " …<중략>… " + raw[-300:])
+        log(f"[!파싱이상] tr_id={tr_id} 선언cnt={cnt} ncols={ncols} 실필드={len(fields)} "
+            f"나머지={len(fields) % ncols} → raw_len={len(raw)} raw={rr!r}")
     recs = []
     if len(fields) > ncols:
         # 여러 건: 컬럼 수 단위로 분할, 마지막 미달분은 빈값 패딩
@@ -177,73 +190,132 @@ def parse_data_frame(raw):
     return tr_id, recs
 
 
-async def subscribe(ws, tr_id, code):
+async def _send_sub(ws, tr_id, code, tr_type):
+    """tr_type: '1'=구독, '2'=해제."""
     func, label = SUBS[tr_id]
-    msg, cols = func("1", code) if tr_id != "H0STCNT0" else func("1", code, "real")
+    msg, cols = func(tr_type, code) if tr_id != "H0STCNT0" else func(tr_type, code, "real")
     _cols[tr_id] = cols
     await ws.send(json.dumps(msg))
-    log(f"[구독요청] {tr_id}({label}) tr_key={code} (cols={len(cols)})")
+    act = "구독" if tr_type == "1" else "해제"
+    log(f"[{act}] {tr_id}({label}) tr_key={code}" + (f" (cols={len(cols)})" if tr_type == "1" else ""))
 
 
-async def run(account, code, minutes):
+POST_RELEASE_HOLD = 60.0   # 해제 후 실시간체결 관찰 유지 시간(초) → 종목별 완료 기준
+
+
+def _rec_code(rec: dict) -> str:
+    """레코드에서 종목코드 추출 (ANC/MKO=소문자, CNT=대문자)."""
+    return str(rec.get("mksc_shrn_iscd") or rec.get("MKSC_SHRN_ISCD") or "").strip()
+
+
+async def run(account, codes, vi_info, minutes):
+    """발동중 codes 전체를 동시 모니터링. 실전 감지흐름을 그대로 절차화:
+       종목별 ① 현재가조회(vi_cls_code) 로 VI 감지 → ② CSV 발동시각 확인 → ③ 장운영정보 구독.
+       이후 종목별 독립 상태머신: 발동→예상체결(H0STANC0), 해제(vi_cls='N')→실시간체결(H0STCNT0),
+       재발동(vi_cls='Y')→예상체결 재전환. 해제 후 POST_RELEASE_HOLD 초 관찰 뒤 종목별 완료.
+       전 종목 완료 시 종료(또는 --minutes 상한)."""
     acct = pick_account(account)
-    log(f"=== VI WSS 사이클 테스트 시작 | account={account}(cano={acct.get('cano')}) code={code} {minutes}분 ===")
+    log(f"=== VI WSS 멀티 사이클 테스트 | account={account}(cano={acct.get('cano')}) "
+        f"{len(codes)}종목 {minutes}분 | 종목={codes} ===")
 
-    # REST 현재가 장운영/VI 필드 확인
-    rest_price_check(acct, code)
+    # ── 실전 VI 감지 절차 검증: ① 현재가조회(vi_cls_code) → ② CSV 발동시각 ──
+    log("── [VI 감지 절차] 종목별 ① 현재가조회 vi_cls_code → ② CSV 발동시각 → ③ 장운영정보 구독 ──")
+    rest_detect = {}
+    for c in codes:
+        rest_detect[c] = rest_price_check(acct, c)                       # ① REST 감지
+        info = vi_info.get(c, {})                                        # ② CSV
+        log(f"   ②[{c}] CSV: 종류={info.get('종류','?')} 발동시각={info.get('발동시간','?')} "
+            f"발동가={info.get('발동가','?')} 기준가={info.get('기준가','?')} 괴리율={info.get('괴리율','?')}")
+    n_ok = sum(1 for v in rest_detect.values() if v not in ("", "N", "0"))
+    log(f"── [현재가조회 VI 감지 결과] {n_ok}/{len(codes)} 종목 감지 "
+        f"(vi_cls_code: {', '.join(f'{c}={v!r}' for c, v in rest_detect.items())}) ──")
 
-    # approval_key — 선택 계좌로 (신규 중앙 per-appkey 캐시 재사용)
+    # approval_key — 선택 계좌로 (중앙 per-appkey 캐시 재사용/없으면 발급)
     ka._cfg["my_app"] = acct["appkey"]
     ka._cfg["my_sec"] = acct["appsecret"]
     ka.auth_ws(svr="prod")
     key = ka._base_headers_ws.get("approval_key")
     log(f"[auth_ws] approval_key 앞12={str(key)[:12]}... (계좌별 캐시)")
 
-    vi_released = False
-    released_at = None                       # VI 해제 감지 시각 → 1분 후 연결 종료 기준
-    POST_RELEASE_HOLD = 60.0                 # 해제 후 실시간체결 관찰 유지 시간(초)
+    # 종목별 상태: mode 'exp'(예상)|'real'(실시간), released_at, done, await_first_real(#2용)
+    st = {c: {"mode": "exp", "released_at": None, "done": False, "await_first_real": False}
+          for c in codes}
     t0 = time.time()
     try:
         async with websockets.connect(URL_WS, ping_interval=20, ping_timeout=10) as ws:
             log("[WSS] 연결 성공")
-            # 1) 장운영정보 + 예상체결 동시 구독
-            await subscribe(ws, "H0STMKO0", code)
-            await subscribe(ws, "H0STANC0", code)
+            log("   ③ 장운영정보(H0STMKO0) + 예상체결(H0STANC0) 구독 시작")
+            for c in codes:
+                await _send_sub(ws, "H0STMKO0", c, "1")
+                await _send_sub(ws, "H0STANC0", c, "1")
             while time.time() - t0 < minutes * 60:
-                # VI 해제 후 1분 경과 → 연결 종료 (해제→실시간체결 전환만 관찰하고 마무리)
-                if vi_released and released_at and (time.time() - released_at >= POST_RELEASE_HOLD):
-                    log(f"=== VI 해제 후 {POST_RELEASE_HOLD:.0f}초 경과 → WSS 연결 종료 ===")
+                now = time.time()
+                # 종목별: 해제 후 POST_RELEASE_HOLD 경과 → 완료(구독 해제)
+                for c, s in st.items():
+                    if s["done"]:
+                        continue
+                    if s["mode"] == "real" and s["released_at"] and (now - s["released_at"] >= POST_RELEASE_HOLD):
+                        for tr in ("H0STCNT0", "H0STMKO0"):
+                            try:
+                                await _send_sub(ws, tr, c, "2")
+                            except Exception:
+                                pass
+                        s["done"] = True
+                        log(f"   ✔ [{c}] 해제 후 {POST_RELEASE_HOLD:.0f}초 관찰 완료 → 구독 종료")
+                if st and all(s["done"] for s in st.values()):
+                    log("=== 전 종목 사이클 완료 → WSS 종료 ===")
                     break
                 try:
                     raw = await asyncio.wait_for(ws.recv(), timeout=1.0)
                 except asyncio.TimeoutError:
                     continue
                 if raw.startswith("{"):
-                    # 시스템 메시지(구독응답/PINGPONG)
                     if "PINGPONG" in raw:
                         await ws.send(raw); continue
-                    log(f"[SYS] {raw[:200]}")
+                    log(f"[SYS] {raw[:160]}")
                     continue
                 tr_id, recs = parse_data_frame(raw)
                 for rec in recs:
-                    log(f"[수신:{tr_id}] {rec}")
+                    code = _rec_code(rec)
+                    if code not in st:
+                        # 식별불가(파싱 어긋남/타종목) → 무시하되 1회 가시화
+                        log(f"[!무시] tr_id={tr_id} 식별불가 rec={str(rec)[:120]}")
+                        continue
+                    s = st[code]
                     if tr_id == "H0STMKO0":
                         vi = str(rec.get("vi_cls_code", "")).strip()
-                        mkop = str(rec.get("mkop_cls_code", "")).strip()
-                        trht = str(rec.get("trht_yn", "")).strip()
-                        log(f"   ↳ [H0STMKO0 해석] vi_cls_code={vi!r} mkop_cls_code={mkop!r} trht_yn={trht!r} "
-                            f"(※ 발동시각 전용 필드 없음 — 위 값으로 발동/해제 판정)")
-                        # VI 해제 판정: 실측상 해제 시 vi_cls_code='N' (빈값/0 아님 — 260602 라이브 확인).
-                        #   방어적으로 'N'/'0'/'' 모두 해제로 본다('Y'=발동중).
-                        if not vi_released and vi in ("N", "0", ""):
-                            vi_released = True
-                            released_at = time.time()
-                            log(f"   ★ VI 해제 감지(vi_cls_code={vi!r}) → H0STCNT0 실시간체결 구독 전환 "
-                                f"({POST_RELEASE_HOLD:.0f}초 후 종료 예정)")
-                            await subscribe(ws, "H0STCNT0", code)
+                        log(f"[{code}] MKO vi_cls={vi!r} mkop={rec.get('mkop_cls_code','')!r} "
+                            f"antc_mkop={rec.get('antc_mkop_cls_code','')!r} trht={rec.get('trht_yn','')!r}")
+                        if vi in ("N", "0", ""):            # VI 해제
+                            if s["mode"] == "exp":
+                                s["mode"] = "real"; s["released_at"] = now; s["await_first_real"] = True
+                                await _send_sub(ws, "H0STANC0", code, "2")
+                                await _send_sub(ws, "H0STCNT0", code, "1")
+                                log(f"   ★[{code}] VI 해제(vi_cls={vi!r}) → 실시간체결 전환")
+                        else:                               # 'Y' 등 = 발동/재발동
+                            if s["mode"] == "real":
+                                s["mode"] = "exp"; s["released_at"] = None; s["await_first_real"] = False
+                                await _send_sub(ws, "H0STCNT0", code, "2")
+                                await _send_sub(ws, "H0STANC0", code, "1")
+                                log(f"   ◆[{code}] VI 재발동(vi_cls={vi!r}) → 예상체결 재전환")
                     elif tr_id == "H0STANC0":
-                        log(f"   ↳ [예상체결=동시호가 결정가 후보] stck_prpr/antc 관련 필드 위 rec 확인")
-            log(f"=== 종료 ({time.time()-t0:.0f}s 경과, vi_released={vi_released}) ===")
+                        log(f"[{code}] ANC 예상가={rec.get('stck_prpr')} 등락={rec.get('prdy_ctrt')}% "
+                            f"cntg_vol={rec.get('cntg_vol')} acml_vol={rec.get('acml_vol')} hour_cls={rec.get('hour_cls_code')!r}")
+                    elif tr_id == "H0STCNT0":
+                        if s["await_first_real"]:           # #2: 해제 직후 첫 실시간 틱 = 단일가 일괄체결
+                            s["await_first_real"] = False
+                            vol = rec.get("CNTG_VOL"); prc = rec.get("STCK_PRPR"); acml = rec.get("ACML_VOL")
+                            try:
+                                amt = f"{int(vol) * int(prc):,}원"
+                            except Exception:
+                                amt = "?"
+                            log(f"   ▶[{code}] 해제후 첫 실시간틱 = 동시호가 단일가 일괄체결: "
+                                f"{vol}주 @ {prc} ({amt}) | 당일누적 ACML_VOL={acml} VI_STND_PRC={rec.get('VI_STND_PRC')}")
+                        else:
+                            log(f"[{code}] CNT 체결가={rec.get('STCK_PRPR')} CNTG_VOL={rec.get('CNTG_VOL')} "
+                                f"ACML_VOL={rec.get('ACML_VOL')} HOUR_CLS={rec.get('HOUR_CLS_CODE')!r}")
+            log(f"=== 종료 ({time.time()-t0:.0f}s 경과) 상태: "
+                + ", ".join(f"{c}:{s['mode']}{'(완료)' if s['done'] else ''}" for c, s in st.items()) + " ===")
     except Exception as e:
         log(f"[ERR] {type(e).__name__}: {e}")
 
@@ -260,30 +332,26 @@ def main():
     stamp = now.strftime("%y%m%d_%H%M")
     _logf = open(os.path.join(LOG_DIR, f"test_vi_wss_{stamp}.log"), "w", encoding="utf-8")
 
-    code = args.code
-    if code:
-        log(f"[종목선택] --code 지정 → {code}")
-    elif _is_market_hours(now):
-        # 장 중(09:00~15:20): 즉시 최신 VI 리스트 확인 → 발동중 '마지막(최근 발동)' 종목만 테스트
-        log(f"[종목선택] 장중({now.strftime('%H:%M:%S')} KST) → 최신 VI 발동중 마지막 종목 자동선택")
-        row = latest_active_vi_code()
-        if not row:
-            log("[종목선택] 현재 발동중 종목 없음 → 종료 (장중 잠시 후 재시도 또는 --code 지정)")
+    # 종목 선택은 "시작 시점 스냅샷" 1회만. 실행 중 새로 발동되는 VI 는 추가하지 않는다(무한 누적 방지).
+    vi_info: dict = {}   # code -> CSV row (발동시각/종류/발동가 등)
+    if args.code:
+        codes = [args.code.strip()]
+        log(f"[종목선택] --code 지정 → {codes}")
+    else:
+        scope = "장중" if _is_market_hours(now) else "장외(backup 폴백)"
+        log(f"[종목선택] {scope}({now.strftime('%H:%M:%S')} KST) → 발동중 전 종목 스냅샷 모니터링")
+        rows = active_vi_rows()
+        if not rows:
+            log("[종목선택] 현재 발동중 종목 없음 → 종료 (잠시 후 재시도 또는 --code 지정)")
             _logf.close()
             raise SystemExit("현재 VI 발동중 종목 없음")
-        code = str(row["종목코드"]).strip()
-        log(f"[종목선택] → {code} {row.get('종목명','')} (발동시간={row.get('발동시간')})")
-    else:
-        # 장외: --code 미지정 → 최신(backup 포함) 발동중 종목 시도
-        log(f"[종목선택] 장외({now.strftime('%H:%M:%S')} KST), --code 미지정 → 최신 발동중 종목 시도")
-        row = latest_active_vi_code()
-        if not row:
-            _logf.close()
-            raise SystemExit("발동중 종목 없음 → 장중에 실행하거나 --code 로 직접 지정하세요.")
-        code = str(row["종목코드"]).strip()
+        codes = [str(r["종목코드"]).strip() for r in rows]
+        vi_info = {str(r["종목코드"]).strip(): r for r in rows}
+        log("[종목선택] 발동중: " + ", ".join(
+            f"{r.get('종목코드')}({r.get('종목명','')},{r.get('종류','')},발동{r.get('발동시간')})" for r in rows))
 
     try:
-        asyncio.run(run(args.account, code, args.minutes))
+        asyncio.run(run(args.account, codes, vi_info, minutes=args.minutes))
     finally:
         if _logf:
             log(f"[로그파일] {_logf.name}")

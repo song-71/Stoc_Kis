@@ -2,6 +2,34 @@
 
 ---
 
+## [2026-06-02] 23b8471
+- **Category**: feat
+- **Title**: test_vi_wss_cycle.py — 멀티종목 동시 모니터링 + 실전 VI 감지 절차화 + 라이브 검증 확장
+- **Files**: `test_vi_wss_cycle.py`
+- **Changes**:
+  1. **멀티종목 모니터링**: `latest_active_vi_code()` 대체 → `active_vi_rows()` 신설.
+     시작 시점 vi_status CSV '발동중 전 종목' 스냅샷 1회 고정(실행 중 새 VI 추가 없음, 무한 누적 방지).
+     종목별 독립 상태머신(mode: exp/real, released_at, done, await_first_real) 도입.
+  2. **실전 VI 감지 절차화**: `run()` 루프 전에 종목별 3단계 흐름 절차화.
+     - ① `rest_price_check()`: 현재가조회(FHKST01010100) `vi_cls_code` 반환 + 감지판정 로깅 (기존 best-effort 로깅 → 반환값 있는 감지 함수로 변경)
+     - ② CSV 발동시각/종류/발동가/기준가/괴리율 확인 로깅
+     - ③ 장운영정보(H0STMKO0) + 예상체결(H0STANC0) 구독
+  3. **종목별 사이클 상태전환**: 발동→예상체결(H0STANC0), 해제(vi_cls='N')→실시간체결(H0STCNT0) 전환,
+     재발동(vi_cls='Y')→예상체결 재전환. 해제 후 POST_RELEASE_HOLD=60초 관찰 뒤 종목별 완료,
+     전 종목 완료 시 WSS 종료.
+  4. **#2 단일가 일괄체결 명시 로그**: 해제 직후 첫 H0STCNT0 틱 = 동시호가 단일가 일괄체결.
+     "N주 @ 단가 (금액) | ACML_VOL/VI_STND_PRC" 형식으로 1회 명시.
+  5. **#1 파싱이상 진단**: 멀티레코드인데 필드 수가 컬럼 수의 배수가 아니면(정렬 어긋남/손상 프레임) raw 덤프.
+     단일 레코드 짧음(H0STMKO0 10/11, EXCH_CLS_CODE 미전송)은 정상 패딩 처리(노이즈 제외).
+  6. **`_send_sub(tr_type)` 헬퍼**: 기존 `subscribe()` 대체, tr_type '1'=구독/'2'=해제 통합.
+     `_rec_code()` 헬퍼로 ANC/MKO(소문자)/CNT(대문자) 레코드에서 종목코드 추출 통일.
+- **Impact**:
+  - 단일 종목 → 발동중 전 종목 동시 모니터링으로 일괄 사이클 검증 가능.
+  - 현재가조회 vi_cls_code 로 REST 기반 VI 실시간 감지 절차 실전 검증 완료.
+  - 단일가 일괄체결 체적/금액 자동 출력으로 해제 순간 수량 확인 용이.
+  - **260602 라이브 검증**: 013720 THE CUBE&(정적VI) — vi_cls_code='Y' 감지 → 구독 → 해제(vi_cls='N') → 단일가 일괄체결 3,106주@460(1,428,760원) → 60초 후 완료 종료.
+    vi_cls_code sticky 아님 확정(발동중='Y'/정상='N', 005930 반대검증).
+
 ## [2026-06-02] 3b46a5b
 - **Category**: fix / feat
 - **Title**: test_vi_wss_cycle.py — VI 사이클 WSS 라이브 검증, 버그 3건 수정 + 기능 2건 추가 + 파싱 정확화

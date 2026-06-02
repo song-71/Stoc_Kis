@@ -2,6 +2,16 @@
 
 ---
 
+## [2026-06-02] 9883a6d
+- **Category**: fix
+- **Title**: _get_balance_page 기동 직후 transient 500 재시도 추가
+- **Files**: `ws_realtime_trading.py`
+- **Changes**:
+  1. **증상**: 재시작 직후 [시작 잔고조회] 첫 호출(CTX_AREA_FK100=빈값)에서 KIS inquire-balance 가 간헐 500 Internal Server Error 반환. 260602 재시작 3회 실측(13:21, 15:03 포함) 모두 a1(43444822) 첫 잔고호출에서 동일 패턴.
+  2. **수정**: `_get_balance_page` 의 `requests.get + raise_for_status` 를 최대 3회 재시도(1.5s 간격) 루프로 감쌈. `requests.RequestException`(HTTPError·Timeout·ConnectionError) 모두 재시도 대상. 3회 모두 실패 시 마지막 예외 raise → 기존 오류 전파 동작 유지.
+  3. idempotent GET 이므로 재시도 안전. tr_cont 페이지네이션 버그 수정과는 별개(이건 첫 호출 자체 실패 대응).
+- **Impact**: 기동 직후 transient 500 흡수 → hold_map/시작잔고 정상화, str1 매도 모니터링 누락 방지.
+
 ## [2026-06-02] 4126c4e
 - **Category**: feat
 - **Title**: 08:59 prdy>9.8% 종목 H0STMKO0 관찰구독 → vi_cls_code 정합성 검증 로그 추가

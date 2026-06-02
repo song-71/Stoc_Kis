@@ -8185,46 +8185,52 @@ def _on_market_status_krx(result) -> None:
                         _notify(f"{ts_prefix()} [장운영] {market} 해제 — REST 폴링 재개", tele=True)
 
         # VI 발동/해제 감지 (vi_cls_code)
+        # [260602 수정] 실측상 KIS vi_cls_code 는 발동='Y' / 해제='N' 으로 온다(현재가조회·H0STMKO0 동일).
+        #   과거 코드는 0/1/2/3 숫자를 가정해 `!= "0"` 으로 발동을 판정 → 해제값 'N' 도 발동으로 오판,
+        #   [VI해제]/restore 가 한 번도 안 타고 5분 fallback 으로만 복귀하던 버그(260529 로그: 발동4/해제0).
+        #   → 발동상태값 = 'N'/'0'/'' 이 아닌 값. 단순 문자열변화 대신 '상태전이'로 판정해
+        #     keepalive 선캐싱('0')·반복 프레임에서의 허위 전이를 방지하고, 재발동도 자연히 처리한다.
         vi_cls = str(row.get("vi_cls_code", "")).strip()
         if vi_cls:
             prev_vi = _vi_cls_cache.get(code, "")
-            if vi_cls != prev_vi:
-                _vi_cls_cache[code] = vi_cls
-                if vi_cls != "0":  # VI 발동 (정적VI=1, 동적VI=2, 정적+동적=3 등)
-                    cnt = _vi_trigger_count.get(code, 0) + 1
-                    _vi_trigger_count[code] = cnt
-                    _vi_exp_sub_switch(code)
-                    # VI 발동 시각 기록 (parquet 저장용)
-                    _vi_start_ts[code] = datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S")
-                    _vi_end_ts.pop(code, None)
-                    _market_event[code] = "VI발동"
-                    msg = (f"{ts_prefix()} [VI발동] {name}({code}) "
-                           f"vi_cls={vi_cls} ({cnt}회차)")
-                    logger.warning(msg)
-                    _notify(msg, tele=True)
-                else:  # vi_cls == "0" → VI 해제
-                    _vi_exp_sub_restore(code)
-                    _vi_end_ts[code] = datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S")
-                    _market_event.pop(code, None)
-                    _vi_trigger_info.pop(code, None)
-                    msg = (f"{ts_prefix()} [VI해제] {name}({code}) "
-                           f"vi_cls={vi_cls}")
-                    logger.info(msg)
-                    _notify(msg, tele=True)
-                    # H0STMKO0 동적 구독 해제 (keepalive/보유 종목 제외)
-                    keepalive_set = set(_mkt_keepalive_current.values())
-                    if code not in keepalive_set:
-                        held_codes_vi = set()
+            _vi_cls_cache[code] = vi_cls
+            is_active = vi_cls not in ("N", "0", "")     # 발동 상태
+            was_active = prev_vi not in ("N", "0", "")    # 직전 발동 상태
+            if is_active and not was_active:              # 비활성 → 발동/재발동
+                cnt = _vi_trigger_count.get(code, 0) + 1
+                _vi_trigger_count[code] = cnt
+                _vi_exp_sub_switch(code)
+                # VI 발동 시각 기록 (parquet 저장용)
+                _vi_start_ts[code] = datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S")
+                _vi_end_ts.pop(code, None)
+                _market_event[code] = "VI발동"
+                msg = (f"{ts_prefix()} [VI발동] {name}({code}) "
+                       f"vi_cls={vi_cls} ({cnt}회차)")
+                logger.warning(msg)
+                _notify(msg, tele=True)
+            elif was_active and not is_active:            # 발동 → 해제
+                _vi_exp_sub_restore(code)
+                _vi_end_ts[code] = datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S")
+                _market_event.pop(code, None)
+                _vi_trigger_info.pop(code, None)
+                msg = (f"{ts_prefix()} [VI해제] {name}({code}) "
+                       f"vi_cls={vi_cls}")
+                logger.info(msg)
+                _notify(msg, tele=True)
+                # H0STMKO0 동적 구독 해제 (keepalive/보유 종목 제외)
+                keepalive_set = set(_mkt_keepalive_current.values())
+                if code not in keepalive_set:
+                    held_codes_vi = set()
+                    try:
+                        with _str1_sell_state_lock:
+                            held_codes_vi = {c for c, st in _str1_sell_state.items() if not st.get("sold")}
+                    except Exception:
+                        pass
+                    if code not in held_codes_vi:
                         try:
-                            with _str1_sell_state_lock:
-                                held_codes_vi = {c for c, st in _str1_sell_state.items() if not st.get("sold")}
-                        except Exception:
-                            pass
-                        if code not in held_codes_vi:
-                            try:
-                                _mkstatus_sub_remove({code})
-                            except Exception as e:
-                                logger.warning(f"{ts_prefix()} [VI해제] H0STMKO0 해제 실패 {code}: {e}")
+                            _mkstatus_sub_remove({code})
+                        except Exception as e:
+                            logger.warning(f"{ts_prefix()} [VI해제] H0STMKO0 해제 실패 {code}: {e}")
 
 
 H0STMKO0_MAX_SLOTS: int = 5  # 데이터(ccnl/exp) 슬롯 ≥35 보장 위한 보수적 cap
@@ -12624,6 +12630,8 @@ def ingest_loop():
                     _mkt_evt = _market_wide_event.get(_mkt, "") or _market_event.get(code, "")
                     df_code = df_code.with_columns([
                         pl.lit("Y" if _is_vi else "").alias("vi_yn"),
+                        # [260602] H0STMKO0 마지막 vi_cls_code 원값 저장 (발동='Y'/해제='N', H0STMKO0 미구독 종목은 "")
+                        pl.lit(_vi_cls_cache.get(code, "")).alias("vi_cls_code"),
                         pl.lit(_vi_start_ts.get(code, "") if _is_vi else "").alias("vi_start_ts"),
                         pl.lit(_mkt_evt).alias("market_event"),
                     ])

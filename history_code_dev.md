@@ -2,6 +2,17 @@
 
 ---
 
+## [2026-06-02] 4126c4e
+- **Category**: feat
+- **Title**: 08:59 prdy>9.8% 종목 H0STMKO0 관찰구독 → vi_cls_code 정합성 검증 로그 추가
+- **Files**: `ws_realtime_trading.py`
+- **Changes**:
+  1. 전역 `_vi_observe_codes(set)` / `_vi_observe_done(bool)` 추가 — 09:00 VI 지연 변수(`_vi_delayed_codes`) 옆에 선언
+  2. `scheduler_loop`: 08:59:00~08:59:05 구간에 `_last_prdy_ctrt > 9.8%` & 구독 중(`codes`) 종목을 `_mkstatus_sub_add` 로 H0STMKO0 관찰구독 + 텔레그램 통지
+  3. `scheduler_loop`: 09:05 도달 시 관찰용 H0STMKO0 해제(보유/keepalive/VI활성 제외) + `_vi_observe_codes` 비움
+  4. `_on_market_status_krx`: 관찰 종목(`_vi_observe_codes`)은 `[VI관찰-0859]` 로그(vi_cls_code / ovtm_vi / mkop / antc_mkop / trht / iscd_stat)만 남기고 `continue` → 실제 VI 전환/상태 로직은 건너뜀(기존 09:00 타이머 연장 동작 유지, 동작 변경 0)
+- **Impact**: 장 오픈 연장(VI 예측) 기준을 09:02 고정 타이머에서 H0STMKO0 vi_cls_code 이벤트 기반으로 전환하기 전, 09:00 전후 vi_cls_code 수신 정합성을 하루 관찰해 검증. 매매 동작 변경 없음. H0STMKO0_MAX_SLOTS=5(a1 공유)로 대상 6개+ 시 일부만 관찰됨(별도 a2 WSS 이전 시 해소 예정)
+
 ## [2026-06-02] c1dfba1
 - **Category**: refactor
 - **Title**: 경로B VI 감지 로그 간소화 — VI현황조회 REST 추가호출 제거 (옵션 B 채택)

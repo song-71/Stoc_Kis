@@ -552,6 +552,12 @@ try:
         )
     else:
         _last_lenient_skip_ts = [0.0]  # rate-limit 용 (mutable closure)
+        # [260602] decode skip 근본원인 진단 로깅 (rate-limit 무시, 최초 N건만 상세)
+        #   - 발생이 08:50~08:59 예상체결(H0STANC0) 프레임에만 집중 → CP949 한글 유입 의심.
+        #   - 실패 프레임을 버리기 전에 (tr_id / 프레임길이 / 에러offset 주변 hex /
+        #     cp949 재디코드 샘플) 을 남겨 truncation vs CP949 인코딩 유입을 확정한다.
+        _lenient_diag_count = [0]
+        _LENIENT_DIAG_MAX = 40
 
         async def _lenient_assembler_get(self, decode=None):
             # 원본 websockets.asyncio.messages.Assembler.get(15.0.1) 본문 복제 —
@@ -583,7 +589,35 @@ try:
                     return data.decode()                        # 정상 프레임: 기존과 100% 동일
                 except UnicodeDecodeError as _e:
                     _now_ts = time.time()
-                    if _now_ts - _last_lenient_skip_ts[0] >= 30.0:  # 30s 1회 rate-limit
+                    # ── [260602] 근본원인 진단: 최초 _LENIENT_DIAG_MAX 건은 rate-limit 무시하고 상세 기록 ──
+                    if _lenient_diag_count[0] < _LENIENT_DIAG_MAX:
+                        _lenient_diag_count[0] += 1
+                        try:
+                            _st = _e.start
+                            # TR 식별: 정상부 프레임 헤더 "0|H0STANC0|001|..." 는 ASCII → 안전 디코드
+                            _hdr = data[:48].decode("ascii", "replace")
+                            _trid = _hdr.split("|")[1] if "|" in _hdr else "?"
+                            # 에러 offset 주변 ±16바이트 hex
+                            _lo = max(0, _st - 16)
+                            _win = data[_lo:_st + 16]
+                            _hex = " ".join(f"{b:02x}" for b in _win)
+                            # 깨진 바이트 자체
+                            _bad = data[_st:_st + 4]
+                            _bad_hex = " ".join(f"{b:02x}" for b in _bad)
+                            # CP949(EUC-KR) 재디코드 시도 → 멀쩡한 한글이 나오면 인코딩 유입 확정
+                            _cp949 = data[max(0, _st - 8):_st + 24].decode("cp949", "replace")
+                            logger.warning(
+                                f"{ts_prefix()} [ws][utf8-diag #{_lenient_diag_count[0]}] "
+                                f"tr_id={_trid} len={len(data)} reason='{_e.reason}' offset={_st} "
+                                f"bad=[{_bad_hex}] hex@±16=[{_hex}] cp949='{_cp949}'"
+                            )
+                        except Exception as _diag_e:
+                            try:
+                                logger.warning(f"{ts_prefix()} [ws][utf8-diag] 진단 로깅 실패: {_diag_e}")
+                            except Exception:
+                                pass
+                        _last_lenient_skip_ts[0] = _now_ts
+                    elif _now_ts - _last_lenient_skip_ts[0] >= 30.0:  # 상세 소진 후: 30s 1회 요약
                         _last_lenient_skip_ts[0] = _now_ts
                         try:
                             logger.warning(
@@ -1060,6 +1094,11 @@ def _inquire_psbl_rvsecncl(client, cano: str, acnt: str, tr_id: str = "TTTC0084R
         "CTX_AREA_FK100": "", "CTX_AREA_NK100": "",
     }
     out: list[dict] = []
+    # 연속조회는 응답 헤더 tr_cont 로만 판정한다. KIS 는 다음 페이지가 없어도(rt_cd=0)
+    # body 의 ctx_area_fk100 에 "CANO^ACNT^" + 공백 패딩 같은 쓰레기 값을 채워 돌려주므로,
+    # ctx 값 유무로 루프를 돌리면 그 가짜 연속키로 재조회 → 500 Internal Server Error 가 난다.
+    # 초기 요청 tr_cont="", 연속 요청 tr_cont="N". 응답 tr_cont 가 F/M 일 때만 다음 페이지가 있다.
+    headers["tr_cont"] = ""
     for _ in range(20):
         r = requests.get(url, headers=headers, params=params, timeout=10)
         r.raise_for_status()
@@ -1070,12 +1109,12 @@ def _inquire_psbl_rvsecncl(client, cano: str, acnt: str, tr_id: str = "TTTC0084R
         if isinstance(output1, dict):
             output1 = [output1]
         out.extend(output1)
-        ctx_fk = j.get("ctx_area_fk100") or ""
-        ctx_nk = j.get("ctx_area_nk100") or ""
-        if not ctx_fk and not ctx_nk:
+        tr_cont = str(r.headers.get("tr_cont") or "").strip().upper()
+        if tr_cont not in ("F", "M"):   # D/E/공백 = 마지막 페이지(또는 데이터 없음)
             break
-        params["CTX_AREA_FK100"] = ctx_fk
-        params["CTX_AREA_NK100"] = ctx_nk
+        headers["tr_cont"] = "N"
+        params["CTX_AREA_FK100"] = j.get("ctx_area_fk100") or ""
+        params["CTX_AREA_NK100"] = j.get("ctx_area_nk100") or ""
     return out
 
 
@@ -3710,6 +3749,8 @@ _afternoon_extra_closing_done = False
 _morning_extra_logged_done = False
 _afternoon_extra_logged_done = False
 _sell_state_supplement_done = False
+# [260602] 08:45 진단로그 확인 리마인더 (decode skip 근본원인 진단 — 1일 1회)
+_diag_reminder_done = False
 # 08:30~08:40 시간외 종가 추가매수 — 당일 실제 발사한 주문 기록 (08:41 결과 표 소스)
 _morning_extra_placed: list[dict] = []
 
@@ -5772,6 +5813,20 @@ def scheduler_loop():
                             _run_overtime_buy_orders()
                         except Exception as e:
                             logger.warning(f"{ts_prefix()} [시간외매수] {e}")
+            # ── [260602] 08:45 진단로그 확인 TODO 리마인더 (decode skip 근본원인) ──
+            # 08:50 예상체결(H0STANC0) 구독 직전에 1회 알림. 장전 08:50~08:59 에 [ws][utf8-diag #N]
+            # 로그가 찍히면 cp949='...' 필드로 CP949 한글 유입 여부를 확정한다.
+            global _diag_reminder_done
+            if (not _diag_reminder_done) and dtime(8, 45) <= now.time() < dtime(8, 50):
+                _diag_reminder_done = True
+                _notify(
+                    f"{ts_prefix()} [TODO][진단] decode skip 근본원인 진단로그 확인 — "
+                    f"08:50~08:59 장전 예상체결(H0STANC0) 구간에서 '[ws][utf8-diag #N]' 라인의 "
+                    f"cp949='...' 값 확인(멀쩡한 한글=CP949 인코딩 유입 확정). "
+                    f"로그: out/logs/wss_TR_{datetime.now(KST).strftime('%y%m%d')}.log",
+                    tele=True,
+                )
+
             new_mode = calc_mode(now)
             with _mode_lock:
                 old_mode = _current_mode

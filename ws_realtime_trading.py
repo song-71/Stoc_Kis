@@ -8388,33 +8388,24 @@ def _handle_stale_check_result(code: str, output: dict) -> None:
     mrkt_warn = str(output.get("mrkt_warn_cls_code", "")).strip()
     invt_caful = str(output.get("invt_caful_yn", "N")).strip().upper()
 
-    _VI_CLS_NAMES = {"1": "정적VI", "2": "동적VI", "3": "정적&동적"}
-
     def _status_notify(msg: str) -> None:
         sys.stdout.write("\n")
         _notify(msg)
 
     # ── VI 발동 감지 (vi_cls_code 기준) ──
     # [260602] 실측: VI 동시호가 중엔 temp_stop_yn='N' 인데 vi_cls_code='Y' 로 온다.
-    #   → temp_stop_yn 으로는 VI 를 못 잡으므로 현재가조회의 vi_cls_code 로 감지하고,
-    #     VI현황조회(_inquire_vi_status_single)로 발동시각/종류를 보강한다. 둘 다 로그에 표기.
-    #     _vi_exp_sub_switch 가 H0STMKO0 도 구독하므로 해제는 경로 A(H0STMKO0 vi_cls='N')가 처리.
+    #   → temp_stop_yn 으로는 VI 를 못 잡으므로 현재가조회의 vi_cls_code 로 감지한다.
+    #   발동시각은 감지시각(now)으로 기록한다 — 정확 발동시각/VI종류(정적·동적)는 vi_status CSV
+    #   (Daily_vi, 260602부터 양방향)에 권위있게 남으므로, 여기서 별도 VI현황조회(REST 추가호출)는
+    #   하지 않는다(로그 장식용 호출 제거 → 변동성 장세 REST 절약). 매매 영향 없음.
+    #   _vi_exp_sub_switch 가 H0STMKO0 도 구독하므로 해제는 경로 A(H0STMKO0 vi_cls='N')가 처리.
     if vi_cls_rt not in ("N", "0", "") and code not in _vi_exp_sub_ts:
-        try:
-            _vi_client = _price_client or _init_price_client()
-            is_vi, vi_time, vi_cls = _inquire_vi_status_single(_vi_client, code)
-            if is_vi:
-                _vi_trigger_info[code] = {"vi_time": vi_time, "vi_cls_code": vi_cls}
-                detail = f"{_VI_CLS_NAMES.get(vi_cls, vi_cls)} 발동시각={vi_time}"
-            else:
-                detail = "VI현황 미확정"
-            msg = (f"{ts_prefix()} [VI감지-REST] {name}({code}) "
-                   f"vi_cls_code={vi_cls_rt} ({detail}) → 예상체결 전환")
-            logger.warning(msg)
-            _notify(msg, tele=True)
-            _vi_exp_sub_switch(code)
-        except Exception as e:
-            logger.warning(f"{ts_prefix()} [VI감지-REST] {name}({code}) 조회 실패: {e}")
+        detected_at = datetime.now(KST).strftime("%H:%M:%S")
+        msg = (f"{ts_prefix()} [VI감지-REST] {name}({code}) "
+               f"vi_cls_code={vi_cls_rt} 감지시각={detected_at} → 예상체결 전환")
+        logger.warning(msg)
+        _notify(msg, tele=True)
+        _vi_exp_sub_switch(code)
         _enqueue_rest_price_row(code, output)
         return
 

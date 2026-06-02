@@ -2,6 +2,35 @@
 
 ---
 
+## [2026-06-02] 55b47ae
+- **Category**: fix / feat
+- **Title**: VI 발동/해제 감지 근본수정 (상태전이 판정) + vi_cls_code parquet 저장
+- **Files**: `ws_realtime_trading.py`
+- **Changes**:
+  1. **fix — VI 발동/해제 감지 로직 근본수정** (`_on_market_status_krx`, ~L8187):
+     - 근본원인: KIS vi_cls_code 실측값은 발동='Y'/해제='N' 인데, 기존 코드는 0/1/2/3 숫자를
+       가정해 `vi_cls != "0"` 으로 발동 판정 → 해제값 'N' 도 `!= "0"` 이라 발동으로 오판.
+       결과: [VI해제]/_vi_exp_sub_restore 가 한 번도 안 타고, 5분 fallback(_vi_exp_sub_ts 300초)
+       으로만 실시간체결 복귀 → VI 해제 후 최대 ~5분간 예상체결에 머무름.
+       증거: 260529 로그 — [VI발동] 4건 / [VI해제] 0건, 발동로그에 vi_cls=N 2건 혼입.
+     - 수정: 단순 문자열변화 비교 대신 '상태전이' 판정 도입.
+       `is_active = vi_cls not in ("N","0","")` / `was_active = prev_vi not in ("N","0","")`.
+       비활성→발동(is_active and not was_active) = _vi_exp_sub_switch(예상체결),
+       발동→비활성(was_active and not is_active) = _vi_exp_sub_restore(실시간체결).
+       효과: (a) 해제 즉시 정상복귀, (b) 재발동(Y→N→Y) 자연 처리, (c) keepalive 선캐싱('0')·
+       반복 동일프레임 허위 전이 방지.
+     - 검증근거: test_vi_wss_cycle.py 260602 라이브 확인(011300·013720·145670 사이클).
+     - ※ **재시작 후 라이브 재검증 필요** (커밋 시점 실행 중 프로세스는 구코드).
+  2. **feat — vi_cls_code parquet 컬럼 추가** (ingest_loop, ~L12630):
+     - 기존 vi_yn(Y/공백, _vi_active_codes 기반)만 저장, vi_cls_code 원값 미보존.
+     - `pl.lit(_vi_cls_cache.get(code,"")).alias("vi_cls_code")` 추가.
+       H0STMKO0 마지막 수신값 그대로 보존 (발동='Y'/해제='N', 미구독 종목="").
+     - 스키마 안전: diagonal_relaxed 병합 → 기존 part 와 혼재 시 null 채움 자동 처리.
+- **Impact**:
+  - VI 해제 시 실시간체결 즉시 복귀(기존: 5분 fallback). 매도 타이밍 지연 해소.
+  - 재발동 사이클(발동→해제→재발동) 자연 처리 — 추가 코드 불필요.
+  - parquet에 vi_cls_code 원값 보존 → VI 분석 데이터 품질 향상.
+
 ## [2026-06-02] 23b8471
 - **Category**: feat
 - **Title**: test_vi_wss_cycle.py — 멀티종목 동시 모니터링 + 실전 VI 감지 절차화 + 라이브 검증 확장

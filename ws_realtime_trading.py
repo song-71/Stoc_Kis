@@ -4767,6 +4767,9 @@ OVERTIME_REAL_PROGRESS_INTERVAL = 10     # 체결가 수신 중 진행상황 출
 _last_overtime_real_slot: datetime | None = None
 _vi_delayed_codes: set[str] = set()   # VI 발동 의심 종목 (09:00~09:02 예상체결 유지)
 _vi_delay_until: datetime | None = None  # VI 지연 종료 시각 (09:02:00)
+# [260602 관찰] 08:59 prdy>9.8% 종목 H0STMKO0 관찰구독 → vi_cls_code 로그(연장기준 정합성 검증용, 동작 미변경)
+_vi_observe_codes: set[str] = set()
+_vi_observe_done: bool = False
 _last_prdy_ctrt: dict[str, float] = {c: 0.0 for c in codes}
 _last_mkop_cls_code: dict[str, str] = {}  # code -> new_mkop_cls_code (종목상태, WS 수신값)
 _last_trid_per_code: dict[str, str] = {}  # code → 마지막 수신 tr_id
@@ -5576,7 +5579,7 @@ def _wss_norecv_watchdog_loop():
 def scheduler_loop():
     global _current_mode, _last_rebuild_ts, _last_no_data_warn_ts, _no_data_rebuild_count
     global _overtime_real_active, _overtime_real_last_progress_ts, _vi_delayed_codes, _vi_delay_until, _last_overtime_real_slot
-    global _end_time_reached, _active_kws
+    global _end_time_reached, _active_kws, _vi_observe_codes, _vi_observe_done
     logger.info(f"{ts_prefix()} [scheduler] started")
     # ── 시작 시 cleanup: 08:30 이전이면 config 의 failed 외부주문 정리 (1회) ──
     _cleanup_failed_external_orders_at_startup()
@@ -5899,6 +5902,36 @@ def scheduler_loop():
                         _set_runtime_status(RUNTIME_STATUS_STOPPED)
                         logger.info(f"{ts_prefix()} [scheduler] EXIT 모드 정리 완료 → os._exit(0)")
                         os._exit(0)
+
+                # ── [260602 관찰] 08:59 prdy>9.8% 종목 H0STMKO0 관찰구독 → vi_cls_code 로그 ──
+                # 목적: 장 오픈 연장(VI 예측) 기준을 H0STMKO0 vi_cls_code 로 전환하기 전, 09:00 전후
+                #   그 값이 어떻게 오는지 정합성 검증. 관찰 전용 — 실제 연장 동작은 기존 09:00 타이머 유지.
+                if (not _vi_observe_done) and dtime(8, 59) <= now.time() <= dtime(8, 59, 5):
+                    _vi_observe_done = True
+                    observe = {c for c, v in _last_prdy_ctrt.items() if v > 9.8 and c in set(codes)}
+                    if observe:
+                        _vi_observe_codes |= observe
+                        try:
+                            _mkstatus_sub_add(observe)
+                        except Exception as e:
+                            logger.warning(f"{ts_prefix()} [VI관찰-0859] H0STMKO0 관찰구독 실패: {e}")
+                        obs_names = [f"{code_name_map.get(c, c)}({c})={_last_prdy_ctrt.get(c, 0.0):.1f}%" for c in observe]
+                        _notify(
+                            f"{ts_prefix()} [VI관찰-0859] {len(observe)}종목 H0STMKO0 관찰구독 시작 "
+                            f"→ vi_cls_code 로그 (대상: {', '.join(obs_names)})", tele=True)
+                    else:
+                        logger.info(f"{ts_prefix()} [VI관찰-0859] prdy>9.8% 종목 없음 → 관찰 스킵")
+                # 09:05 관찰 종료: 관찰용 H0STMKO0 해제(보유/keepalive/VI활성 제외) + 셋 비움
+                if _vi_observe_codes and now.time() >= dtime(9, 5):
+                    _keep = set(_mkt_keepalive_current.values()) | _vi_active_codes
+                    _to_rm = _vi_observe_codes - _keep
+                    if _to_rm:
+                        try:
+                            _mkstatus_sub_remove(_to_rm)
+                        except Exception:
+                            pass
+                    logger.info(f"{ts_prefix()} [VI관찰-0859] 관찰 종료 → H0STMKO0 {len(_to_rm)}종목 해제")
+                    _vi_observe_codes.clear()
 
                 # ── VI 종목별 구독 관리: 09:00에 prdy_ctrt>=10% 종목만 예상체결 유지 ──
                 if dtime(9, 0) <= now.time() <= dtime(9, 0, 1) and not _vi_delayed_codes and _vi_delay_until is None:
@@ -8133,6 +8166,21 @@ def _on_market_status_krx(result) -> None:
         if not code:
             continue
         name = code_name_map.get(code, code)
+
+        # ── [260602 관찰] 08:59 prdy>9.8% 관찰 종목: vi_cls_code 로그만 남기고 실제 로직은 건너뜀 ──
+        # (연장기준 정합성 검증용. 실제 VI 전환/연장은 기존 경로가 처리하므로 동작 변경 없음.)
+        if code in _vi_observe_codes:
+            logger.warning(
+                f"{ts_prefix()} [VI관찰-0859] {name}({code}) "
+                f"vi_cls_code={str(row.get('vi_cls_code', '')).strip()!r} "
+                f"ovtm_vi={str(row.get('ovtm_vi_cls_code', '')).strip()!r} "
+                f"mkop={str(row.get('mkop_cls_code', '')).strip()!r} "
+                f"antc_mkop={str(row.get('antc_mkop_cls_code', '')).strip()!r} "
+                f"trht={str(row.get('trht_yn', '')).strip()!r} "
+                f"iscd_stat={str(row.get('iscd_stat_cls_code', '')).strip()!r}"
+            )
+            continue
+
         trht_yn = str(row.get("trht_yn", "N")).strip().upper()
         iscd_stat = str(row.get("iscd_stat_cls_code", "")).strip()
 

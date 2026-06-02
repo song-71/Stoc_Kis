@@ -2,6 +2,16 @@
 
 ---
 
+## [2026-06-02] 2df1910
+- **Category**: fix
+- **Title**: 재시작 1006 구조적 원인 수정 — UNSUBSCRIBE 예산 cap + close 실행 보장
+- **Files**: `ws_realtime_trading.py`
+- **Changes**:
+  1. **배경**: 앞선 band-aid(f2f05d7, 5s→13s 외곽 timeout) 재검토. 구조적 결함은 UNSUBSCRIBE(최대 5타입×1s)가 외곽 예산을 모두 소진하면 close()가 호출조차 안 되는 것. close frame 미전송 → KIS 세션 잔재 → 재시작 직후 동일 approval_key 로 접속 시 1006 반복.
+  2. **`_shutdown`**: `_request_ws_close` join 외곽 timeout 13.0s → 6.0s (band-aid 되돌림). 단계별 예산 관리는 내부로 이전. 정상 종료 시 추가비용 없음.
+  3. **`_request_ws_close`**: UNSUBSCRIBE 총예산 `_UNSUB_BUDGET = 2.0s` cap 추가. 예산 소진 시 남은 종목 skip하고 즉시 close 진행 → close frame 전송 항상 보장. UNSUBSCRIBE 타입별 ok/timeout(+Ns), 단계 종료(+Ns), close() 반환(+Ns) 로깅 추가. 예외 로그도 debug→warning으로 승격.
+- **Impact**: close frame 전송을 구조적으로 보장 → KIS 세션 즉시 반환 → 재시작 직후 1006 해소 기대. 다음 재시작 종료 로그의 'close() 반환 (+Ns)' 와 단계별 시간으로 원인 확정 가능. 잔여 1006은 기존 self-heal(dwell<15s → force_new approval_key)이 복구.
+
 ## [2026-06-02] f2f05d7
 - **Category**: fix
 - **Title**: 재시작 1006 근본수정 — graceful close timeout 5s→13s, settle 처방 철회

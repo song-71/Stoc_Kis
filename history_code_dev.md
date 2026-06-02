@@ -2,6 +2,30 @@
 
 ---
 
+## [2026-06-02] 80c8f44
+- **Category**: fix
+- **Title**: inquire-balance 페이지네이션 500 에러 수정 — tr_cont 헤더 기반 연속 판정
+- **Files**: `ws_realtime_trading.py`
+- **Changes**:
+  1. **증상**: 재시작 직후 [시작잔고조회] 500 Server Error.
+     URL에 `CTX_AREA_FK100=63614390^01^N^N^01^01^N^+공백패딩` 값으로 2차 연속호출 발생.
+  2. **근본원인**: KIS `inquire-balance`는 다음 페이지가 없어도 body의 `ctx_area_fk100`에
+     `CANO^ACNT^...`+공백 패딩을 채워 반환 → `strip()` 후에도 비어있지 않아
+     body ctx 기반 종료 판정 실패 → 쓰레기 ctx로 2차 조회 → 500.
+     (미체결취소 `_inquire_psbl_rvsecncl`과 동일 클래스 버그. 아침 단일페이지 호출 시엔 패딩 미발생하여 잠복.)
+  3. **수정**:
+     - `_get_balance_page`에 `tr_cont` 요청헤더 송신 파라미터 추가 (초기 `""`, 연속 `"N"`).
+     - 반환 튜플을 5요소로 확장: `(out1, out2, body_ctx_fk, body_ctx_nk, resp_tr_cont)`.
+     - 두 페이지네이션 루프(시작잔고 `_query_and_print_balance`, str1_sell 잔고 `_get_balance_holdings`)에서
+       응답 `tr_cont`가 `'F'`/`'M'`일 때만 연속 진행, body ctx 패딩 신뢰 제거.
+     - 단일페이지 호출부 2곳(`_run_closing_balance_verification`, `_get_account_available_cash`)도
+       5요소 unpack으로 갱신.
+  4. **점검**: `ws_realtime_trading.py` 내 ctx 기반 페이지네이션은 두 함수뿐,
+     둘 다 tr_cont 기반으로 통일됨 (다른 취약 루프 없음).
+- **Impact**:
+  - 재시작 시 [시작잔고조회] 500 에러 제거. 페이지네이션 연속 판정이 KIS 응답 헤더 기반으로 일원화됨.
+  - 단일페이지 호출부도 5요소 unpack 통일로 향후 리팩토링 오류 방지.
+
 ## [2026-06-02] 55b47ae
 - **Category**: fix / feat
 - **Title**: VI 발동/해제 감지 근본수정 (상태전이 판정) + vi_cls_code parquet 저장

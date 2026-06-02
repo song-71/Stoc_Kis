@@ -183,6 +183,17 @@ def main():
         log_manager.log_tm(out)
         logging.info("%s", out)
 
+    def _log_info_only(msg: str) -> None:
+        """텔레그램 없이 로그/화면만 (진행 단계 상세용)."""
+        logging.info("%s %s", ts_prefix(), msg)
+
+    def _fmt_elapsed(sec: float) -> str:
+        m, s = divmod(int(sec), 60)
+        h, m = divmod(m, 60)
+        return f"{h}시간 {m}분 {s}초" if h else (f"{m}분 {s}초" if m else f"{s}초")
+
+    _t_start = time.time()
+    # [260602] 텔레그램은 4단계만: 시작 / 다운로드중(1회) / 다운로드완료(+소요) / 파일병합완료
     _log_tm_and_info("[1m_ohlcv_All_code_download] 프로그램 시작")
 
     any_written = False
@@ -220,16 +231,21 @@ def main():
         target_codes = TARGET_CODES
 
     total_codes = len(target_codes)
-    progress_state = {"next_pct": 10}
+    progress_state = {"next_pct": 10, "tele_sent": False}
 
     def _report_progress(idx: int) -> None:
         if total_codes <= 0:
             return
         pct = int((idx * 100) / total_codes)
         while pct >= progress_state["next_pct"]:
-            _log_tm_and_info(
-                f"전체 데이터중 {progress_state['next_pct']}%({idx}/{total_codes}건) 수신 완료"
-            )
+            cur = progress_state["next_pct"]
+            line = f"전체 데이터중 {cur}%({idx}/{total_codes}건) 수신"
+            # 텔레그램은 중간(50% 도달) 1회만 "다운로드 중", 나머지 단계는 로그전용
+            if cur >= 50 and not progress_state["tele_sent"]:
+                progress_state["tele_sent"] = True
+                _log_tm_and_info(f"[1m_ohlcv] 다운로드 중 … {line}")
+            else:
+                _log_info_only(line)
             progress_state["next_pct"] += 10
 
     out_dir = Path(__file__).resolve().parent / "data" / "1m_data"
@@ -504,7 +520,7 @@ def main():
     if not any_written:
         logging.error("%s 저장할 데이터가 없습니다. (거래일/시간/종목 거래유무 확인)", ts_prefix())
         _log_tm_and_info("[1m_ohlcv] 저장할 데이터가 없습니다.")
-        _log_tm_and_info("[1m_ohlcv_All_code_download] 프로그램 종료")
+        _log_info_only("[1m_ohlcv_All_code_download] 프로그램 종료")
         return
 
     if not biz_date:
@@ -514,18 +530,20 @@ def main():
     if not temp_files:
         logging.error("%s 임시 parquet 파일이 없습니다. (temp_1m 확인)", ts_prefix())
         _log_tm_and_info("[1m_ohlcv] 임시 parquet 파일이 없습니다.")
-        _log_tm_and_info("[1m_ohlcv_All_code_download] 프로그램 종료")
+        _log_info_only("[1m_ohlcv_All_code_download] 프로그램 종료")
         return
-    _log_tm_and_info(f"[1m_ohlcv] 데이터 병합 시작 (임시 파일 {len(temp_files)}개)")
+    # ★ 다운로드(수신) 완료 — 총 소요시간 포함 (텔레그램)
+    _log_tm_and_info(f"[1m_ohlcv] 다운로드 완료 (총 {total_codes}종목, 소요 {_fmt_elapsed(time.time() - _t_start)})")
+    _log_info_only(f"[1m_ohlcv] 데이터 병합 시작 (임시 파일 {len(temp_files)}개)")
     merged = pd.concat([pd.read_parquet(p) for p in temp_files], ignore_index=True)
 
     parquet_path = out_dir / f"{biz_date}_1m_chart_DB_parquet.parquet"
 
     key_cols = ["date", "time", "code"]
     if parquet_path.exists():
-        _log_tm_and_info(f"[1m_ohlcv] 기존 parquet 발견 -> 덮어쓰기 모드")
+        _log_info_only(f"[1m_ohlcv] 기존 parquet 발견 -> 덮어쓰기 모드")
 
-    _log_tm_and_info(f"[1m_ohlcv] 중복 제거 시작 (기준={','.join(key_cols)})")
+    _log_info_only(f"[1m_ohlcv] 중복 제거 시작 (기준={','.join(key_cols)})")
     merged["_v_ok"] = merged["volume"].fillna(0) > 0 if "volume" in merged.columns else False
     merged["_a_ok"] = merged["acml_value"].fillna(0) > 0 if "acml_value" in merged.columns else False
     merged["_c_ok"] = merged["close"].fillna(0) > 0 if "close" in merged.columns else False
@@ -541,7 +559,7 @@ def main():
     merged = merged.drop_duplicates(subset=key_cols, keep="first").reset_index(drop=True)
     merged = merged.drop(columns=["_v_ok", "_a_ok", "_c_ok", "_score"], errors="ignore")
 
-    _log_tm_and_info(f"[1m_ohlcv] parquet 저장 시작 (총 {len(merged)}건)")
+    _log_info_only(f"[1m_ohlcv] parquet 저장 시작 (총 {len(merged)}건)")
     merged.to_parquet(parquet_path, index=False)
 
     if summary_rows:
@@ -556,7 +574,8 @@ def main():
     # 요약 출력이 완전히 끝난 뒤 로그를 남기도록 순서 보장
     time.sleep(0.2)
     logging.info("%s 저장 완료: %s", ts_prefix(), parquet_path)
-    _log_tm_and_info(f"[1m_ohlcv] 저장 완료: {parquet_path.name}")
+    # ★ 파일병합 완료 (텔레그램)
+    _log_tm_and_info(f"[1m_ohlcv] 파일병합 완료: {parquet_path.name} (총 {len(merged)}건)")
 
     # ── S3 업로드 ──
     try:
@@ -569,7 +588,7 @@ def main():
         s3 = boto3.client("s3")
         s3.upload_file(str(parquet_path), s3_bucket, s3_key)
         logging.info("%s [S3] uploaded %s -> %s", ts_prefix(), parquet_path.name, s3_url)
-        _log_tm_and_info(f"[1m_ohlcv] S3 업로드 완료: {s3_url}")
+        _log_info_only(f"[1m_ohlcv] S3 업로드 완료: {s3_url}")
     except Exception as e:
         logging.error("%s [S3] 업로드 실패: %s", ts_prefix(), e)
 
@@ -593,7 +612,7 @@ def main():
     except Exception as e:
         logging.error("%s [cleanup] 로컬 정리 실패: %s", ts_prefix(), e)
 
-    _log_tm_and_info("[1m_ohlcv_All_code_download] 프로그램 종료")
+    _log_info_only("[1m_ohlcv_All_code_download] 프로그램 종료")
 
 
 if __name__ == "__main__":

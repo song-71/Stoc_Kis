@@ -85,6 +85,13 @@ PAGE_LIMIT_1M = 120
 LOG_ID = "_1d"  # 로그/텔레그램 메시지 식별용
 
 
+def _fmt_elapsed(sec: float) -> str:
+    """초 → '시간/분/초' 문자열 (다운로드 완료 메시지 소요시간용)."""
+    m, s = divmod(int(sec), 60)
+    h, m = divmod(m, 60)
+    return f"{h}시간 {m}분 {s}초" if h else (f"{m}분 {s}초" if m else f"{s}초")
+
+
 def ts_prefix() -> str:
     kst = timezone(timedelta(hours=9))
     return datetime.now(kst).strftime(f"[%y%m%d_%H%M%S{LOG_ID}]")
@@ -138,7 +145,7 @@ def fetch_market_ohlcv(
     total = len(codes_list)
     if limit:
         total = min(total, limit)
-    send_telegram(f"{ts_prefix()} [KIS][download] start freq={freq} range={start}~{end} total={total}")
+    send_telegram(f"{ts_prefix()} [KIS][download] 다운로드 중 freq={freq} total={total}종목 range={start}~{end}")
     start_dt = parse_yyyymmdd(start)
     end_dt = parse_yyyymmdd(end)
     logged_cols = False
@@ -291,6 +298,8 @@ def main() -> None:
     log_name = f"KIS_log_{datetime.now(kst).strftime('%y%m%d')}.log"
     run_tag = f"{os.path.basename(__file__)} 시작 {datetime.now(kst).strftime('%Y-%m-%d %H:%M:%S')}"
     log_manager = LogManager(log_dir, log_name=log_name, run_tag=run_tag)
+    _t0 = time.time()
+    # [260602] 텔레그램은 4단계만: 시작 / 다운로드중 / 다운로드완료(+소요) / 파일병합완료
     log_manager.log_tm(f"{ts_prefix()} [KIS][start] {os.path.basename(__file__)} 실행")
 
     appkey = config.get("appkey")
@@ -363,8 +372,7 @@ def main() -> None:
         results = [combined]
         print(f"{ts_prefix()} [csv] loaded: {csv_path} rows={len(combined)}")
     else:
-        send_telegram(f"{ts_prefix()} [KIS][start] OHLCV download freq={args.freq} range={start_arg}~{end_arg} market={args.market}")
-        log_manager.log_tm(
+        log_manager.log(
             f"{ts_prefix()} [KIS][download] 모든 KRX 종목 {args.freq} 데이터 다운로드 시작 "
             f"market={args.market} range={start_arg}~{end_arg}"
         )
@@ -400,7 +408,7 @@ def main() -> None:
         if not df.empty:
             df["market"] = "KRX"
             results.append(df)
-        send_telegram(f"{ts_prefix()} [KIS][done] KRX download complete count={len(codes)} freq={args.freq}")
+        send_telegram(f"{ts_prefix()} [KIS][done] 다운로드 완료 count={len(codes)}종목 freq={args.freq} 소요={_fmt_elapsed(time.time() - _t0)}")
 
     if not results:
         print(f"{ts_prefix()} 조회 결과가 없습니다.")
@@ -427,7 +435,7 @@ def main() -> None:
     except Exception as e:
         print(f"{ts_prefix()} [pipeline] 실패: {e}")
         raise
-    log_manager.log_tm(f"{ts_prefix()} [KIS][done] 데이터 다운로드 및 S3 업로드 완료 (총 {len(combined)}건)")
+    log_manager.log(f"{ts_prefix()} [KIS][done] 데이터 다운로드 및 S3 업로드 완료 (총 {len(combined)}건)")
 
     if args.freq == "1d":
         print(f"{ts_prefix()} [pipeline] unified parquet build 실행")
@@ -437,10 +445,10 @@ def main() -> None:
             venv_python = "python"
         exit_code = os.system(f"{venv_python} {unified_path} --config {config_path}")
         if exit_code == 0:
-            log_manager.log_tm(f"{ts_prefix()} [KIS][done] EC2 통합 parquet 생성 완료 (data/1d_data/kis_1d_unified_parquet_DB.parquet)")
+            log_manager.log_tm(f"{ts_prefix()} [KIS][done] 파일병합 완료 (data/1d_data/kis_1d_unified_parquet_DB.parquet)")
         else:
             log_manager.log_tm(f"{ts_prefix()} [KIS][warn] EC2 통합 parquet 생성 실패 (data/1d_data/kis_1d_unified_parquet_DB.parquet)")
-    log_manager.log_tm(f"{ts_prefix()} [KIS][end] {os.path.basename(__file__)} 종료")
+    log_manager.log(f"{ts_prefix()} [KIS][end] {os.path.basename(__file__)} 종료")
 
 
 if __name__ == "__main__":

@@ -9490,7 +9490,8 @@ def _top_rank_loop():
                 pd.DataFrame(rows).to_csv(out_path, index=False, encoding="utf-8-sig")
             except Exception as e:
                 logger.warning(f"{ts_prefix()} [top] save failed: {e}")
-            msg = f"{ts_prefix()} 상승률 상위 Top{TOP_RANK_N} 다운로드, 저장 완료 : {out_path}"
+            _fn = os.path.basename(str(out_path)).replace("Fetch_fluctuation_top_", "...")
+            msg = f"{ts_prefix()} 상승률 상위 Top{TOP_RANK_N} 다운로드, 저장 완료({_fn})"
             sys.stdout.write("\n")  # 제자리 출력 줄바꿈
             _notify(msg)
 

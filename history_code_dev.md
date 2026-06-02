@@ -2,6 +2,16 @@
 
 ---
 
+## [2026-06-02] f2f05d7
+- **Category**: fix
+- **Title**: 재시작 1006 근본수정 — graceful close timeout 5s→13s, settle 처방 철회
+- **Files**: `restart_wss_trading.sh`, `ws_realtime_trading.py`
+- **Changes**:
+  1. **원인 재규명**: 직전 커밋(93f2c51)에서 재시작 1006을 "KIS 서버측 세션 해제 지연"으로 보고 settle 7초 대기를 추가했으나 재검증 결과 실제 원인은 "우리 close 미완료"로 확인. 모든 재시작 종료 로그에서 `_request_ws_close 5s timeout` 발생 — UNSUBSCRIBE(타입별 1s) + close frame(최대 10s) 합이 5s를 초과하여 close frame이 매번 잘렸고, KIS가 abnormal close로 인식 → 세션 잔재 → 재시작 직후 새 접속 1006.
+  2. **ws_realtime_trading.py `_shutdown`**: `_request_ws_close` 스레드 join timeout 5.0s → 13.0s. 충분한 시간을 부여하여 close frame 완료 → KIS 정상 close 인식 → 세션 즉시 반환. 정상 케이스는 빠르게 끝나면 join 즉시 반환되므로 추가비용 없음. timeout 경고 메시지도 13s로 갱신.
+  3. **restart_wss_trading.sh**: 직전 커밋에서 추가한 settle `sleep 7` 및 관련 echo 제거(잘못된 처방 철회). do_restart()→do_stop() 선행 종료(이중실행 방지) 로직은 유효하여 유지.
+- **Impact**: close frame 미완료 → KIS abnormal close → 세션 잔재 → 재시작 1006 사이클 근본 차단. 검증 포인트: 다음 재시작 종료 로그가 `5s/13s timeout` 대신 `close frame 송신 완료`로 바뀌면 해결 확인.
+
 ## [2026-06-02] 93f2c51
 - **Category**: fix
 - **Title**: 재시작 시 WSS 1006 핸드셰이크 실패 방지 + 이중실행 원천 차단

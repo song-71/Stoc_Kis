@@ -23,6 +23,10 @@ RUNNER_NAME = "ws_realtime_trading_runner.sh"
 
 
 def do_restart() -> int:
+    # [260602] 이전 프로세스(스크립트+runner)를 먼저 확실히 종료(SIGTERM→graceful shutdown,
+    #   필요시 SIGKILL)한 뒤 재기동 → 이중 실행/이중 매매 방지. (restart 스크립트도 내부에서
+    #   동일 종료를 하지만, Restart.py 레벨에서 한 번 더 보장.)
+    do_stop()
     return subprocess.call(["/bin/bash", RESTART_SH], cwd=BASE_DIR)
 
 

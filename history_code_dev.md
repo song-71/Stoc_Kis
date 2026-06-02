@@ -2,6 +2,29 @@
 
 ---
 
+## [2026-06-02] fa7d25d
+- **Category**: fix
+- **Title**: 경로B(REST 현재가조회) VI 감지를 vi_cls_code 기준으로 전환 + Daily VI 조회 방향 전체로
+- **Files**: `ws_realtime_trading.py`, `Daily_inquire_vi_status.py`
+- **Changes**:
+  1. **근본원인(ws_realtime_trading.py)**: 틱 끊김 후 경로B(REST 현재가조회)에서 VI 판단을
+     `temp_stop_yn='Y'` 게이트로만 했으나, 260602 실측 결과 VI 동시호가 중엔
+     `temp_stop_yn='N'` 이고 `vi_cls_code='Y'` 로 온다. → 일반 구독 종목의 VI를 경로B에서
+     완전히 놓쳐 예상체결 전환이 누락됨.
+  2. **수정(ws_realtime_trading.py)**: `_handle_stale_check_result`에서
+     - `vi_cls_code` 선검사 분기를 `temp_stop_yn` 검사보다 앞에 추가.
+     - `vi_cls_code`가 비정상값('N'/'0'/'' 아님)이면 `_inquire_vi_status_single`로
+       발동시각/종류를 보강하고 `[VI감지-REST]` 로그(텔레그램) + `_vi_exp_sub_switch` 수행.
+       해제는 이후 경로A(H0STMKO0 `vi_cls='N'`)가 처리하므로 별도 해제 로직 불필요.
+     - 기존 `temp_stop_yn=Y` 처리는 '거래정지' 전용 분기로 분리, 로그에 `vi_cls_code` 병기.
+  3. **수정(Daily_inquire_vi_status.py)**: `OPT_DIRECTION` `"1"`(상승만) → `"0"`(전체).
+     하락 VI가 vi_status CSV에서 누락되던 문제 해소.
+     (프로덕션 단일조회 `_inquire_vi_status_single`은 이미 `FID_DIV_CLS_CODE="0"` 전체였음.)
+- **Impact**:
+  - VI 동시호가 진입 시 경로B에서도 VI가 즉시 감지되어 예상체결 전환 누락 없어짐.
+  - Daily VI 상태 CSV에 하락 VI 종목도 정상 포함됨.
+  - 실거래 핵심 경로 변경 — 다음 재시작 후 라이브 검증 필요.
+
 ## [2026-06-02] 80c8f44
 - **Category**: fix
 - **Title**: inquire-balance 페이지네이션 500 에러 수정 — tr_cont 헤더 기반 연속 판정

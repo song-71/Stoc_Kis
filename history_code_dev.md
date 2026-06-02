@@ -2,6 +2,29 @@
 
 ---
 
+## [2026-06-02] c1dfba1
+- **Category**: refactor
+- **Title**: 경로B VI 감지 로그 간소화 — VI현황조회 REST 추가호출 제거 (옵션 B 채택)
+- **Files**: `ws_realtime_trading.py`
+- **Changes**:
+  1. **배경**: 직전 커밋(fa7d25d)에서 경로B(REST 현재가조회) VI 감지 시 `_inquire_vi_status_single`
+     (FHPST01390000)을 즉시 호출해 발동시각·VI종류(정적/동적)를 로그에 표기하도록 추가했음.
+  2. **판단**: 해당 vi_time·vi_cls 정보는 `[VI감지-REST]` 로그에만 쓰이고,
+     매매 로직·parquet 저장(`_vi_start_ts=now()`)에는 미사용 확인.
+     정확 발동시각·VI종류는 vi_status CSV(Daily_vi, 양방향)에 권위있게 남으므로,
+     감지마다 REST 1회 추가하는 비용 대비 실익이 없음 → 사용자 옵션 B 채택.
+  3. **수정**: `_handle_stale_check_result` (~L8395) 에서
+     - `_inquire_vi_status_single` 호출 블록 제거.
+     - `_VI_CLS_NAMES` dict 제거.
+     - 감지 로그를 `vi_cls_code={Y} 감지시각=HH:MM:SS → 예상체결 전환` 으로 간소화.
+  4. **부수효과(무해)**:
+     - `_inquire_vi_status_single`: 호출처 없어져 dead code, 유틸로 보존.
+     - `_vi_trigger_info`: set 하는 곳 없어져 사실상 미사용 (기존 pop은 무해 no-op).
+- **Impact**:
+  - 변동성 장세에서 VI 감지마다 REST 1회 절약.
+  - 매매 로직·parquet 저장에 변경 없음.
+  - 로그 가독성 유지(감지시각 근사값 표기).
+
 ## [2026-06-02] fa7d25d
 - **Category**: fix
 - **Title**: 경로B(REST 현재가조회) VI 감지를 vi_cls_code 기준으로 전환 + Daily VI 조회 방향 전체로

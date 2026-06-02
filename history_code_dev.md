@@ -2,6 +2,17 @@
 
 ---
 
+## [2026-06-02] 93f2c51
+- **Category**: fix
+- **Title**: 재시작 시 WSS 1006 핸드셰이크 실패 방지 + 이중실행 원천 차단
+- **Files**: `restart_wss_trading.sh`, `ws_realtime_trading_Restart.py`
+- **Changes**:
+  1. **배경**: 260602 빠른 수동 재시작 4회 모두 새 프로세스에서 WSS 1006(dwell≈1.12s, "no close frame received or sent") 핸드셰이크 실패 발생. 원인은 이전 프로세스 종료 직후 같은 a1 approval_key 로 곧바로 재접속 → KIS 서버측 WSS 세션 해제가 완료되기 전에 충돌. self-heal(force_new)로 복구되긴 했으나 재시작마다 반복.
+  2. **restart_wss_trading.sh**: 이전 프로세스 종료 확인 후 새 runner 기동 직전에 `sleep 7` 및 안내 echo 추가. KIS 서버가 직전 approval_key WSS 슬롯을 반환할 시간 확보 → 재시작 1006 재발 방지.
+  3. **ws_realtime_trading_Restart.py**: `do_restart()` 진입 시 `do_stop()` 먼저 호출. 기존에는 restart 스크립트 내부에서만 종료 처리하여 Restart.py 레벨 보장이 없었음. 변경 후: SIGTERM→graceful shutdown→필요시 SIGKILL(스크립트+runner 모두) 수행 완료 후 재기동 → 이중 실행/이중 매매 원천 차단.
+  4. 참고: WSS graceful close(SIGTERM→_handle_signal→_shutdown→_request_ws_close: 활성 구독 UNSUBSCRIBE + close frame 송신)는 이미 구현돼 있어 이번 수정 범위 외.
+- **Impact**: 재시작마다 반복되던 WSS 1006 → self-heal 사이클 제거. 이중 프로세스로 인한 이중 매매 가능성 차단.
+
 ## [2026-06-02] bd864ca
 - **Category**: feat
 - **Title**: OHLCV 다운로드 텔레그램 4단계 축소 + 완료 소요시간 추가

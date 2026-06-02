@@ -876,7 +876,12 @@ def _hashkey(base_url: str, appkey: str, appsecret: str, body: dict) -> str:
     return j.get("HASH") or j.get("hash") or ""
 
 
-def _get_balance_page(client, cano: str, acnt_prdt_cd: str, tr_id: str, ctx_fk: str = "", ctx_nk: str = "") -> tuple:
+def _get_balance_page(client, cano: str, acnt_prdt_cd: str, tr_id: str,
+                      ctx_fk: str = "", ctx_nk: str = "", tr_cont: str = "") -> tuple:
+    """잔고 1페이지 조회. 반환: (out1, out2, body_ctx_fk, body_ctx_nk, resp_tr_cont).
+    연속조회 판정은 반드시 응답 헤더 resp_tr_cont('F'/'M'=다음 있음)로만 한다 —
+    KIS 는 다음 페이지가 없어도 body 의 ctx_area_fk100 에 'CANO^ACNT^...'+공백 패딩을 채워
+    돌려주므로, 그 값으로 재조회하면 500 Internal Server Error 가 난다(미체결취소와 동일 패턴)."""
     url = f"{client.cfg.base_url}/uapi/domestic-stock/v1/trading/inquire-balance"
     params = {
         "CANO": cano, "ACNT_PRDT_CD": acnt_prdt_cd, "AFHR_FLPR_YN": "N",
@@ -884,7 +889,9 @@ def _get_balance_page(client, cano: str, acnt_prdt_cd: str, tr_id: str, ctx_fk: 
         "FNCG_AMT_AUTO_RDPT_YN": "N", "PRCS_DVSN": "00",
         "CTX_AREA_FK100": ctx_fk, "CTX_AREA_NK100": ctx_nk,
     }
-    r = requests.get(url, headers=client._headers(tr_id=tr_id), params=params, timeout=10)
+    headers = client._headers(tr_id=tr_id)
+    headers["tr_cont"] = tr_cont          # 초기 "" / 연속 "N"
+    r = requests.get(url, headers=headers, params=params, timeout=10)
     r.raise_for_status()
     j = r.json()
     if str(j.get("rt_cd")) != "0":
@@ -893,7 +900,11 @@ def _get_balance_page(client, cano: str, acnt_prdt_cd: str, tr_id: str, ctx_fk: 
     out2 = j.get("output2") or {}
     if isinstance(out1, dict):
         out1 = [out1]
-    return out1, out2, str(j.get("ctx_area_fk100") or out2.get("ctx_area_fk100") or ""), str(j.get("ctx_area_nk100") or out2.get("ctx_area_nk100") or "")
+    resp_cont = str(r.headers.get("tr_cont") or "").strip().upper()
+    return (out1, out2,
+            str(j.get("ctx_area_fk100") or out2.get("ctx_area_fk100") or ""),
+            str(j.get("ctx_area_nk100") or out2.get("ctx_area_nk100") or ""),
+            resp_cont)
 
 
 def _buy_order_cash(client, cano: str, acnt_prdt_cd: str, tr_id: str, code: str, qty: int, price: float, ord_dvsn: str = "00") -> dict:
@@ -1284,9 +1295,9 @@ def _query_and_print_balance(label: str, *, trade_only: bool = True,
             acct_summary: dict = {}
             acct_rows: list[dict] = []
             seen_codes_local: set[str] = set()
-            ctx_fk, ctx_nk = "", ""
+            ctx_fk, ctx_nk, tr_cont = "", "", ""
             for _ in range(10):
-                out1, out2, ctx_fk, ctx_nk = _get_balance_page(client, cano, acnt, "TTTC8434R", ctx_fk, ctx_nk)
+                out1, out2, ctx_fk, ctx_nk, resp_cont = _get_balance_page(client, cano, acnt, "TTTC8434R", ctx_fk, ctx_nk, tr_cont)
                 if not acct_summary:
                     acct_summary = out2 if isinstance(out2, dict) else (out2[0] if isinstance(out2, list) and out2 else {})
                 rows = out1 if isinstance(out1, list) else ([out1] if isinstance(out1, dict) else [])
@@ -1300,8 +1311,9 @@ def _query_and_print_balance(label: str, *, trade_only: bool = True,
                         acct_rows.append(row)
                         if include_in_hold_map and c not in _code_account_map:
                             _code_account_map[c] = acct
-                if not ctx_fk.strip() and not ctx_nk.strip():
+                if resp_cont not in ("F", "M"):   # 응답 tr_cont 로만 연속 판정 (body ctx 패딩 신뢰 금지)
                     break
+                tr_cont = "N"
             valid_rows = [
                 r for r in acct_rows
                 if int(float(str(r.get("hldg_qty", 0) or 0).replace(",", "") or 0)) > 0
@@ -1674,9 +1686,9 @@ def _get_balance_holdings() -> dict[str, dict]:
         alias = acct.get("alias", acct.get("account_id", "?"))
         try:
             client = _init_account_client(acct) if "appkey" in acct else (_top_client or _init_top_client())
-            ctx_fk, ctx_nk = "", ""
+            ctx_fk, ctx_nk, tr_cont = "", "", ""
             for _ in range(10):
-                out1, _, ctx_fk, ctx_nk = _get_balance_page(client, cano, acnt, "TTTC8434R", ctx_fk, ctx_nk)
+                out1, _, ctx_fk, ctx_nk, resp_cont = _get_balance_page(client, cano, acnt, "TTTC8434R", ctx_fk, ctx_nk, tr_cont)
                 rows = out1 if isinstance(out1, list) else ([out1] if isinstance(out1, dict) else [])
                 if not rows:
                     break
@@ -1706,8 +1718,9 @@ def _get_balance_holdings() -> dict[str, dict]:
                     else:
                         # 다른 계좌에도 동일 종목 보유 시 수량 합산
                         hold_map[c]["qty"] += effective_qty
-                if not ctx_fk.strip() and not ctx_nk.strip():
+                if resp_cont not in ("F", "M"):   # 응답 tr_cont 로만 연속 판정 (body ctx 패딩 신뢰 금지)
                     break
+                tr_cont = "N"
             logger.info(f"[str1_sell] 잔고조회 {alias}({cano}): {sum(1 for c, v in hold_map.items() if _code_account_map.get(c) == acct and v.get('qty', 0) > 0)}종목")
         except Exception as e:
             logger.warning(f"{ts_prefix()} [str1_sell] 잔고조회 실패 {alias}({cano}): {e}")
@@ -3774,7 +3787,7 @@ def _run_closing_balance_verification(label: str) -> None:
             if not cano:
                 continue
             client = _top_client or _init_top_client()
-            out1, _, _, _ = _get_balance_page(client, cano, acnt, "TTTC8434R")
+            out1, _, _, _, _ = _get_balance_page(client, cano, acnt, "TTTC8434R")
             rows = out1 if isinstance(out1, list) else ([out1] if isinstance(out1, dict) else [])
             hold_map = {}
             for row in rows:
@@ -6593,7 +6606,7 @@ def _get_account_available_cash(client: KisClient, acct: dict) -> float:
     exclude = float(str(acct.get("exclude_cash", "0") or 0).replace("_", "") or 0)
     max_inv = float(str(acct.get("max_invest", "0") or 0).replace("_", "") or 0)
     try:
-        hold_rows, out2, _, _ = _get_balance_page(client, cano, acnt, "TTTC8434R")
+        hold_rows, out2, _, _, _ = _get_balance_page(client, cano, acnt, "TTTC8434R")
         items = [out2] if isinstance(out2, dict) else (out2 if isinstance(out2, list) else [])
         if not items:
             return 0.0

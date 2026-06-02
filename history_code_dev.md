@@ -2,6 +2,28 @@
 
 ---
 
+## [2026-06-02] 0e4dfdf
+- **Category**: fix / diag / feat
+- **Title**: 미체결취소 연속조회 500 에러 수정 + decode-skip 근본원인 진단로깅 + 08:45 리마인더
+- **Files**: `ws_realtime_trading.py`
+- **Changes**:
+  1. **fix — `_inquire_psbl_rvsecncl`: 미체결취소 조회 500 에러 근본수정**:
+     - 근본원인: 연속조회 종료 판정을 응답 body의 `ctx_area_fk100` 유무로 했는데, KIS는 마지막 페이지에도 `ctx_area_fk100`에 `"CANO^ACNT^"` + 공백패딩 같은 쓰레기 값을 채워 반환 → 코드가 다음 페이지 있다고 오판 → 가짜 연속키로 재조회 시 KIS가 500 Internal Server Error 반환.
+     - 로그 증상: `[미체결취소] 실패: 500 Server Error ... CTX_AREA_FK100=43444822^01^...`
+     - 수정: 연속조회 종료 판정을 응답 헤더 `tr_cont` 기반으로 변경. 초기 요청 `tr_cont=""`, 응답 `tr_cont`가 `F`/`M`일 때만 다음 페이지 존재 → 연속 요청 `tr_cont="N"`. `D`/`E`/공백이면 종료. body의 ctx 값은 연속 요청 파라미터로만 활용.
+  2. **diag — `_lenient_assembler_get`: decode skip(UTF-8 깨짐) 근본원인 진단 로깅 추가**:
+     - 배경: decode skip 이 260511 경 발생 시작, 260601 급증. 전 일자 예외 없이 08:50~08:59 장전 예상체결(H0STANC0) 구간에만 집중(09:00 이후 0건). 에러 사유(invalid start byte / unexpected end of data)가 CP949 한글 유입 정황과 일치 → 확정용 진단 필요.
+     - 추가: `UnicodeDecodeError` 발생 시 최초 40건은 rate-limit 무시하고 상세 기록 — `tr_id`(프레임 헤더 추출) / `len` / `reason` / `offset` / 깨진바이트 hex / 주변 ±16바이트 hex / `cp949` 재디코드 샘플.
+     - 40건 소진 후엔 기존 30초 1회 요약으로 폴백. **근본수정 아님 — 진단 단계**.
+     - 로그 패턴: `[ws][utf8-diag #N] tr_id=H0STANC0 ... cp949='...'`
+  3. **feat — `scheduler_loop`: 08:45 진단로그 확인 TODO 리마인더 (1일 1회)**:
+     - 모듈 플래그 `_diag_reminder_done` 추가.
+     - 08:45~08:50 구간에서 1회 텔레그램 알림 발송 — "08:50~08:59 H0STANC0 구간의 `[ws][utf8-diag #N]` 라인에서 `cp949='...'` 값 확인(멀쩡한 한글=CP949 인코딩 유입 확정)" 안내.
+- **Impact**:
+  - `_inquire_psbl_rvsecncl` 호출 시 더 이상 500 에러 발생하지 않음. 미체결취소 조회 안정화.
+  - decode skip 발생 시 다음날 08:50~08:59 구간에서 `[ws][utf8-diag]` 상세 로그 생성 → CP949 유입 확정 또는 단순 truncation 판별 가능. 이후 근본수정 방향 결정 예정.
+  - 08:45 리마인더로 진단 결과 확인 누락 방지.
+
 ## [2026-06-01] 05144e0
 - **Category**: fix
 - **Title**: Daily_vi 장운영정보 파싱오류 수정 + WSS 중복구독 비활성화, VI 사이클 점검 테스트 추가

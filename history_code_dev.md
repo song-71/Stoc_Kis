@@ -2,6 +2,25 @@
 
 ---
 
+## [2026-06-02] 3b46a5b
+- **Category**: fix / feat
+- **Title**: test_vi_wss_cycle.py — VI 사이클 WSS 라이브 검증, 버그 3건 수정 + 기능 2건 추가 + 파싱 정확화
+- **Files**: `test_vi_wss_cycle.py`
+- **Changes**:
+  1. **fix — `pick_account` KeyError('users')**: `load_config()`(가공 dict, raw "users" 없음) 대신 `config.json` 원본을 직접 `json.load` → V2 멀티계좌(`users→default_user→accounts`) 구조 파싱 정상화.
+  2. **fix — `AttributeError: kis_auth.data_fetch` 없음**: `domestic_stock_functions_ws` import 전에 `sys.modules["kis_auth"] = ka` 별칭 등록 (메인 ws_realtime_trading.py:676 · Daily_inquire_vi_status.py:44 와 동일 패턴).
+  3. **fix — stale 종목 자동선택**: live 디렉토리의 `vi_status_merged_*.csv`가 사전순으로 분당 파일보다 뒤라 `sorted()[-1]`에 잘못 걸리던 문제 → `_latest_vi_csv()` 신설, 당일 `vi_status_YYMMDD_HHMM.csv` 패턴만 선택 + merged 파일 제외.
+  4. **feat — 장중 자동선택**: 09:00~15:20(KST) 실행 시 최신 VI 리스트의 마지막 발동중 종목을 즉시 자동 선택(`_is_market_hours`, KST timezone 적용). `--code` 지정 시 우선.
+  5. **feat — 해제 1분 후 WSS 자동종료**: VI 해제 감지 시각 기준 `POST_RELEASE_HOLD=60.0`초 경과 시 연결 종료(해제→실시간체결 전환만 관찰 후 마무리).
+  6. **fix — `parse_data_frame` 컬럼 미달 패딩**: 메인(`kis_auth_llm`)과 동일하게, KIS가 마지막 컬럼을 생략해 보낼 때(H0STMKO0 정의 11 / 실수신 10 — EXCH_CLS_CODE 미전송) 빈값 패딩 → 이름 기반 파싱이 `_raw_fields`로 깨지지 않도록. 멀티건은 ncols 단위 분할+패딩.
+  7. **fix — VI 해제 판정 조건**: 실측상 해제 시 `vi_cls_code='N'`(빈값/0 아님 — 260602 라이브 확인). 기존 `vi in ("","0")`이 'N'을 놓치던 것을 `vi in ("N","0","")` 로 수정('Y'=발동중).
+  8. **docs — docstring 갱신**: approval_key/동시실행 섹션을 260602 현행으로 수정 — a2 WSS 슬롯 비어있음(260601 Daily_vi WSS 비활성), a1(`--account main`) 실행 금지 사유 명시.
+- **Impact**:
+  - 실행 즉시 죽던 3가지 오류(KeyError/AttributeError/stale 종목) 모두 수정 → 정상 실행 가능.
+  - 장중 실행 시 최신 VI 종목 자동선택 → 수동 `--code` 없이 바로 검증 가능.
+  - VI 해제 후 60초 후 자동종료로 불필요한 장시간 대기 없이 사이클 완결.
+  - **260602 라이브 검증 결과**: 011300 우성머티리얼스 full cycle 확인 — 예상체결(H0STANC0) 수신 → `vi_cls_code='N'` 해제감지 → H0STCNT0 실시간체결 전환 → 60초 후 자동종료. H0STMKO0 named 파싱 정상. approval_key 충돌 0.
+
 ## [2026-06-02] 0e4dfdf
 - **Category**: fix / diag / feat
 - **Title**: 미체결취소 연속조회 500 에러 수정 + decode-skip 근본원인 진단로깅 + 08:45 리마인더

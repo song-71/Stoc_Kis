@@ -2,6 +2,17 @@
 
 ---
 
+## [2026-06-02] b2ab9b3
+- **Category**: feat
+- **Title**: WSS close/재접속 사이클 독립 검증 테스트 신규 추가
+- **Files**: `test_wss_close_cycle.py` (신규)
+- **Changes**:
+  1. **목적**: 재시작 직후 1006(invalid approval) 원인·수정을 메인 프로덕션(a1) 무중단으로 독립 검증. a2(syw_2) approval_key + 실제 KISWebSocket(kis_auth_llm) 사용 → 프로덕션과 동일한 close 경로 재현.
+  2. **측정 항목**: ① close() 소요시간(close frame 실제 송신 완료 시간) ② UNSUBSCRIBE 단계 소요시간(mode=unsubclose, `_request_ws_close` 모사) ③ close 직후 동일 approval_key 즉시 재접속 시 1006(dwell<15s) 발생 여부.
+  3. **모드**: `unsubclose`(UNSUBSCRIBE 후 close) / `closeonly`. CLI: `--account --code --cycles --mode --reconnect-delay`.
+  4. **로그 캡처**: KISWebSocket 내부 로그(close frame 송신 완료 Nms / 1006 / SUBSCRIBE)를 logging 핸들러로 캡처하여 사이클별 측정값 출력.
+- **Impact**: 프로덕션 무중단 상태로 WSS close 메커니즘 단독 검증 가능. [260602 17:46 실측] close=8ms(ConnectionClosedOK code=1000), 즉시 재접속 1006 없이 15초 유지 → close 코드 자체는 정상·즉시 동작 확인. 프로덕션의 5초 타임아웃/1006은 close 버그가 아니라 당일 4회 빠른 연속 재시작으로 인한 rapid-restart 연쇄 부작용(정상 일일 단일 기동/종료에선 미발생) 결론.
+
 ## [2026-06-02] 2df1910
 - **Category**: fix
 - **Title**: 재시작 1006 구조적 원인 수정 — UNSUBSCRIBE 예산 cap + close 실행 보장

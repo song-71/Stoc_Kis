@@ -12914,16 +12914,13 @@ def _shutdown(reason: str):
         kws_snap = _active_kws
         _active_kws = None  # 다른 스레드의 추가 send 방지
     if kws_snap is not None:
-        # close 자체도 dead socket 에서 hang 가능 → 별도 thread + timeout
-        # [260602] 5s→13s: 기존 5s 는 UNSUBSCRIBE(타입별 1s) + close frame(최대 10s) 합을 못 채워
-        #   매 재시작 종료 시 5s timeout → close frame 미완료 → KIS 가 abnormal close 로 인식 →
-        #   세션 잔재 → 재시작 직후 새 접속 1006(no close frame). close 완료 시간을 충분히 부여.
-        #   (정상적으로 빨리 끝나면 join 은 즉시 반환하므로 정상 케이스 추가비용 없음.)
+        # close 는 정상 소켓이면 즉시 끝난다. 타임아웃은 _request_ws_close 내부에서 단계별로 관리하며,
+        # 여기 외곽은 6s 안전망(내부 UNSUBSCRIBE 예산 2s + close 여유).
         _close_t = threading.Thread(target=_request_ws_close, args=(kws_snap,), daemon=True)
         _close_t.start()
-        _close_t.join(timeout=13.0)
+        _close_t.join(timeout=6.0)
         if _close_t.is_alive():
-            logger.warning(f"[shutdown] _request_ws_close 13s timeout — dead socket 추정, 계속 진행")
+            logger.warning(f"[shutdown] _request_ws_close 6s timeout — 계속 진행 (self-heal 로 복구)")
     t_wss = time.time()
     logger.info(f"[shutdown] (1/4) WSS 종료 완료 (+{t_wss-t0:.2f}s)")
     # ── 메모리 데이터 저장 (WSS 종료 후, 큐 소진 대기 → flush → snapshot) ──
@@ -12972,6 +12969,12 @@ def _request_ws_close(kws) -> None:
     # [260511] kws is _active_kws 체크 제거 — _shutdown 이 _active_kws=None 으로 먼저
     #         설정 후 호출하므로, 항상 _subscribed 기반으로 UNSUBSCRIBE 시도.
     #         각 send 는 1초 thread timeout 으로 dead socket hang 방지.
+    # [260602] 단계별 소요시간 측정 + UNSUBSCRIBE 총예산 cap.
+    #   기존: UNSUBSCRIBE(최대 5타입 × 1s) 가 외곽 예산(5s)을 다 먹으면 close() 가 호출조차 안 됨
+    #   → close frame 미전송 → KIS 세션 잔재 → 재시작 직후 새 접속 1006. close 를 항상 실행하도록
+    #   UNSUBSCRIBE 총예산을 2s 로 묶고, 어느 단계가 시간을 먹는지 로그로 남겨 원인을 확정한다.
+    _t0 = time.time()
+    _UNSUB_BUDGET = 2.0
     try:
         _name_to_req = {
             "ccnl_krx": ccnl_krx,                  # noqa: F405
@@ -12981,10 +12984,13 @@ def _request_ws_close(kws) -> None:
             "overtime_exp_ccnl_krx": overtime_exp_ccnl_krx,# noqa: F405
         }
         for _name, _codes in list(_subscribed.items()):
+            if time.time() - _t0 >= _UNSUB_BUDGET:
+                logger.warning(f"{ts_prefix()} [shutdown] UNSUBSCRIBE 예산({_UNSUB_BUDGET}s) 소진 → 남은 종목 skip, close 진행")
+                break
             _req = _name_to_req.get(_name)
             if not _req or not _codes:
                 continue
-            # send 자체도 dead socket 에서 hang 가능 → thread + 1s timeout
+            _st = time.time()
             _ut = threading.Thread(
                 target=_send_subscribe,
                 args=(kws, _req, list(_codes), "2"),
@@ -12993,21 +12999,24 @@ def _request_ws_close(kws) -> None:
             _ut.start()
             _ut.join(timeout=1.0)
             if _ut.is_alive():
-                logger.debug(f"{ts_prefix()} [shutdown] UNSUBSCRIBE timeout ({_name})")
-        # KIS 가 UNSUBSCRIBE 처리할 시간 (close frame 전 짧은 dwell)
-        time.sleep(0.5)
+                logger.warning(f"{ts_prefix()} [shutdown] UNSUBSCRIBE timeout ({_name}, +{time.time()-_st:.2f}s)")
+            else:
+                logger.info(f"{ts_prefix()} [shutdown] UNSUBSCRIBE ok ({_name}, +{time.time()-_st:.2f}s)")
     except Exception as _e:
         logger.debug(f"{ts_prefix()} [shutdown] UNSUBSCRIBE 단계 skip: {_e}")
 
-    # close frame 송신 (KISWebSocket.close default timeout=10.0)
+    # close frame 송신 (반드시 실행 — KISWebSocket.close 내부 timeout 보유)
+    logger.info(f"{ts_prefix()} [shutdown] UNSUBSCRIBE 단계 종료(+{time.time()-_t0:.2f}s) → close frame 송신 시작")
+    _tc = time.time()
     for attr in ("close", "shutdown"):
         try:
             fn = getattr(kws, attr, None)
             if callable(fn):
                 fn()
+                logger.info(f"{ts_prefix()} [shutdown] close() 반환 (+{time.time()-_tc:.2f}s)")
                 return
-        except Exception:
-            pass
+        except Exception as _ce:
+            logger.warning(f"{ts_prefix()} [shutdown] close({attr}) 예외(+{time.time()-_tc:.2f}s): {_ce}")
     for attr in ("ws", "wsapp", "websocket"):
         try:
             obj = getattr(kws, attr, None)

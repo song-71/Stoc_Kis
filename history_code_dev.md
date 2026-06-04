@@ -2,6 +2,20 @@
 
 ---
 
+## [2026-06-04] 7e3893e
+- **Category**: refactor
+- **Title**: 계좌 식별자/토큰 캐시 a1/a2 체계 통일 + REST access_token 공유 표준 확립
+- **Files**: `ws_realtime_trading.py`, `kis_utils.py`, `kis_auth.py`, `kis_API_ohlcv_download_Utils.py`, `ws_realtime_subscribe_to_DB-2.py`, `Daily_inquire_vi_status.py`, `fetch_top30_each_1m.py`, `check_market_status.py`, `inquire_vi_status.py`, `inquire_vi_status_simple.py`, `kis_inquire_balance_simple.py`, `kis_Trading_1_LmUp_str.py`, `fetch_foreign_investor_daily.py`, `ws_a2_subprocess.py`, `symulation/fetch_investor_history.py`, `symulation/investor_db_pilot.py`, `test_ccnl_notice.py`, `test_inquire_price.py`, `test_vi_wss_cycle.py`, `test_wss_close_cycle.py`, `test_wss_simple.py`, `rules/trading_project_main_plan.md`, `rules/LOCAL_appkey_token_sharing_prompt_260604.md` (신규)
+- **Changes**:
+  1. **발생 원인**: 260604 08:20·08:28·09:00 알림톡 다발 원인 분석. 같은 appkey임에도 프로그램마다 토큰 캐시 파일명이 달라(main: `kis_token.json` vs `kis_token_main.json`; syw_2: `kis_token_syw2.json` vs `kis_token_syw_2.json`, 프로덕션 내부 라인 6541 vs 6613 불일치) 서로 캐시를 인식 못하고 각자 재발급 → 알림톡 반복.
+  2. **계좌 식별자 통일**: 전 파일에서 `main` → `a1`, `syw_2`/`syw2` → `a2` 로 일원화. config.json 키도 `['a1', 'a2']` 체계.
+  3. **토큰 캐시 파일명 통일**: `kis_token_a1.json` / `kis_token_a2.json` 단일 체계로 통일. appkey당 1발급 후 전 프로그램 공용 재사용 보장. 구파일(`kis_token.json`, `kis_token_main.json`, `kis_token_syw2.json`, `kis_token_syw_2.json`)은 watchdog 등 참조 해소 후 23:28 cron 재시작 시 정리 예정.
+  4. **기본경로 통일**: `./kis_token.json` (기본값) → `./kis_token_a1.json` 로 통일하여 무계정 호출 시에도 a1 캐시 사용.
+  5. **approval_key vs access_token 명문화**: `rules/trading_project_main_plan.md` 에 REST access_token 공유 표준 섹션 추가. approval_key(WSS, `/oauth2/Approval`, 발급 알림 없음)와 access_token(REST, `/oauth2/tokenP`, 24h 유효, 6h 내 동일토큰 반환, 발급 시 알림톡 발생)은 완전히 다른 키임을 명문화.
+  6. **신규 규칙 파일**: `rules/LOCAL_appkey_token_sharing_prompt_260604.md` — 로컬 개발 환경 전달용 appkey/token 공유 표준 프롬프트.
+  7. **검증**: 잔여 구참조 grep 0건, config 키 `['a1','a2']` 확인, 수정 `.py` 전부 `py_compile` 통과.
+- **Impact**: 알림톡 다발 원인 근본 해소. appkey당 REST access_token이 단일 캐시 파일로 통합되어 24h 내 재발급 없이 전 프로그램 공유 재사용. 새 프로그램 추가 시에도 a1/a2 식별자만 사용하면 자동으로 동일 캐시 참조.
+
 ## [2026-06-02] b2ab9b3
 - **Category**: feat
 - **Title**: WSS close/재접속 사이클 독립 검증 테스트 신규 추가

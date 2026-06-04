@@ -55,7 +55,7 @@ def fetch_balance_simple(config_path: str | None = None, account_id: str | None 
         appsecret=cfg["appsecret"],
         base_url=cfg.get("base_url") or DEFAULT_BASE_URL,
         custtype=cfg.get("custtype") or "P",
-        token_cache_path=os.path.join(here, "kis_token_main.json"),
+        token_cache_path=os.path.join(here, "kis_token_a1.json"),
     ))
 
     cano = str(cfg.get("cano") or cfg.get("CANO") or "").strip()

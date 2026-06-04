@@ -102,11 +102,11 @@ def _tele(msg: str) -> None:
 def _init_client() -> KisClient:
     with open(os.path.join(SCRIPT_DIR, "config.json"), encoding="utf-8") as f:
         cfg = json.load(f)
-    acct = cfg["users"][cfg["default_user"]]["accounts"]["main"]
+    acct = cfg["users"][cfg["default_user"]]["accounts"]["a1"]
     return KisClient(KisConfig(
         appkey=acct["appkey"], appsecret=acct["appsecret"],
         base_url=cfg.get("base_url", DEFAULT_BASE_URL),
-        token_cache_path=os.path.join(SCRIPT_DIR, "kis_token_main.json"),
+        token_cache_path=os.path.join(SCRIPT_DIR, "kis_token_a1.json"),
     ))
 
 
@@ -154,14 +154,14 @@ def _init_ws_a2() -> None:
     global _kws
     with open(os.path.join(SCRIPT_DIR, "config.json"), encoding="utf-8") as f:
         cfg = json.load(f)
-    acct = cfg["users"][cfg["default_user"]]["accounts"].get("syw_2")
+    acct = cfg["users"][cfg["default_user"]]["accounts"].get("a2")
     if not acct or not acct.get("appkey"):
         _vi_log("[WSS초기화 실패] syw_2 계좌 설정 없음")
         return
 
     ka._cfg["my_app"] = acct["appkey"]
     ka._cfg["my_sec"] = acct["appsecret"]
-    ka.token_tmp = os.path.join(SCRIPT_DIR, "kis_token_syw_2.json")
+    ka.token_tmp = os.path.join(SCRIPT_DIR, "kis_token_a2.json")
     try:
         ka.auth(svr="prod")
         ka.auth_ws(svr="prod")

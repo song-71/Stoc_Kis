@@ -189,7 +189,7 @@ def cycle(i: int, code: str, mode: str, reconnect_delay: float) -> None:
 def main():
     global _logf
     ap = argparse.ArgumentParser()
-    ap.add_argument("--account", default="syw_2")
+    ap.add_argument("--account", default="a2")
     ap.add_argument("--code", default="005930")
     ap.add_argument("--cycles", type=int, default=2)
     ap.add_argument("--mode", default="unsubclose", choices=["unsubclose", "closeonly"])

@@ -264,7 +264,7 @@ logger = logging.getLogger("wss")
 # 인증 — 계정2(syw_2)로 접속
 # =============================================================================
 _cfg_json_auth = load_config(str(SCRIPT_DIR / "config.json"))
-_acct2_auth = _cfg_json_auth.get("accounts", {}).get("syw_2", {})
+_acct2_auth = _cfg_json_auth.get("accounts", {}).get("a2", {})
 if not _acct2_auth.get("appkey") or not _acct2_auth.get("appsecret"):
     raise ValueError("config.json → accounts.syw_2에 appkey/appsecret이 필요합니다.")
 
@@ -951,7 +951,7 @@ _price_req_second = int(time.time())
 def _load_syw2_cfg() -> dict:
     """config.json → accounts.syw_2 키를 읽어 공통 설정과 병합하여 반환."""
     cfg = load_config(str(SCRIPT_DIR / "config.json"))
-    acct = cfg.get("accounts", {}).get("syw_2", {})
+    acct = cfg.get("accounts", {}).get("a2", {})
     if not acct.get("appkey") or not acct.get("appsecret"):
         raise ValueError("config.json → accounts.syw_2에 appkey/appsecret이 필요합니다.")
     return {
@@ -969,7 +969,7 @@ def _init_top_client() -> KisClient:
         appkey=a2["appkey"], appsecret=a2["appsecret"],
         base_url=a2["base_url"], custtype=a2["custtype"],
         market_div=a2.get("market_div") or TOP_RANK_MARKET_DIV,
-        token_cache_path=str(SCRIPT_DIR / "kis_token_syw2.json"),
+        token_cache_path=str(SCRIPT_DIR / "kis_token_a2.json"),
     ))
 
 
@@ -979,7 +979,7 @@ def _init_price_client() -> KisClient:
         appkey=a2["appkey"], appsecret=a2["appsecret"],
         base_url=a2["base_url"], custtype=a2["custtype"],
         market_div=a2["market_div"],
-        token_cache_path=str(SCRIPT_DIR / "kis_token_syw2.json"),
+        token_cache_path=str(SCRIPT_DIR / "kis_token_a2.json"),
     ))
 
 

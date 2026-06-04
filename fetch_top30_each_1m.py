@@ -59,7 +59,7 @@ BACKUP_DIR = os.path.join(OUT_DIR, "backup")
 def _init_client_syw2() -> KisClient:
     """syw_2 계정으로 KisClient 생성"""
     cfg = load_config(os.path.join(SCRIPT_DIR, "config.json"))
-    acct = cfg.get("accounts", {}).get("syw_2", {})
+    acct = cfg.get("accounts", {}).get("a2", {})
     appkey = acct.get("appkey")
     appsecret = acct.get("appsecret")
     if not appkey or not appsecret:
@@ -73,7 +73,7 @@ def _init_client_syw2() -> KisClient:
         base_url=base_url,
         custtype=custtype,
         market_div=market_div,
-        token_cache_path=os.path.join(SCRIPT_DIR, "kis_token_syw2.json"),
+        token_cache_path=os.path.join(SCRIPT_DIR, "kis_token_a2.json"),
     )
     return KisClient(kis_cfg)
 

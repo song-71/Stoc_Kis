@@ -40,7 +40,7 @@ class KisConfig:
     base_url: str = DEFAULT_BASE_URL
     custtype: str = "P"
     market_div: str = "J"
-    token_cache_path: str = "./kis_token.json"
+    token_cache_path: str = "./kis_token_a1.json"
     timeout_sec: int = 10
     max_http_retries: int = 4
     http_backoff_sec: float = 0.7

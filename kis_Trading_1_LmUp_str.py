@@ -5362,7 +5362,7 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="보유 종목 조회 후 시장가 매도")
     ap.add_argument("--config", default="config.json", help="설정 파일 경로")
     ap.add_argument("--cano-key", default=None, help="config에서 계좌키 선택 (예: cano)")
-    ap.add_argument("--account-id", default="syw_2", help="accounts 하위 계정 ID 선택 (기본: syw_2)")
+    ap.add_argument("--account-id", default="a2", help="accounts 하위 계정 ID 선택 (기본: a2)")
     ap.add_argument(
         "--run-mode",
         type=int,

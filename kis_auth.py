@@ -125,7 +125,7 @@ class KisConfig:
     appsecret: str
     base_url: str = DEFAULT_BASE_URL
     custtype: str = "P"
-    token_cache_path: str = "./kis_token.json"
+    token_cache_path: str = "./kis_token_a1.json"
     timeout_sec: int = 10
     max_http_retries: int = 4
     http_backoff_sec: float = 0.7
@@ -147,7 +147,7 @@ class KisAuthClient:
                     appkey=cfg_json.get("appkey", ""),
                     appsecret=cfg_json.get("appsecret", ""),
                     base_url=cfg_json.get("base_url", DEFAULT_BASE_URL),
-                    token_cache_path=cfg_json.get("token_cache_path", "./kis_token.json")
+                    token_cache_path=cfg_json.get("token_cache_path", "./kis_token_a1.json")
                 )
             except Exception as e:
                 raise ValueError(f"config.json 로드 실패: {e}. appkey/appsecret를 config.json에 설정하세요.")

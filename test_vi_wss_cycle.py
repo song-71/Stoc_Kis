@@ -323,7 +323,7 @@ async def run(account, codes, vi_info, minutes):
 def main():
     global _logf
     ap = argparse.ArgumentParser()
-    ap.add_argument("--account", default="syw_2")
+    ap.add_argument("--account", default="a2")
     ap.add_argument("--code", default=None)
     ap.add_argument("--minutes", type=int, default=10)
     args = ap.parse_args()

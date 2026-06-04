@@ -51,7 +51,7 @@ client = KisClient(KisConfig(
     base_url=base_url,
     custtype=custtype,
     market_div=market_div,
-    token_cache_path=str(SCRIPT_DIR / "kis_token_main.json"),
+    token_cache_path=str(SCRIPT_DIR / "kis_token_a1.json"),
 ))
 client.ensure_token()
 

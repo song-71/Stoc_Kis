@@ -24,8 +24,8 @@ TRADING_OPTION = 2
 ORDERS = [("285800", 1),    # ("종목코드", 수량),
 ]
 
-# 계좌 선택: "main" (43444822) 또는 "syw_2" (63614390)
-ACCOUNT = "syw_2"
+# 계좌 선택: "a1" (43444822) 또는 "a2" (63614390)
+ACCOUNT = "a2"
 
 # tr_key: 체결통보 구독 키 (HTS 로그인 ID). 빈 문자열이면 config에서 자동 추출
 TR_KEY = ""
@@ -95,7 +95,7 @@ def submit_orders() -> list[tuple[str, int, bool, str]]:
         appkey = acct.get("appkey", "")
         appsecret = acct.get("appsecret", "")
 
-        token_name = "kis_token_main.json" if ACCOUNT == "main" else "kis_token_syw2.json"
+        token_name = f"kis_token_{ACCOUNT}.json"
         cfg = KisConfig(
             appkey=appkey, appsecret=appsecret,
             base_url=base_url,
@@ -156,7 +156,7 @@ def run_full_test(tr_key: str) -> int:
     from domestic_stock_functions_ws import ccnl_notice  # noqa: F401 — must be after sys.modules override
     ka._cfg["my_app"] = appkey
     ka._cfg["my_sec"] = appsecret
-    token_file = "kis_token_main.json" if ACCOUNT == "main" else f"kis_token_{ACCOUNT}.json"
+    token_file = f"kis_token_{ACCOUNT}.json"
     ka.token_tmp = str(SCRIPT_DIR / token_file)
     ka.auth(svr="prod")
     ka.auth_ws(svr="prod")

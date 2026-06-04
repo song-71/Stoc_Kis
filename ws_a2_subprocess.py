@@ -63,7 +63,7 @@ def run_a2_subprocess(config_path: str, data_queue, cmd_queue):
         with open(config_path, "r", encoding="utf-8") as f:
             cfg = json.load(f)
         from kis_utils import get_account_config, get_user_config  # noqa: E402
-        syw2 = get_account_config(cfg, "syw_2")
+        syw2 = get_account_config(cfg, "a2")
         if not syw2 or not syw2.get("appkey"):
             logger.error("config.json 에 syw_2 계정 누락 — a2 subprocess 종료")
             return

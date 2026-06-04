@@ -34,7 +34,7 @@ def _is_open_day_via_api(target_dt: datetime) -> bool:
     if not appkey or not appsecret:
         try:
             default_user = cfg["default_user"]
-            acct = cfg["users"][default_user]["accounts"]["main"]
+            acct = cfg["users"][default_user]["accounts"]["a1"]
             appkey = acct["appkey"]
             appsecret = acct["appsecret"]
         except (KeyError, TypeError):
@@ -44,7 +44,7 @@ def _is_open_day_via_api(target_dt: datetime) -> bool:
         raise RuntimeError("config에 appkey/appsecret이 없습니다.")
 
     base_dir = os.path.dirname(_CONFIG_PATH)
-    token_path = os.path.join(base_dir, "kis_token_main.json") if base_dir else "kis_token_main.json"
+    token_path = os.path.join(base_dir, "kis_token_a1.json") if base_dir else "kis_token_a1.json"
 
     client = KisClient(
         KisConfig(
@@ -154,14 +154,14 @@ class ConfigProxy(dict):
         if "htsid" in user and "my_htsid" not in flat:
             flat["my_htsid"] = user["htsid"]
         # main account → flat (appkey, cano 등)
-        main_acct = user.get("accounts", {}).get("main", {})
+        main_acct = user.get("accounts", {}).get("a1", {})
         for k, v in main_acct.items():
             flat[k] = v
         # accounts dict 유지 (syw_2 접근용) - main 제외
         if "accounts" in user:
             flat["accounts"] = {
                 aid: dict(acfg) for aid, acfg in user["accounts"].items()
-                if aid != "main"
+                if aid != "a1"
             }
         return flat
 
@@ -171,9 +171,9 @@ class ConfigProxy(dict):
         uid = self._raw.get("default_user", "")
         users = self._raw.get("users", {})
         user = users.get(uid, {})
-        main_acct = user.get("accounts", {}).get("main", {})
+        main_acct = user.get("accounts", {}).get("a1", {})
 
-        if key in self.ACCOUNT_KEYS and "main" in user.get("accounts", {}):
+        if key in self.ACCOUNT_KEYS and "a1" in user.get("accounts", {}):
             main_acct[key] = value
         elif key in self.USER_KEYS and uid in users:
             user[key] = value
@@ -197,7 +197,7 @@ def _migrate_config_to_v2(v1: dict) -> dict:
 
     # 기존 accounts (syw_2 등)
     old_accounts = v1.get("accounts", {})
-    accounts = {"main": main_acct}
+    accounts = {"a1": main_acct}
     for aid, acfg in old_accounts.items():
         accounts[aid] = dict(acfg)
 

@@ -1,6 +1,6 @@
 # Stoc_Kis Trading Project — Main Plan
 
-_Last updated: 2026-05-26 (by: intent-tracker)_
+_Last updated: 2026-06-04 (by: intent-tracker)_
 _Source: `ws_realtime_trading.py` 운영 흐름 + 사용자 의도_
 
 이 문서는 Stoc_Kis 프로젝트의 **운영 의도·방향·판정 기준**의 단일 소스다.
@@ -109,6 +109,30 @@ _Source: `ws_realtime_trading.py` 운영 흐름 + 사용자 의도_
 4. **[C] self-heal**: `run_ws_forever` 가 `dwell<15s` 감지 시 다음 재접속에서 `auth_ws(force_new=True)` 강제 재발급 (`run_ws_forever._force_new_approval`). 무효 캐시 키를 영구 재사용하던 버그의 자동 회복.
 
 **구현**: `kis_auth_llm.py` (`_approval_tmp_path`/`save_approval_key`/`read_approval_key`/`auth_ws(force_new)`), `ws_realtime_trading.py` (dwell<15s → force_new). 근거: 메모리 `project_wss_approval_key_invalidation.md`, 백업 `kis_auth_llm.py.bak_260601_approval`.
+
+---
+
+### REST access_token 공유 표준 (260604 수립) — ★카톡 알림톡 다발 시 1순위 점검
+
+**증상 식별**: 오전 단시간(08:20·08:28·09:00 등)에 KIS 카카오톡 "Open API 토큰 발급" 알림톡이 **여러 번** 연속으로 수신되면 → **access_token 중복 발급(캐시 파편화)** 을 1순위로 의심한다.
+
+**키 종류 구분 (혼동 금지)**:
+- `approval_key` (`/oauth2/Approval`): **WSS 접속 전용**. 카톡 알림톡 **없음**. 신규 발급 시 직전 키 즉시 무효화 → WSS 두절 위험 (위 섹션 참조).
+- `access_token` (`/oauth2/tokenP`): **REST 호출 전용**. **신규 발급 시 카톡 알림톡 발송**. 6시간 이내 재요청은 기존 토큰 동일값 반환(알림톡 없음). 유효 24시간. approval_key 와 달리 신규 발급해도 기존 토큰을 즉시 무효화하지 않으므로 WSS 두절로 이어지지 않는다 — 영향은 "중복 알림톡"에 한정.
+
+**근본 원인 (260604 확인)**:
+1. 토큰 캐시 **파일명이 프로그램별로 파편화**되어 같은 appkey인데도 서로 캐시를 공유하지 못한다.
+   - main 계좌: `kis_token.json`(기본 경로) vs `kis_token_main.json` 혼재. `ws_realtime_trading.py` 내부 6541행 vs 6613행도 불일치.
+   - syw_2 계좌: `kis_token_syw2.json` vs `kis_token_syw_2.json` 혼재.
+2. 각 프로그램이 상대방 캐시를 인식하지 못해 각자 재발급 → 6시간 경계마다 알림톡 폭발.
+
+**관리 규칙 (절대 준수)**:
+1. **캐시 파일명은 a1/a2 체계로 단일 통일**: `kis_token_a1.json` (main 계좌), `kis_token_a2.json` (syw_2 계좌). 계좌당 파일 1개만 존재해야 한다. `kis_token.json`(기본 경로) · `kis_token_main.json` · `kis_token_syw_2.json` · `kis_token_syw2.json` 등 **변종 파일명 전면 금지**. (approval_key 캐시가 `md5(appkey)[:12]`를 쓰는 것과 동일 원리 — 캐시 식별은 appkey 기준.)
+2. **appkey당 access_token 1발급 + 전 프로그램 공용 재사용**: 같은 appkey면 어떤 프로그램이든 동일 캐시 파일을 공유한다. 목표: appkey당 하루 1발급 = 카톡 1회.
+3. **`/oauth2/tokenP` 직접 호출 금지**: 반드시 중앙 캐시 함수(`kis_auth*.auth()` / BaseTokenManager의 `token_cache_path`)를 통해서만 발급·재사용한다. 캐시 우회 = 중복 발급 = 알림톡 폭발.
+4. **로컬(노트북 등 외부 PC) 동일 appkey 사용 주의**: 6시간 이내는 같은 토큰을 받지만 6시간 경과 후 신규 발급 → 알림톡 추가 발송. 로컬용은 가급적 별도 appkey(a2 등)를 쓰거나, 서버 캐시 파일을 재사용하도록 맞춘다.
+
+**구현 위치 (통일 예정)**: `kis_auth.py` / `kis_API_ohlcv_download_Utils.py` 의 `token_cache_path`(기본값 `./kis_token.json` → `./kis_token_a1.json`/`./kis_token_a2.json` 으로 교체 예정), `kis_auth_llm.py` 의 `save_token`/`read_token`(`token_tmp`), `ws_realtime_trading.py` 토큰 발급 호출부(6541·6613행). 각 프로그램이 `token_cache_path`를 넘기는 지점에서 a1/a2 파일명을 사용하도록 일괄 수정 필요.
 
 ---
 
@@ -291,3 +315,4 @@ _신규 항목은 `changelog-manager` 에이전트가 append._
 - 2026-05-26 (intent-tracker) — 좀비 reaper ws_realtime_watchdog.py 운영 의무 수립. 08:25 기동, 5분 주기 status=2 강제종료 + 20:00 이후 무조건 종료 (커밋 6f0c2b6)
 - 2026-05-26 (intent-tracker) — WSS 자동복구 표준 패턴 4개 항목 수립 (send_request timeout 필수, 무수신 watchdog 독립 스레드, 활성 시간창 09:00~15:20, 연속실패 os._exit 에스컬레이션). 커밋 04f9e92
 - 2026-05-26 (intent-tracker) — 매도 체결 텔레그램 필수 정보 원칙 수립 (매수가+사유+PNL 포함 의무). 커밋 04f9e92
+- 2026-06-04 (intent-tracker) — REST access_token 공유 표준 수립. 캐시 파일명 a1/a2 단일 체계 통일, appkey당 1발급+공용 재사용, /oauth2/tokenP 직접 호출 금지. 260604 파편화로 인한 카톡 알림톡 다발 사고 재발 방지.

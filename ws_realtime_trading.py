@@ -1290,7 +1290,7 @@ def _query_and_print_balance(label: str, *, trade_only: bool = True,
             if not cano:
                 logger.warning(f"{ts_prefix()} [{label}] config에 cano 없음")
                 return None
-            accounts = [{"account_id": "main", "alias": "a1", "cano": cano, "acnt_prdt_cd": acnt}]
+            accounts = [{"account_id": "a1", "alias": "a1", "cano": cano, "acnt_prdt_cd": acnt}]
 
         # 계좌별 데이터 수집
         per_account: list[dict] = []
@@ -1692,7 +1692,7 @@ def _get_balance_holdings() -> dict[str, dict]:
             acnt = str(cfg.get("acnt_prdt_cd", "01")).strip() or "01"
             if not cano:
                 return {}
-            accounts = [{"account_id": "main", "alias": "a1", "cano": cano, "acnt_prdt_cd": acnt}]
+            accounts = [{"account_id": "a1", "alias": "a1", "cano": cano, "acnt_prdt_cd": acnt}]
         except Exception:
             return {}
     for acct in accounts:
@@ -3127,7 +3127,7 @@ def _restore_orders_from_server_on_startup() -> None:
     # 5) 요약 로그 + 텔레그램
     by_acct: dict[str, list[str]] = {}
     for o in all_orders:
-        alias = o["acct_alias"] or "main"
+        alias = o["acct_alias"] or "a1"
         by_acct.setdefault(alias, []).append(
             f"{o['name']}({o['code']}) 미체결={o['psbl_qty']}/{o['ord_qty']} ordno={o['ordno']}"
         )
@@ -3441,7 +3441,7 @@ def _run_closing_buy_orders() -> None:
                         _closing_buy_placed.append({
                             "name": name, "code": code, "qty": qty, "limit_up": limit_up, "amount_net": amount_net,
                             "ordno": ordno, "cano": cano, "acnt": acnt,
-                            "account_id": prep.get("account_id", "main"), "alias": alias,
+                            "account_id": prep.get("account_id", "a1"), "alias": alias,
                         })
                         acct_tag = f"[{alias}]" if alias else ""
                         # 주문 완료 즉시 로그 (체결통보보다 먼저 기록되도록)
@@ -6500,7 +6500,7 @@ def _init_top_client() -> KisClient:
         appkey=a1["appkey"], appsecret=a1["appsecret"],
         base_url=a1["base_url"], custtype=a1["custtype"],
         market_div=a1.get("market_div") or TOP_RANK_MARKET_DIV,
-        token_cache_path=str(SCRIPT_DIR / "kis_token_main.json"),
+        token_cache_path=str(SCRIPT_DIR / "kis_token_a1.json"),
     ))
 
 
@@ -6510,7 +6510,7 @@ def _init_price_client() -> KisClient:
         appkey=a1["appkey"], appsecret=a1["appsecret"],
         base_url=a1["base_url"], custtype=a1["custtype"],
         market_div=a1["market_div"],
-        token_cache_path=str(SCRIPT_DIR / "kis_token_main.json"),
+        token_cache_path=str(SCRIPT_DIR / "kis_token_a1.json"),
     ))
 
 
@@ -6518,7 +6518,7 @@ def _init_price_client() -> KisClient:
 def _load_syw2_cfg() -> dict:
     """config.json → accounts.syw_2 키를 읽어 공통 설정과 병합하여 반환."""
     cfg = load_config(str(SCRIPT_DIR / "config.json"))
-    acct = cfg.get("accounts", {}).get("syw_2", {})
+    acct = cfg.get("accounts", {}).get("a2", {})
     if not acct.get("appkey") or not acct.get("appsecret"):
         return {}
     return {
@@ -6538,7 +6538,7 @@ def _init_top_client_2() -> KisClient | None:
         appkey=a2["appkey"], appsecret=a2["appsecret"],
         base_url=a2["base_url"], custtype=a2["custtype"],
         market_div=a2.get("market_div") or TOP_RANK_MARKET_DIV,
-        token_cache_path=str(SCRIPT_DIR / "kis_token_syw2.json"),
+        token_cache_path=str(SCRIPT_DIR / "kis_token_a2.json"),
     ))
 
 
@@ -6550,7 +6550,7 @@ def _init_price_client_2() -> KisClient | None:
         appkey=a2["appkey"], appsecret=a2["appsecret"],
         base_url=a2["base_url"], custtype=a2["custtype"],
         market_div=a2["market_div"],
-        token_cache_path=str(SCRIPT_DIR / "kis_token_syw2.json"),
+        token_cache_path=str(SCRIPT_DIR / "kis_token_a2.json"),
     ))
 
 
@@ -6563,7 +6563,7 @@ def _iter_enabled_accounts(trade_only: bool = False) -> list[dict]:
 
     반환 리스트 각 항목:
       {
-        "account_id": "main" | "syw_2",
+        "account_id": "a1" | "a2",
         "alias": "a1" | "a2",
         "appkey": ..., "appsecret": ..., "cano": ..., "acnt_prdt_cd": ...,
         "exclude_cash": ..., "base_url": ...,
@@ -6583,7 +6583,7 @@ def _iter_enabled_accounts(trade_only: bool = False) -> list[dict]:
         if not appkey:
             return []
         return [{
-            "account_id": "main", "alias": "a1",
+            "account_id": "a1", "alias": "a1",
             "appkey": appkey,
             "appsecret": cfg.get("appsecret", ""),
             "cano": cfg.get("cano", ""),
@@ -6591,7 +6591,7 @@ def _iter_enabled_accounts(trade_only: bool = False) -> list[dict]:
             "exclude_cash": cfg.get("exclude_cash", "0"),
             "max_invest": cfg.get("max_invest", "0"),
             "base_url": cfg.get("base_url") or DEFAULT_BASE_URL,
-            "token_cache_path": str(SCRIPT_DIR / "kis_token_main.json"),
+            "token_cache_path": str(SCRIPT_DIR / "kis_token_a1.json"),
         }]
 
     # V2 → 모든 사용자의 모든 계좌
@@ -6610,7 +6610,7 @@ def _iter_enabled_accounts(trade_only: bool = False) -> list[dict]:
             if trade_only and te is False:
                 continue
             alias_idx += 1
-            token_name = "kis_token_main.json" if aid == "main" else f"kis_token_{aid}.json"
+            token_name = f"kis_token_{aid}.json"
             accounts.append({
                 "account_id": aid,
                 "alias": acfg.get("cano_alias") or f"a{alias_idx}",
@@ -6684,7 +6684,7 @@ def _resolve_target_accounts(target, all_accounts: list[dict]) -> list[dict]:
       "all"          → 전체 계좌
       "a1"           → alias 매칭
       ["a1", "a2"]   → 다중 alias 매칭
-      "main"         → account_id 매칭
+      "a1"           → account_id 매칭
     """
     if not all_accounts:
         return []

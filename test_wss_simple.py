@@ -121,7 +121,7 @@ def main() -> int:
         print("[ERROR] config.json 구조 미일치 (users.sywems12.accounts)")
         return 1
 
-    targets = [("main (a1)", accs.get("main")), ("syw_2 (a2)", accs.get("syw_2"))]
+    targets = [("a1", accs.get("a1")), ("a2", accs.get("a2"))]
 
     print(f"REST_URL = {REST_URL}")
     print(f"WS_URL   = {WS_URL}")
@@ -154,7 +154,7 @@ def main() -> int:
             for i, m in enumerate(msgs):
                 print(f"      [resp {i+1}] {m}")
         # (4) — a1 만 ALREADY IN USE 면 UNSUBSCRIBE 송신으로 강제 해제 시도
-        if ok and ak and label.startswith("main") and any("ALREADY IN USE" in m for m in msgs):
+        if ok and ak and label.startswith("a1") and any("ALREADY IN USE" in m for m in msgs):
             print(f"  (4) ALREADY IN USE 감지 → UNSUBSCRIBE 강제 해제 시도")
             result = asyncio.run(ws_force_cleanup_attempt(ak, "sywems12"))
             print(result)

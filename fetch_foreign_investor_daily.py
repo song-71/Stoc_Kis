@@ -53,7 +53,7 @@ def _load_main_credentials() -> dict:
     with open(CONFIG_PATH, encoding="utf-8") as f:
         cfg = json.load(f)
     base_url = cfg.get("base_url", "https://openapi.koreainvestment.com:9443")
-    main_acct = cfg.get("users", {}).get("sywems12", {}).get("accounts", {}).get("main", {})
+    main_acct = cfg.get("users", {}).get("sywems12", {}).get("accounts", {}).get("a1", {})
     return {
         "base_url": base_url,
         "appkey": main_acct.get("appkey", ""),

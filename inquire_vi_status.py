@@ -85,8 +85,8 @@ def _build_client(cfg: dict) -> KisClient:
     """config.json에서 main 계좌 기준으로 KisClient 생성."""
     user_key = cfg.get("default_user", "sywems12")
     user = cfg["users"][user_key]
-    acct = user["accounts"]["main"]
-    token_path = os.path.join(BASE_DIR, "kis_token_main.json")
+    acct = user["accounts"]["a1"]
+    token_path = os.path.join(BASE_DIR, "kis_token_a1.json")
     return KisClient(
         KisConfig(
             appkey=acct["appkey"],

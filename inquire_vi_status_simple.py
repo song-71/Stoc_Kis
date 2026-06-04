@@ -24,11 +24,11 @@ _VI_KIND   = {"1": "정적VI", "2": "동적VI", "3": "정적&동적"}
 def _client():
     with open(os.path.join(_BASE, "config.json"), encoding="utf-8") as f:
         cfg = json.load(f)
-    acct = cfg["users"][cfg["default_user"]]["accounts"]["main"]
+    acct = cfg["users"][cfg["default_user"]]["accounts"]["a1"]
     return KisClient(KisConfig(
         appkey=acct["appkey"], appsecret=acct["appsecret"],
         base_url=cfg.get("base_url", DEFAULT_BASE_URL),
-        token_cache_path=os.path.join(_BASE, "kis_token_main.json"),
+        token_cache_path=os.path.join(_BASE, "kis_token_a1.json"),
     ))
 
 

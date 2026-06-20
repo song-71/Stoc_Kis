@@ -88,6 +88,12 @@ CRITICAL_PATTERNS_EXTRA = [
 # 비정상종료 판정: 15:30 이전에만 CRITICAL
 MARKET_CLOSE = "15:30"
 
+# 프로덕션 정상 종료(장 마감 후 EOD)의 확정 표식.
+# 프로덕션이 그날 일과를 정상 종료하면 마지막에 이 줄을 찍는다
+# (예: "[scheduler] EXIT 모드 정리 완료 → os._exit(0)").
+# 이 표식이 (15:30 이후에) 보이면 모니터도 일일 리뷰 후 정상 종료한다.
+NORMAL_EOD_EXIT_PATTERN = re.compile(r"\[scheduler\] EXIT 모드 정리 완료")
+
 
 class LogMonitor:
     def __init__(self):
@@ -121,6 +127,10 @@ class LogMonitor:
         # 추가 CRITICAL 패턴 (watchdog 강제 종료, 시스템 재시작)
         for pat, cat in CRITICAL_PATTERNS_EXTRA:
             if pat.search(line):
+                # os._exit 정상 종료(EOD)는 장 마감(15:30) 이후엔 CRITICAL 오탐이므로
+                # 비정상종료와 동일하게 INFO(정상종료)로 강등한다.
+                if cat == "시스템강제종료" and self._extract_time(line) >= MARKET_CLOSE:
+                    return ("INFO", "정상종료")
                 return ("CRITICAL", cat)
         for pat, cat in MODERATE_PATTERNS:
             if pat.search(line):
@@ -359,6 +369,32 @@ class LogMonitor:
         except Exception as e:
             print(f"[monitor] claude daily review 호출 실패: {e}")
 
+    # ─── 정상 종료 처리 (EOD) ───────────────────────────────────────
+    def _handle_normal_eod(self):
+        """프로덕션이 정상 종료(장 마감 후 EOD)되면 일일 리뷰를 마치고 모니터도 정상 종료한다."""
+        # INFO 알림: 프로덕션 정상 종료 사실을 명시
+        info_msg = (f"{ts_prefix()} [INFO] ws_realtime_trading 이 정상 종료되었습니다. "
+                    f"→ 모니터링도 정상 종료합니다.")
+        print(info_msg)
+        _monitor_log(f"[TELE] {info_msg}")
+        if DRY_RUN:
+            print(f"[DRY-RUN TELE] {info_msg}")
+        else:
+            try:
+                tmsg(info_msg, "-t")
+            except Exception:
+                pass
+
+        # 미처리 항목 flush + 일일 리뷰 (아직 안 했으면) — stop() 보다 먼저 해야
+        # _flush_moderate 가 _stop 가드에 걸려 건너뛰지 않는다.
+        if not self.daily_review_done:
+            self._flush_traceback()
+            self._flush_moderate()
+            self._invoke_daily_review()
+
+        # 모니터 종료 트리거 (run 루프가 다음 폴링에서 빠져나간다)
+        self.stop()
+
     # ─── 배치 타이머 ────────────────────────────────────────────────
     def _schedule_batch_timer(self):
         if self._stop.is_set():
@@ -394,6 +430,12 @@ class LogMonitor:
             key = self._dedup_key(category, line)
             if not self._is_duplicate(key):
                 self._handle_moderate(category, line.strip())
+
+        # 프로덕션 정상 종료(EOD) 감지 → 일일 리뷰 후 모니터도 정상 종료
+        if (self._extract_time(line) >= MARKET_CLOSE
+                and NORMAL_EOD_EXIT_PATTERN.search(line)):
+            self._handle_normal_eod()
+            return
 
         # 시간 체크
         now_t = datetime.now(KST).strftime("%H:%M")

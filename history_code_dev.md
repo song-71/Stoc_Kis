@@ -2,6 +2,19 @@
 
 ---
 
+## [2026-06-20] aae7d7e
+- **Category**: fix
+- **Title**: 로그 모니터 — 장 마감 후 EOD 정상종료 CRITICAL 오탐 수정 + 모니터 자동 정상 종료
+- **Files**: `ws_log_monitor.py`
+- **Changes**:
+  1. **근본 원인**: `CRITICAL_PATTERNS_EXTRA`의 `os._exit` 패턴에 장 마감 시각 가드가 없어, 프로덕션이 매일 16:01에 정상 종료할 때 출력하는 `[scheduler] EXIT 모드 정리 완료 → os._exit(0)` 줄이 CRITICAL 텔레그램 + 긴급 Claude 호출로 오탐. 06/05·08·12·15·16·17·18·19 등 거의 매 거래일 반복 발생(`out/monitor/issues_*.jsonl` 확인).
+  2. **classify() 수정**: `CRITICAL_PATTERNS_EXTRA` 루프에서 `cat=="시스템강제종료"` 이고 로그 시각 >= `MARKET_CLOSE`(15:30) 이면 `("INFO","정상종료")`로 강등. 장중 `os._exit`·watchdog FATAL·재시작은 CRITICAL 유지.
+  3. **NORMAL_EOD_EXIT_PATTERN 상수 추가**: `re.compile(r"\[scheduler\] EXIT 모드 정리 완료")` — 프로덕션 정상 종료의 확정 표식.
+  4. **process_line() 수정**: 로그 시각 >= 15:30 이고 `NORMAL_EOD_EXIT_PATTERN` 매치 시 `_handle_normal_eod()` 호출 후 return.
+  5. **_handle_normal_eod() 추가**: INFO 알림 출력·텔레그램 → 미처리분 flush(`_flush_traceback`, `_flush_moderate`) → 일일 리뷰 즉시 실행 → `stop()`. 18:35 하드 종료는 안전망으로 유지.
+  6. **검증**: `py_compile` 통과. `classify` 단위 테스트 5종 통과(정상 EOD→INFO, 장중 좀비 `os._exit`→CRITICAL, 주문실패/watchdog FATAL→CRITICAL). DRY-RUN 통합 테스트: `[scheduler] EXIT` 줄 처리 직후 INFO 출력 → 일일 리뷰 호출 → `_stop=True` 확인.
+- **Impact**: 매 거래일 16:01 발생하던 오탐 CRITICAL 알림 및 불필요한 Claude 긴급 호출 완전 차단. 프로덕션 정상 종료 직후 모니터도 일일 리뷰를 마치고 깔끔하게 종료되어 18:35까지 idle 상태로 잔여 알림이 발생하는 문제 해소.
+
 ## [2026-06-04] 7e3893e
 - **Category**: refactor
 - **Title**: 계좌 식별자/토큰 캐시 a1/a2 체계 통일 + REST access_token 공유 표준 확립

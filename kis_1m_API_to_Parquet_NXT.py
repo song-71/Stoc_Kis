@@ -10,8 +10,14 @@ NXT(넥스트레이드) 프리마켓/애프터마켓 1분봉 다운로드
   - S3 경로: .../market_data/1m_nxt/date=YYYY-MM-DD/ohlcv.parquet
   - EC2 로컬: *_NXT.parquet 최근 2일치만 유지
 
-실행 (20:00 이후):
-    nohup /home/ubuntu/Stoc_Kis/venv/bin/python /home/ubuntu/Stoc_Kis/kis_1m_API_to_Parquet_NXT.py > /home/ubuntu/Stoc_Kis/out/1m_nxt_parquet.log 2>&1 &
+실행 (하루 2회):
+    # 아침(프리마켓 08:00~08:50만, 당일 오전 분석용) — 09:05 KST
+    nohup .../venv/bin/python .../kis_1m_API_to_Parquet_NXT.py --session=morning > .../out/1m_nxt_parquet_morning.log 2>&1 &
+    # 저녁(애프터마켓 15:40~20:00만, 아침 프리마켓 파일과 병합) — 20:01 KST
+    nohup .../venv/bin/python .../kis_1m_API_to_Parquet_NXT.py --session=evening > .../out/1m_nxt_parquet.log 2>&1 &
+
+세션(--session) 미지정 시 KST 시각 자동 판정(12시 이전=morning, 이후=evening).
+아침 실행이 누락된 날은 저녁에 `--session=full`(프리+애프터)로 수동 보강 가능.
 
 로그:
     tail -f /home/ubuntu/Stoc_Kis/out/1m_nxt_parquet.log
@@ -53,18 +59,54 @@ def ts_prefix() -> str:
 
 # NXT 시간 범위: 프리마켓(08:00~08:50) + 애프터마켓(15:40~20:00)
 # API 1회 호출 = 최대 30개(30분) 반환 → 30분 간격 기준점으로 호출
-QUERY_TIMES = []
-# 프리마켓 (30분 간격: 08:30, 08:50 → 2회로 50분 커버)
-for t in ["083000", "085000"]:
-    QUERY_TIMES.append(t)
-# 애프터마켓 (30분 간격 + 20:00 보장)
-_cur = datetime.strptime("161000", "%H%M%S")
-_after_end = datetime.strptime("200000", "%H%M%S")
-while _cur <= _after_end:
-    QUERY_TIMES.append(_cur.strftime("%H%M%S"))
-    _cur += timedelta(minutes=30)
-if "200000" not in QUERY_TIMES:
-    QUERY_TIMES.append("200000")
+
+# 프리마켓 조회 기준시각.
+# API는 기준시각 기준 "과거 최대 30봉"을 한 번에 반환(시작점 아님).
+#   081000 → 08:00~08:10 (첫 봉 08:00 정각 확보용. 08:30 기준은 08:01부터라 08:00이 누락됨)
+#   083000 → 08:01~08:30
+#   085000 → 08:21~08:50
+# → 3회로 08:00~08:50 전 구간 커버.
+PREMARKET_QUERY_TIMES = ["081000", "083000", "085000"]
+
+
+def _build_aftermarket_query_times() -> list[str]:
+    """애프터마켓 조회 기준시각 (16:10~20:00, 30분 간격 + 20:00 보장)."""
+    times: list[str] = []
+    cur = datetime.strptime("161000", "%H%M%S")
+    end = datetime.strptime("200000", "%H%M%S")
+    while cur <= end:
+        times.append(cur.strftime("%H%M%S"))
+        cur += timedelta(minutes=30)
+    if "200000" not in times:
+        times.append("200000")
+    return times
+
+
+AFTERMARKET_QUERY_TIMES = _build_aftermarket_query_times()
+
+
+def _build_query_times(session: str) -> list[str]:
+    """세션별 조회 기준시각 목록.
+    - morning: 프리마켓만 (당일 오전 분석용, 08:00~08:50)
+    - evening: 애프터마켓만 (15:40~20:00). 아침 프리마켓 파일과 최종 병합.
+    - full:    프리마켓 + 애프터마켓 (수동 단발 보강용. 아침 실행 누락된 날 복구)
+    """
+    if session == "morning":
+        return list(PREMARKET_QUERY_TIMES)
+    if session == "evening":
+        return list(AFTERMARKET_QUERY_TIMES)
+    return list(PREMARKET_QUERY_TIMES) + list(AFTERMARKET_QUERY_TIMES)
+
+
+def _resolve_session(now_kst: datetime) -> str:
+    """실행 세션 결정. `--session=morning|evening|full` 인자 우선,
+    없으면 KST 시각 자동 판정(12시 이전=morning, 이후=evening)."""
+    for a in sys.argv[1:]:
+        if a.startswith("--session="):
+            val = a.split("=", 1)[1].strip().lower()
+            if val in ("morning", "evening", "full"):
+                return val
+    return "morning" if now_kst.hour < 12 else "evening"
 
 # NXT 허용 시간 범위 (이 범위 밖 데이터는 필터링)
 NXT_TIME_RANGES = [
@@ -179,6 +221,11 @@ def main():
     summary_rows = []
     now_kst = datetime.now(kst)
     default_biz_date = now_kst.strftime("%Y%m%d") if now_kst.hour >= 9 else (now_kst - timedelta(days=1)).strftime("%Y%m%d")
+
+    session = _resolve_session(now_kst)
+    query_times = _build_query_times(session)
+    _log(f"[1m_NXT] 실행 세션={session} (조회시각 {len(query_times)}개: {query_times[0]}~{query_times[-1]})")
+
     biz_date = None
     pdy_cache: dict[str, dict[str, float]] = {}
 
@@ -231,7 +278,8 @@ def main():
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
     def _checkpoint_path(date_str: str) -> Path:
-        return checkpoint_dir / f"{date_str}_nxt_checkpoint.csv"
+        # 세션별 분리: 아침(morning) 완료가 저녁(full) 실행을 skip 시키지 않도록
+        return checkpoint_dir / f"{date_str}_{session}_nxt_checkpoint.csv"
 
     def _load_checkpoint(date_str: str) -> set[str]:
         ck_path = _checkpoint_path(date_str)
@@ -280,7 +328,7 @@ def main():
             pdy_ret = (pdy_close / p2dy_close) - 1.0 if p2dy_close > 0 else 0.0
             pdy_cache[code] = {"pdy_close": pdy_close, "pdy_ret": pdy_ret}
 
-        for query_time in QUERY_TIMES:
+        for query_time in query_times:
             try:
                 output1, output2 = inquire_time_itemchartprice(
                     env_dv="real",
@@ -421,14 +469,23 @@ def main():
         return
 
     _log(f"[1m_NXT] 데이터 병합 시작 (임시 파일 {len(temp_files)}개)")
-    merged = pd.concat([pd.read_parquet(p) for p in temp_files], ignore_index=True)
+    frames = [pd.read_parquet(p) for p in temp_files]
 
     # NXT 파일명: _NXT suffix
     parquet_path = out_dir / f"{biz_date}_1m_chart_DB_parquet_NXT.parquet"
 
     key_cols = ["date", "time", "code"]
+    # 기존 파일이 있으면 덮어쓰지 않고 병합한다.
+    # (아침 morning 실행으로 받은 프리마켓 + 저녁 full 실행의 애프터마켓을 누적)
     if parquet_path.exists():
-        _log("[1m_NXT] 기존 NXT parquet 발견 -> 덮어쓰기 모드")
+        try:
+            existing = pd.read_parquet(parquet_path)
+            frames.append(existing)
+            _log(f"[1m_NXT] 기존 NXT parquet 병합 (기존 {len(existing)}건 + 신규 temp {len(temp_files)}개)")
+        except Exception as e:
+            _log(f"[1m_NXT][WARN] 기존 parquet 읽기 실패, 신규 데이터만 저장: {e}")
+
+    merged = pd.concat(frames, ignore_index=True)
 
     _log(f"[1m_NXT] 중복 제거 시작 (기준={','.join(key_cols)})")
     merged["_v_ok"] = merged["volume"].fillna(0) > 0 if "volume" in merged.columns else False

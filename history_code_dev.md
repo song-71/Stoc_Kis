@@ -2,6 +2,17 @@
 
 ---
 
+## [2026-06-25] 1f1cd04
+- **Category**: refactor
+- **Title**: 날짜별 텔레로그 기록을 telegMsg.tmsg() 단일 지점으로 통합
+- **Files**: `telegMsg.py`, `ws_realtime_trading.py`
+- **Changes**:
+  1. **문제**: 날짜별 텔레그램 로그(out/logs/{YYMMDD}_telegram.log) 기록 코드가 프로덕션의 `_notify` / `_notify_async` 안에만 존재했음. 실제 텔레그램 발송은 모든 프로그램이 `telegMsg.tmsg()` 한 곳을 거치지만 `tmsg()` 자체는 기록을 하지 않아, 프로덕션 종료 후 `ws_realtime_watchdog.py` / `ws_log_monitor.py` / `Daily_inquire_vi_status.py` 등 9개+ 프로그램이 보내는 텔레 메시지는 날짜별 텔레로그에 남지 않았음.
+  2. **telegMsg.py — `_append_tele_log()` 추가**: KST(UTC+9) 기준 날짜·시각으로 `out/logs/{YYMMDD}_telegram.log` 에 `'YYYY-MM-DD HH:MM:SS | 메시지'` 형식 기록. 기존 프로덕션 형식과 동일. 기록 실패는 텔레그램 전송을 막지 않도록 조용히 무시.
+  3. **telegMsg.py — `tmsg()` 내부 호출 위치**: 네트워크 전송보다 먼저 `_append_tele_log()` 를 호출. `_notify_async` 의 데몬 스레드 fire-and-forget 경로에서도 기록이 전송 시도에 앞서 남아 누락 위험 최소화.
+  4. **ws_realtime_trading.py — 중복 기록 코드 제거**: `_notify` / `_notify_async` 내 파일 기록 블록 삭제. `tmsg()` 가 유일한 기록 지점이 되어 프로덕션 텔레 메시지 중복 두 줄 문제 해소. 관련 주석 갱신.
+- **Impact**: 프로덕션 종료 후에도 `tmsg()` 를 호출하는 모든 프로그램의 텔레 메시지가 같은 날짜별 텔레로그에 자동으로 빠짐없이 기록됨. 앞으로 추가될 프로그램도 별도 작업 없이 자동 적용. 프로젝트 규칙(텔레 메시지는 자체 로그에 시간정보와 함께 반드시 기록) 완전 준수.
+
 ## [2026-06-25] 6a2b2d2
 - **Category**: fix
 - **Title**: 로그 모니터 — 시스템종료 분류 로직 개선 (비정상강제종료만 CRITICAL)

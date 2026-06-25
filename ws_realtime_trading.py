@@ -324,11 +324,8 @@ def _notify(msg: str, tele: bool = False) -> None:
     sys.stdout.write("\r\033[2K" + msg + "\n")
     sys.stdout.flush()
     if tele:
-        try:
-            with open(TELE_LOG_PATH, "a", encoding="utf-8") as _tf:
-                _tf.write(f"{datetime.now(KST).strftime('%Y-%m-%d %H:%M:%S')} | {msg}\n")
-        except Exception:
-            pass
+        # [260625] 날짜별 텔레로그 기록은 telegMsg.tmsg() 가 단일 지점에서 담당.
+        #   (프로덕션 종료 후 다른 프로그램의 텔레 메시지도 같은 로그에 남기기 위함)
         if tmsg is not None:
             try:
                 tmsg(msg, "-t")
@@ -339,8 +336,10 @@ def _notify(msg: str, tele: bool = False) -> None:
 def _notify_async(msg: str) -> None:
     """[260521] 핫패스 보호용 비동기 텔레그램 통지.
 
-    - 파일 로그(logger) + TELE_LOG_PATH 기록(시간정보 포함)은 **동기**로 즉시 남긴다
-      (프로젝트 규칙: 텔레그램 메시지는 자체 로그에 시간정보와 함께 반드시 기록).
+    - 파일 로그(logger)는 동기로 즉시 남긴다.
+    - [260625] 날짜별 텔레로그(시간정보 포함) 기록은 telegMsg.tmsg() 단일 지점이 담당.
+      tmsg() 는 네트워크 전송보다 먼저 로그를 남기므로, 아래 데몬 스레드에서 호출돼도
+      기록이 전송 시도에 앞서 남는다(프로젝트 규칙: 텔레 메시지는 자체 로그에 반드시 기록).
     - 실제 텔레그램 HTTP 전송(tmsg)만 데몬 스레드로 fire-and-forget 하여,
       네트워크 지연/장애가 호출 스레드(예: _str1_sell_worker)를 막지 않게 한다.
     - 단발 주문 직후 통지에 사용. 매매 안전성과 무관한 부가 동작 전용.
@@ -348,12 +347,9 @@ def _notify_async(msg: str) -> None:
     logger.info(msg)
     sys.stdout.write("\r\033[2K" + msg + "\n")
     sys.stdout.flush()
-    # TELE_LOG_PATH 기록은 동기로 즉시 (누락 방지)
-    try:
-        with open(TELE_LOG_PATH, "a", encoding="utf-8") as _tf:
-            _tf.write(f"{datetime.now(KST).strftime('%Y-%m-%d %H:%M:%S')} | {msg}\n")
-    except Exception:
-        pass
+    # [260625] 날짜별 텔레로그 기록은 telegMsg.tmsg() 내부 단일 지점에서 담당.
+    #   tmsg() 는 네트워크 전송보다 먼저 로그를 남기므로, 아래 데몬 스레드에서
+    #   호출되더라도 기록이 전송 시도에 앞서 남는다(누락 위험 최소화).
     # 텔레그램 HTTP 전송만 스레드로 분리 (timeout은 telegMsg.tmsg 내부에서 보장)
     if tmsg is not None:
         def _send() -> None:
@@ -2035,18 +2031,16 @@ def _str1_sell_worker() -> None:
                     logger.warning(f"[str1_sell] 취소 스킵 {code}: ordno/수량 없음")
                     continue
                 # 종목별 보유 계좌로 취소 (syw_2 등 서브계좌 지원)
-                acct = _code_account_map.get(code)
-                if acct:
-                    cano = acct["cano"]
-                    acnt = acct.get("acnt_prdt_cd", "01") or "01"
-                    client = _init_account_client(acct)
-                else:
-                    cfg = _read_cfg() or load_config(str(CONFIG_PATH))
-                    cano = str(cfg.get("cano", "")).strip()
-                    acnt = str(cfg.get("acnt_prdt_cd", "01")).strip() or "01"
-                    client = _top_client or _init_top_client()
+                # (260624) 임의 a1 폴백 제거: 보유계좌를 못 찾으면 취소 스킵(잘못된 계좌 취소조회 방지).
+                acct = _resolve_holding_account(code)
+                if not acct:
+                    logger.warning(f"[str1_sell] 보유계좌 없음 → {name}({code}) 취소 스킵")
+                    continue
+                cano = acct["cano"]
+                acnt = acct.get("acnt_prdt_cd", "01") or "01"
+                client = _init_account_client(acct) if "appkey" in acct else (_top_client or _init_top_client())
                 if not cano:
-                    logger.warning(f"[str1_sell] config cano 없음 → {code} 취소 스킵")
+                    logger.warning(f"[str1_sell] cano 없음 → {code} 취소 스킵")
                     continue
                 logger.info(
                     f"{ts_prefix()} [str1_sell] ■ 동시호가매도 취소 API호출 {name}({code})"
@@ -2096,22 +2090,42 @@ def _str1_sell_worker() -> None:
         cndt_pric  = req.get("cndt_pric", 0.0)
         ord_dvsn_name = {"00": "지정가", "01": "시장가", "02": "시간외종가", "05": "장전시간외", "06": "장후시간외", "07": "시간외단일가", "22": "스톱지정가"}.get(ord_dvsn, ord_dvsn)
         retry_after_cancel = False   # 미체결 취소 후 재주문 플래그
+        # ── (260624) 수량초과 폭주 차단: 쿨다운 종목은 매도 시도 자체를 건너뜀 ──
+        # 보유계좌가 정정되면 체결통보 핸들러에서 쿨다운이 해제되어 자연 재개된다.
+        with _str1_qty_exceed_lock:
+            _in_cooldown = code in _str1_qty_exceed_cooldown
+        if _in_cooldown:
+            logger.warning(
+                f"{ts_prefix()} [str1_sell] {name}({code}) 수량초과 쿨다운 중 → 매도 스킵 "
+                f"(보유계좌 정정 시 자동 재개)"
+            )
+            continue
         try:
             # 종목별 보유 계좌로 매도 (syw_2 등 서브계좌 지원)
-            acct = _code_account_map.get(code)
-            if acct:
-                cano = acct["cano"]
-                acnt = acct.get("acnt_prdt_cd", "01") or "01"
-                client = _init_account_client(acct)
-                alias = acct.get("alias", acct.get("account_id", "?"))
-                logger.info(f"[str1_sell] {name}({code}) → {alias}({cano}) 계좌로 매도")
-            else:
-                cfg = _read_cfg() or load_config(str(CONFIG_PATH))
-                cano = str(cfg.get("cano", "")).strip()
-                acnt = str(cfg.get("acnt_prdt_cd", "01")).strip() or "01"
-                client = _top_client or _init_top_client()
+            # (260624) 캐시 MISS 시 거래활성 계좌 잔고를 1회 조회해 실제 보유계좌를 찾는다.
+            # 어떤 계좌도 보유하지 않으면 임의 a1 폴백으로 발사하지 않고 스킵(0보유 발사 금지).
+            acct = _resolve_holding_account(code)
+            if not acct:
+                _skip_msg = (
+                    f"{ts_prefix()} [str1_sell] 보유계좌 없음(보유 0) → {name}({code}) 매도 스킵 "
+                    f"(임의 계좌 발사 금지)  사유={reason}"
+                )
+                logger.warning(_skip_msg)
+                # 텔레그램은 종목당 1회만 (재큐잉 스팸 방지). 보유계좌 정정 시 카운터가
+                # 리셋되어 다시 알릴 수 있다.
+                with _str1_qty_exceed_lock:
+                    _first_skip = code not in _str1_qty_exceed_cooldown
+                    _str1_qty_exceed_cooldown.add(code)
+                if _first_skip:
+                    _notify(_skip_msg, tele=True)
+                continue
+            cano = acct["cano"]
+            acnt = acct.get("acnt_prdt_cd", "01") or "01"
+            client = _init_account_client(acct) if "appkey" in acct else (_top_client or _init_top_client())
+            alias = acct.get("alias", acct.get("account_id", "?"))
+            logger.info(f"[str1_sell] {name}({code}) → {alias}({cano}) 계좌로 매도")
             if not cano:
-                logger.warning(f"[str1_sell] config cano 없음 → {code} 매도 스킵")
+                logger.warning(f"[str1_sell] cano 없음 → {code} 매도 스킵")
                 continue
 
             # [260521] 핫패스 지연 제거: 매도 직전 REST 잔고 재조회(_get_balance_holdings,
@@ -2194,6 +2208,10 @@ def _str1_sell_worker() -> None:
             # 지연시키지 않게). _notify_async 가 파일 로그 + TELE_LOG_PATH 기록은 동기로 즉시
             # 남기므로 별도 logger.info 중복 호출은 불필요.
             _notify_async(msg)
+            # (260624) 주문 접수 성공 → 수량초과 연속 카운터 리셋
+            with _str1_qty_exceed_lock:
+                _str1_qty_exceed_count.pop(code, None)
+                _str1_qty_exceed_cooldown.discard(code)
             # 매도 성공 시 EMA 데드크로스 상태 해제
             _ema_sell_cond.pop(code, None)
             _up_trend_state.pop(code, None)
@@ -2233,8 +2251,29 @@ def _str1_sell_worker() -> None:
 
             # ── 수량 초과(APBK0400) → 미체결 매도주문 취소 후 재주문 ──
             if "APBK0400" in err_str or "수량을 초과" in err_str:
+                # (260624) 폭주 차단: 동일 종목 연속 APBK0400 누적. 한도 초과 시 쿨다운(당일 포기).
+                with _str1_qty_exceed_lock:
+                    _qe_cnt = _str1_qty_exceed_count.get(code, 0) + 1
+                    _str1_qty_exceed_count[code] = _qe_cnt
+                    _qe_over = _qe_cnt >= STR1_SELL_QTY_EXCEED_MAX_RETRY
+                    if _qe_over:
+                        _str1_qty_exceed_cooldown.add(code)
+                if _qe_over:
+                    _cd_msg = (
+                        f"{ts_prefix()} [str1_sell] {name}({code}) 수량초과(APBK0400) "
+                        f"{_qe_cnt}회 연속 → 당일 매도 중단(쿨다운). 보유계좌 정정 시 자동 재개. "
+                        f"사유={reason}"
+                    )
+                    logger.error(_cd_msg)
+                    _notify(_cd_msg, tele=True)
+                    # 쿨다운 진입: 무체결 취소조회/재주문 폭주를 멈춘다.
+                    with _str1_sell_state_lock:
+                        if code in _str1_sell_state:
+                            _str1_sell_state[code]["sell_ordered"] = False
+                            _str1_sell_state[code]["sold"] = False
+                    continue
                 try:
-                    logger.info(f"[str1_sell] 수량초과 → {name}({code}) 미체결 매도주문 조회/취소 시도")
+                    logger.info(f"[str1_sell] 수량초과({_qe_cnt}/{STR1_SELL_QTY_EXCEED_MAX_RETRY}) → {name}({code}) 미체결 매도주문 조회/취소 시도")
                     n_cancelled = _cancel_open_sell_orders_for_code(client, cano, acnt, code)
                     if n_cancelled > 0:
                         logger.info(f"[str1_sell] {name}({code}) 미체결 매도 {n_cancelled}건 취소 완료 → 재주문 예정")
@@ -2658,11 +2697,101 @@ _str1_sell_state: dict[str, dict] = {}
 _str1_sell_state_lock = threading.Lock()
 # 매도 주문 큐: ingest_loop → sell_worker (비동기 처리)
 _str1_sell_queue: "queue.Queue[dict]" = queue.Queue()
-# 종목별 보유 계좌 매핑: _get_balance_holdings()에서 구축, 매도 시 올바른 계좌로 주문
+# 종목별 보유 계좌 매핑: _get_balance_holdings()/체결통보 acnt_no/매도직전 잔고조회에서 구축,
+# 매도 시 올바른 계좌로 주문. (260624) 핵심 버그수정: 이 맵이 비면 임의 a1 폴백으로 매도가
+# 나가 0보유 계좌에서 APBK0400(주문가능수량 초과) 무한실패가 발생했음 → 보유계좌 식별 강화.
 _code_account_map: dict[str, dict] = {}
+_code_account_map_lock = threading.Lock()
+# ── (260624) 수량초과(APBK0400) 폭주 차단 ────────────────────────────────────────
+# 동일 종목에 APBK0400("수량을 초과")가 연속 N회면 그날 매도 시도를 쿨다운(포기)한다.
+# 보유계좌가 정정(_code_account_map 갱신)되면 자연 해소(쿨다운 해제)되도록 설계.
+STR1_SELL_QTY_EXCEED_MAX_RETRY = 4          # 연속 APBK0400 허용 횟수 (초과 시 쿨다운)
+_str1_qty_exceed_count: dict[str, int] = {}  # code → 연속 APBK0400 횟수
+_str1_qty_exceed_cooldown: set[str] = set()  # 쿨다운(당일 매도 포기) 종목
+_str1_qty_exceed_lock = threading.Lock()
 # ── 매도 금지 종목 (no_sell_codes) ─────────────────────────────────────────────
 # config.json의 no_sell_codes 배열에서 로드, 런타임 추가 가능
 _no_sell_codes: set[str] = set()
+
+
+def _account_matches_acnt_no(acct: dict, acnt_no: str) -> bool:
+    """체결통보 H0STCNI0의 acnt_no(=cano 8자리 + acnt_prdt_cd 2자리, 예: '6361439001')가
+    주어진 계좌(acct)와 일치하는지 판정. acnt_no 가 cano 로 시작하면 같은 계좌로 본다.
+
+    htsid 는 두 계좌가 공유하므로 체결통보는 a1/a2 모두 같은 구독으로 도착한다. 그러나
+    acnt_no 필드에 실제 체결 계좌번호가 들어 있어(260623 ccnl_notice CSV 실측) 종목→계좌
+    식별이 가능하다.
+    """
+    cano = str(acct.get("cano", "")).strip()
+    if not cano or not acnt_no:
+        return False
+    return acnt_no.startswith(cano)
+
+
+def _account_from_acnt_no(acnt_no: str) -> dict | None:
+    """체결통보 acnt_no 로 거래활성 계좌를 식별. 못 찾으면 None."""
+    acnt_no = str(acnt_no or "").strip()
+    if not acnt_no:
+        return None
+    for acct in _iter_enabled_accounts(trade_only=True):
+        if _account_matches_acnt_no(acct, acnt_no):
+            return acct
+    return None
+
+
+def _resolve_holding_account(code: str) -> dict | None:
+    """종목코드의 실제 보유계좌(acct dict)를 반환. 못 찾으면 None.
+
+    1) _code_account_map 캐시 HIT 이면 그대로 반환 (핫패스 보호: 조회 없음).
+    2) 캐시 MISS 이면 거래활성 계좌들의 잔고를 1회 조회해 그 종목을 (ord_psbl_qty>0 또는
+       hldg_qty>0) 보유한 계좌를 찾아 캐시 후 반환.
+    3) 어떤 계좌도 보유하지 않으면 None (호출부는 매도 스킵).
+
+    ※ 매도 직전(핫패스)에서 캐시 MISS 일 때만 잔고를 조회하므로 폭주(매 틱 조회)는 없다.
+    """
+    code = str(code).zfill(6)
+    with _code_account_map_lock:
+        acct = _code_account_map.get(code)
+    if acct:
+        return acct
+    # 캐시 MISS → 거래활성 계좌 잔고에서 보유계좌 탐색 (1회)
+    for cand in _iter_enabled_accounts(trade_only=True):
+        cano = str(cand.get("cano", "")).strip()
+        acnt = cand.get("acnt_prdt_cd", "01") or "01"
+        if not cano:
+            continue
+        try:
+            client = _init_account_client(cand) if "appkey" in cand else (_top_client or _init_top_client())
+            ctx_fk, ctx_nk, tr_cont = "", "", ""
+            for _ in range(10):
+                out1, _, ctx_fk, ctx_nk, resp_cont = _get_balance_page(
+                    client, cano, acnt, "TTTC8434R", ctx_fk, ctx_nk, tr_cont
+                )
+                rows = out1 if isinstance(out1, list) else ([out1] if isinstance(out1, dict) else [])
+                if not rows:
+                    break
+                for row in rows:
+                    c = str(row.get("pdno", "") or "").strip().zfill(6)
+                    if c != code:
+                        continue
+                    qty = int(float(str(row.get("hldg_qty", 0) or 0).replace(",", "") or 0))
+                    psbl = int(float(str(row.get("ord_psbl_qty", 0) or 0).replace(",", "") or 0))
+                    if qty > 0 or psbl > 0:
+                        with _code_account_map_lock:
+                            _code_account_map[code] = cand
+                        alias = cand.get("alias", cand.get("account_id", "?"))
+                        logger.info(
+                            f"{ts_prefix()} [str1_sell] 보유계좌 식별(잔고조회): "
+                            f"{code} → {alias}({cano}) psbl={psbl} hldg={qty}"
+                        )
+                        return cand
+                if resp_cont not in ("F", "M"):
+                    break
+                tr_cont = "N"
+        except Exception as e:
+            alias = cand.get("alias", cand.get("account_id", "?"))
+            logger.warning(f"{ts_prefix()} [str1_sell] 보유계좌 탐색 잔고조회 실패 {alias}({cano}): {e}")
+    return None
 # ── EMA 데드크로스 상태 기반 매도 ──────────────────────────────────────────────
 # up_trend 지속 상태: 정배열(ma50>ma200>ma300>ma500>ma2000>wghn) 유지 중이면 True
 _up_trend_state: dict[str, bool] = {}
@@ -2890,6 +3019,29 @@ def _on_ccnl_notice_filled(df, recv_ts: str) -> None:
                             _st["balance_qty"] = _st.get("balance_qty", 0) + qty
                             if _st.get("buy_price", 0) <= 0:
                                 _st["buy_price"] = fill_pr
+                    # ── (260624) 보유계좌 기록: 체결통보 acnt_no 로 실제 체결계좌 식별 ──
+                    # acnt_no = cano(8) + acnt_prdt_cd(2). htsid 는 공유되나 acnt_no 에 실제
+                    # 체결계좌가 들어 있어(260623 실측) 종목→계좌 식별 가능. 잔고조회 경로에만
+                    # 의존하던 _code_account_map 의 공백을 메워 임의 a1 폴백 매도(APBK0400)를 차단.
+                    _fill_acnt_no = str(row.get("acnt_no", "") or "").strip()
+                    _fill_acct = _account_from_acnt_no(_fill_acnt_no)
+                    if _fill_acct:
+                        with _code_account_map_lock:
+                            _code_account_map[code] = _fill_acct
+                        # 보유계좌가 정정되면 수량초과 쿨다운/카운터 해제 (요구사항 B 자연해소)
+                        with _str1_qty_exceed_lock:
+                            _str1_qty_exceed_count.pop(code, None)
+                            _str1_qty_exceed_cooldown.discard(code)
+                        _fa_alias = _fill_acct.get("alias", _fill_acct.get("account_id", "?"))
+                        logger.info(
+                            f"{ts_prefix()} [체결통보] 보유계좌 기록: {name_fill}({code}) "
+                            f"→ {_fa_alias}(acnt_no={_fill_acnt_no})"
+                        )
+                    elif _fill_acnt_no:
+                        logger.warning(
+                            f"{ts_prefix()} [체결통보] acnt_no={_fill_acnt_no} 로 거래활성 계좌를 "
+                            f"식별 못함 {name_fill}({code}) → 매도직전 잔고조회로 폴백 예정"
+                        )
                 if _need_sub:
                     _ensure_code_structs([code])
                     with _lock:
@@ -4689,7 +4841,7 @@ def _trigger_ws_rebuild():
         with _kws_lock:
             if _active_kws is not None:
                 desired = _desired_subscription_map(datetime.now(KST))
-                _apply_subscriptions(_active_kws, desired)
+                _apply_subscriptions(_active_kws, desired, reason="ws_rebuild")
 
     t = threading.Thread(target=_do, daemon=True)
     t.start()
@@ -5545,6 +5697,7 @@ def _wss_norecv_watchdog_loop():
         try:
             _now_t = datetime.now(KST).time()
             if (dtime(9, 0) <= _now_t < dtime(15, 20)
+                and not _market_wide_event          # [260611] 서킷/시장정지 중엔 무수신 정상 → 하드종료(os._exit) 금지
                 and (time.time() - _process_start_ts) > WSS_WATCHDOG_GRACE_SEC):
                 _idle_sec = time.time() - _last_any_recv_ts if _last_any_recv_ts > 0 else 0
                 if _idle_sec >= WSS_NO_RECV_ALERT_SEC and not _alert_sent:
@@ -5899,6 +6052,14 @@ def scheduler_loop():
                         _merge_parts_to_final()
                         # ②-1 거래장부 연도별 parquet 갱신
                         _append_daily_ledger_to_yearly()
+                        # ②-2 WSS 데이터 정리 + S3 아카이브
+                        #     wss_data/indicator_snapshot: 최근 3일만 로컬 유지, 나머지 S3 업로드 후 삭제
+                        #     backup/: 당일자만 남기고 삭제 (S3 업로드 없음). 종료 경로를 막지 않도록 try 로 감쌈.
+                        try:
+                            from ws_s3upload_and_cleanup_data import cleanup_wss_data
+                            cleanup_wss_data(logger=logger)
+                        except Exception as e:
+                            logger.error(f"{ts_prefix()} [cleanup] WSS 데이터 정리 실패: {e}")
                         time.sleep(1.0)
                         # ③ 최종 요약
                         _notify(_final_summary())
@@ -6032,7 +6193,7 @@ def scheduler_loop():
                 with _kws_lock:
                     if _active_kws is not None:
                         desired = _desired_subscription_map(now)
-                        _apply_subscriptions(_active_kws, desired)
+                        _apply_subscriptions(_active_kws, desired, reason="모드전환")
                         # 15:30 종가 체결 전 종목 수신 완료 → WS 닫기
                         if (new_mode == RunMode.CLOSE_REAL
                                 and not desired
@@ -6062,6 +6223,19 @@ def scheduler_loop():
 
                 now_ts = time.time()
                 nt = now.time()
+                # [260611] 서킷브레이커 자동복귀 안전장치: 해제 코드를 놓쳐도 발동+30분에 강제 복귀.
+                #   (해제코드가 먼저 오면 핸들러에서 이미 복귀 처리되고 _cb_resume_at 도 pop 됨)
+                if _cb_resume_at:
+                    _cb_expired = [m for m, ts in _cb_resume_at.items() if now_ts >= ts]
+                    for _m in _cb_expired:
+                        _cb_resume_at.pop(_m, None)
+                        _prev_cb = _market_wide_event.pop(_m, "")
+                        _market_wide_mkop.pop(_m, None)
+                        _market_wide_start_ts.pop(_m, None)
+                        logger.warning(f"{ts_prefix()} [장운영] {_m} 서킷 자동복귀(발동+30분 경과, {_prev_cb}) → 실시간 복귀")
+                        _notify(f"{ts_prefix()} [장운영] {_m} 서킷 30분 경과 자동복귀 → 전 종목 실시간체결 복귀 + 무수신감시 재개", tele=True)
+                    if _cb_expired:
+                        _trigger_ws_rebuild()
                 # "no data" 경고 억제 구간:
                 # - 15:20~15:31 예상체결가/종가 체결 수신 (데이터 간헐적 → 경고/재구독 무의미)
                 # - 15:31 이후 종가 수신 완료 후
@@ -6069,6 +6243,9 @@ def scheduler_loop():
                 in_no_data_suppress = (
                     nt >= dtime(15, 20)
                     or _close_force_stopped
+                    # [260611] 서킷브레이커/시장임시정지 중엔 전 종목 무수신이 정상 →
+                    #   재구독·강제재접속 폭주(→ KIS WSS IP 차단) 차단. WSS 연결은 그대로 유지.
+                    or bool(_market_wide_event)
                 )
                 if _last_any_recv_ts > 0 and not in_no_data_suppress:
                     idle_sec = now_ts - _last_any_recv_ts
@@ -6110,7 +6287,11 @@ def scheduler_loop():
                             )
                             with _kws_lock:
                                 if _active_kws is not None:
-                                    _apply_subscriptions(_active_kws, _desired_subscription_map(now), force=True)
+                                    _apply_subscriptions(
+                                        _active_kws, _desired_subscription_map(now),
+                                        force=True,
+                                        reason=f"no-data watchdog({int(idle_sec)}s유휴, {_no_data_rebuild_count}/{NO_DATA_RECONNECT_COUNT})",
+                                    )
                             _last_rebuild_ts = now_ts
             # ── 전략 모듈 핫스왑 체크 (0.5초 간격) ──
             _check_strategy_swap()
@@ -6302,6 +6483,13 @@ def _log_full_progress():
 _lock = threading.RLock()
 _stop_event = threading.Event()
 _ingest_queue: "queue.Queue[tuple[pl.DataFrame, str, str, str | None, str]]" = queue.Queue()
+# [260609] H0STMKO0(장운영정보) 전용 수신 큐.
+#   on_result 는 이벤트 루프 스레드에서 실행되는데, 거기서 _on_market_status_krx 를 직접 부르면
+#   그 안의 VI 구독전환(_send_subscribe→send_request)이 같은 이벤트 루프에 코루틴을 던지고
+#   fut.result(timeout=10) 로 루프 스스로를 막아(self-deadlock) send 당 10초씩 수신이 멎는다.
+#   (260609 붕괴 시발점: VI해제 1건=10초×3=30초 수신정지 → 워치독 재구독 폭주 → approval 죽음의 나선)
+#   → 워커 스레드로 이관해 send_request 가 이벤트 루프와 분리되어 정상 동작하도록 한다.
+_mkstatus_recv_queue: "queue.Queue" = queue.Queue()
 
 _part_buffer: list[pl.DataFrame] = []         # flush 전 임시 버퍼 (1000행 또는 1분마다 part로 저장)
 _part_buffer_lock = threading.RLock()          # flush와 append 동시 처리용
@@ -6356,12 +6544,22 @@ _vi_start_ts: dict[str, str] = {}             # code → VI 발동 ISO timestamp
 _vi_end_ts: dict[str, str] = {}               # code → VI 해제 ISO timestamp
 # 장운영 전체 이벤트 (CB/사이드카)
 _last_mkop_event: dict[str, str] = {}         # code → 마지막 mkop_cls_code
+_last_mkop_sig: dict[str, tuple] = {}         # code → (mkop, antc_mkop, trht) 마지막 수신 시그니처 (장운영정보 수신 로깅 변화감지용)
 _market_event: dict[str, str] = {}            # code → 장운영 이벤트명 (VI/사이드카 등)
 _market_wide_event: dict[str, str] = {}       # "KOSPI"/"KOSDAQ" → CB/사이드카 이벤트명
 _market_wide_mkop: dict[str, str] = {}        # "KOSPI"/"KOSDAQ" → 마지막 mkop_cls_code
 _market_wide_start_ts: dict[str, str] = {}    # "KOSPI"/"KOSDAQ" → 발동 ISO timestamp
 _code_market_map: dict[str, str] = {}         # code → "KOSPI"/"KOSDAQ"
 _last_cb_replay_ts: dict[str, float] = {}     # CB 중 마지막 복제 가격 저장 시각 (5초 간격)
+# [260611] 서킷브레이커 자동복귀 안전장치: 1·2단계 = 20분 전면중단 + 10분 단일가 = 30분 후 재개.
+#   해제 코드 신호를 놓쳐도 발동+30분에 강제 복귀(무한 정지 방지). 해제코드가 먼저 오면 즉시 복귀.
+_cb_resume_at: dict[str, float] = {}          # market → 자동복귀 예정 unix_ts
+CB_AUTO_RESUME_SEC = 1800                      # 30분
+
+
+def _is_cb_active(code: str) -> bool:
+    """code 가 속한 시장이 서킷브레이커/시장임시정지 발동 중인지(신규매매 금지 판정용)."""
+    return bool(_market_wide_event.get(_code_market_map.get(code, "")))
 # H0STMKO0 keep-alive 순환 (마켓당 1개 유지)
 _MKT_KEEPALIVE_INITIAL = {
     "KOSPI":  "005930",  # 삼성전자
@@ -6977,6 +7175,8 @@ def _try_vi_buy(code: str, name: str, antc_prce: float, stck_prpr: float) -> Non
     """예상체결가 수신 시 VI 매수 시도 — 전략 판단은 str1에 위임."""
     if code in _vi_buy_pending:
         return  # 이미 주문 나간 상태
+    if _is_cb_active(code):
+        return  # [260611] 서킷브레이커/시장임시정지 중 → 신규매수 금지(취소만 가능한 시장상태)
     already_holding = code in _vi_positions and not _vi_positions[code].get("sold")
     should_buy, reason = vi_buy_strategy(
         antc_prce, stck_prpr, VI_TRADE_MODE, already_holding,
@@ -7725,6 +7925,8 @@ def _try_uplimit_buy(
     global _uplimit_today_buy_count
     if not UPLIMIT_BUY_ENABLED:
         return
+    if _is_cb_active(code):
+        return  # [260611] 서킷브레이커/시장임시정지 중 → 신규매수 금지
     if code in _uplimit_positions or code in _uplimit_buy_pending:
         return
     with _uplimit_state_lock:
@@ -8224,41 +8426,75 @@ def _on_market_status_krx(result) -> None:
             except Exception as e:
                 logger.warning(f"{ts_prefix()} [종목상태] {name}({code}) KRX 교차검증 실패: {e}")
 
-        # ── 장운영구분코드 (mkop_cls_code) — 사이드카/서킷브레이크 감지 ──
+        # ── 장운영구분코드 — 사이드카/서킷브레이크 감지 (mkop_cls_code + antc_mkop_cls_code) ──
         mkop = str(row.get("mkop_cls_code", "")).strip()
+        antc_mkop = str(row.get("antc_mkop_cls_code", "")).strip()
+        trht_now = str(row.get("trht_yn", "")).strip()
         market = _code_market_map.get(code, "")
-        if mkop:
+        # [260611] 장운영정보 수신 로깅: 세 필드 중 하나라도 바뀌면 원값을 모두 남긴다.
+        #   (단일가/서킷브레이커 상태가 어느 필드로 오는지 다음 발동 때 확정하기 위함 —
+        #    기존엔 _MKOP_EVENT_NAMES 매칭되는 known-event 전이만 로깅됐음)
+        _mk_sig = (mkop, antc_mkop, trht_now)
+        if _mk_sig != _last_mkop_sig.get(code):
+            _last_mkop_sig[code] = _mk_sig
+            logger.info(
+                f"{ts_prefix()} [장운영정보] {name}({code}) "
+                f"mkop_cls_code={mkop or '-'} antc_mkop_cls_code={antc_mkop or '-'} trht_yn={trht_now or '-'}"
+            )
+        # [260611] 감지 필드 보강: 현재값(mkop) 우선, 비었으면 예상값(antc_mkop)으로도 감지.
+        #   실측상 단일가/서킷 구간에 mkop='None'·antc_mkop='311' 처럼 예상필드로만 오는 경우가
+        #   있어 둘 다 본다. 어느 필드로 잡았는지(_evt_src)를 로그에 남긴다.
+        _evt_code, _evt_src = "", ""
+        if _MKOP_EVENT_NAMES.get(mkop):
+            _evt_code, _evt_src = mkop, "mkop_cls_code"
+        elif _MKOP_EVENT_NAMES.get(antc_mkop):
+            _evt_code, _evt_src = antc_mkop, "antc_mkop_cls_code"
+        if _evt_code:
             prev_mkop = _last_mkop_event.get(code, "")
-            if mkop != prev_mkop:
-                _last_mkop_event[code] = mkop
-                event_name = _MKOP_EVENT_NAMES.get(mkop)
-                if event_name:
-                    _market_event[code] = event_name
-                    msg = f"{ts_prefix()} [장운영] {name}({code}) mkop={mkop} ({event_name})"
-                    logger.warning(msg)
-                    _notify(msg, tele=True)
-                    # 사이드카(187/397)=프로그램매매 호가효력정지로 개인거래와 무관 → 위 정보성
-                    # 로깅/알림만 남기고 시장 전파(REST 폴링 생략)는 발동시키지 않는다.
-                    # 시장 전파(REST 폴링 생략)는 서킷브레이커류(174=발동/184=개시/164=시장임시정지)만.
-                    if mkop in ("174", "184", "164") and market:
-                        now_iso = datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S")
-                        _market_wide_event[market] = event_name
-                        _market_wide_mkop[market] = mkop
-                        _market_wide_start_ts[market] = now_iso
-                        logger.warning(f"{ts_prefix()} [장운영] 마켓전파: {market} ← {event_name} (발동시각={now_iso})")
-                        _notify(f"{ts_prefix()} [장운영] {market} {event_name} — REST 폴링 생략 시작", tele=True)
+            if _evt_code != prev_mkop:
+                _last_mkop_event[code] = _evt_code
+                event_name = _MKOP_EVENT_NAMES.get(_evt_code)
+                _market_event[code] = event_name
+                msg = f"{ts_prefix()} [장운영] {name}({code}) {_evt_src}={_evt_code} ({event_name})"
+                logger.warning(msg)
+                _notify(msg, tele=True)
+                # 사이드카(187/397)=프로그램매매 호가효력정지로 개인거래와 무관 → 정보성 로깅만.
+                # 시장 전파(REST 폴링 생략)는 서킷브레이커류(174=발동/184=개시/164=시장임시정지)만.
+                if _evt_code in ("174", "184", "164") and market:
+                    _newly = not _market_wide_event.get(market)
+                    now_iso = datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S")
+                    _market_wide_event[market] = event_name
+                    _market_wide_mkop[market] = _evt_code
+                    _market_wide_start_ts[market] = now_iso
+                    # [260611] 30분(20분중단+10분단일가) 자동복귀 예약 — 해제코드 놓침 대비 안전장치
+                    _cb_resume_at[market] = time.time() + CB_AUTO_RESUME_SEC
+                    logger.warning(f"{ts_prefix()} [장운영] 마켓전파: {market} ← {event_name} (감지필드={_evt_src}, 발동시각={now_iso})")
+                    _notify(
+                        f"{ts_prefix()} [장운영] {market} {event_name} (감지필드:{_evt_src}) "
+                        f"— 전 종목 예상체결 전환 + 무수신감시 정지 + REST 폴링 생략 (최대 30분 후 자동복귀)",
+                        tele=True,
+                    )
+                    if _newly:
+                        # 서킷 시장 전 종목 ccnl→exp 즉시 적용 (해제는 175/185 또는 30분 타이머)
+                        _trigger_ws_rebuild()
                 # 사이드카/서킷 해제 → 종목 이벤트 클리어 (사이드카 해제 388/398 포함)
-                if mkop in ("175", "185", "388", "398"):
+                if _evt_code in ("175", "185", "388", "398"):
                     _market_event.pop(code, None)
                 # 시장 전파 해제(REST 폴링 재개)는 서킷브레이커 해제(175/185)만.
                 # 사이드카 해제(388/398)는 애초에 시장 전파를 안 했으므로 진입 금지.
-                if mkop in ("175", "185"):
+                if _evt_code in ("175", "185"):
                     if market and _market_wide_event.get(market):
                         prev_evt = _market_wide_event.pop(market, "")
                         _market_wide_mkop.pop(market, None)
                         _market_wide_start_ts.pop(market, None)
-                        logger.warning(f"{ts_prefix()} [장운영] 마켓전파 해제: {market} ({prev_evt} → mkop={mkop})")
-                        _notify(f"{ts_prefix()} [장운영] {market} 해제 — REST 폴링 재개", tele=True)
+                        _cb_resume_at.pop(market, None)
+                        logger.warning(f"{ts_prefix()} [장운영] 마켓전파 해제: {market} ({prev_evt} → {_evt_src}={_evt_code})")
+                        _notify(
+                            f"{ts_prefix()} [장운영] {market} 해제 — 전 종목 실시간체결 복귀 + 무수신감시 재개 + REST 폴링 재개",
+                            tele=True,
+                        )
+                        # 전 종목 exp→ccnl 즉시 복귀
+                        _trigger_ws_rebuild()
 
         # VI 발동/해제 감지 (vi_cls_code)
         # [260602 수정] 실측상 KIS vi_cls_code 는 발동='Y' / 해제='N' 으로 온다(현재가조회·H0STMKO0 동일).
@@ -8307,6 +8543,28 @@ def _on_market_status_krx(result) -> None:
                             _mkstatus_sub_remove({code})
                         except Exception as e:
                             logger.warning(f"{ts_prefix()} [VI해제] H0STMKO0 해제 실패 {code}: {e}")
+
+
+def _mkstatus_recv_loop() -> None:
+    """H0STMKO0 장운영정보 처리 전용 워커 (이벤트 루프와 분리 — 260609 self-deadlock 방지).
+
+    on_result(이벤트 루프 스레드)가 _mkstatus_recv_queue 에 넣은 프레임을 순차 처리한다.
+    여기서 호출되는 _send_subscribe→send_request 는 '워커 스레드'에서 실행되므로,
+    이벤트 루프가 자유로워 run_coroutine_threadsafe 코루틴이 정상 실행된다
+    (루프에서 직접 호출 시 fut.result(timeout=10)가 루프를 막아 10초 자기교착이 났던 버그 해소).
+    """
+    logger.info("[mkstatus] H0STMKO0 처리 워커 시작")
+    while not _stop_event.is_set() or not _mkstatus_recv_queue.empty():
+        try:
+            result = _mkstatus_recv_queue.get(timeout=0.5)
+        except queue.Empty:
+            continue
+        if result is None:
+            break
+        try:
+            _on_market_status_krx(result)
+        except Exception as e:
+            logger.warning(f"{ts_prefix()} [mkstatus] H0STMKO0 처리 오류: {e}")
 
 
 H0STMKO0_MAX_SLOTS: int = 5  # 데이터(ccnl/exp) 슬롯 ≥35 보장 위한 보수적 cap
@@ -8463,12 +8721,25 @@ def _handle_stale_check_result(code: str, output: dict) -> None:
     #   하지 않는다(로그 장식용 호출 제거 → 변동성 장세 REST 절약). 매매 영향 없음.
     #   _vi_exp_sub_switch 가 H0STMKO0 도 구독하므로 해제는 경로 A(H0STMKO0 vi_cls='N')가 처리.
     if vi_cls_rt not in ("N", "0", "") and code not in _vi_exp_sub_ts:
-        detected_at = datetime.now(KST).strftime("%H:%M:%S")
+        now_kst = datetime.now(KST)
+        detected_at = now_kst.strftime("%H:%M:%S")
+        _vi_exp_sub_switch(code)
+        # [260609] VI 발동시각 기록 — '현재 발동(미해제) VI'의 발동시각을 정확히 남긴다.
+        #   기존: REST 경로가 _vi_start_ts 를 갱신하지 않아, 한 종목 복수 VI 시 2회차 이후
+        #   행이 1회차 발동시각으로 잘못 스탬프되던 버그(경로 A H0STMKO0 만 기록).
+        #   → 경로 A(8279~)와 대칭으로 발동시각·해제시각·발동횟수·상태캐시를 기록한다.
+        #   _vi_cls_cache='Y' 로 맞춰, 직후 H0STMKO0 'Y' 프레임이 경로 A 의 상태전이로 오인되어
+        #   [VI발동] 중복 발사·발동시각 덮어쓰기 되는 것을 차단(해제는 경로 A 의 'N' 전이가 처리).
+        cnt = _vi_trigger_count.get(code, 0) + 1
+        _vi_trigger_count[code] = cnt
+        _vi_start_ts[code] = now_kst.strftime("%Y-%m-%d %H:%M:%S")
+        _vi_end_ts.pop(code, None)
+        _vi_cls_cache[code] = "Y"
+        _market_event[code] = "VI발동"
         msg = (f"{ts_prefix()} [VI감지-REST] {name}({code}) "
-               f"vi_cls_code={vi_cls_rt} 감지시각={detected_at} → 예상체결 전환")
+               f"vi_cls_code={vi_cls_rt} 감지시각={detected_at} ({cnt}회차) → 예상체결 전환")
         logger.warning(msg)
         _notify(msg, tele=True)
-        _vi_exp_sub_switch(code)
         _enqueue_rest_price_row(code, output)
         return
 
@@ -9828,6 +10099,19 @@ KNOWN_TRID_MAP: dict[str, tuple[str, str]] = {
     "H0STANC0": ("regular_exp", "N"),
     "H0STOUP0": ("overtime_real", "Y"),
     "H0STOAC0": ("overtime_exp", "N"),
+}
+
+# 구독 요청 함수명 -> (TR_ID, 한글 스트림명).
+# _send_subscribe 로그에 "어떤 스트림의 구독인지(주체)"를 명시하고,
+# 함수 객체에서는 tr_id 추출이 안 되는 unknown 문제를 보완하기 위한 매핑.
+REQ_STREAM_INFO: dict[str, tuple[str, str]] = {
+    "ccnl_krx":              ("H0STCNT0", "실시간체결가"),
+    "ccnl_total":            ("H0UNCNT0", "실시간체결가(통합)"),
+    "exp_ccnl_krx":          ("H0STANC0", "예상체결가"),
+    "overtime_ccnl_krx":     ("H0STOUP0", "시간외 실시간체결가"),
+    "overtime_exp_ccnl_krx": ("H0STOAC0", "시간외 예상체결가"),
+    "ccnl_notice":           ("H0STCNI0", "체결통보"),
+    "market_status_krx":     ("H0STMKO0", "장운영정보"),
 }
 
 def _infer_tr_kind(trid: str, is_real: str | None) -> str:
@@ -12460,7 +12744,9 @@ def on_result(ws, tr_id, result, data_info):
 
     # H0STMKO0 장운영정보: VI 발동/해제 감지 (parquet 미포함)
     if trid == "H0STMKO0":
-        _on_market_status_krx(result)
+        # [260609] 이벤트 루프 self-deadlock 방지: 루프에서 직접 처리하지 않고 워커로 이관.
+        #   (직접 처리 시 VI 구독전환 send_request 가 루프를 막아 10초×N 수신정지 → 워치독 폭주 → 붕괴)
+        _mkstatus_recv_queue.put(result)
         return
     # polars는 중복 컬럼명을 자동으로 suffix 처리하므로 별도 제거 불필요
 
@@ -12556,8 +12842,13 @@ def ingest_loop():
                     _since_save_rows += n
                     _since_save_counts[code] += n
                     _last_recv_ts[code] = now
-                    _last_any_recv_ts = now
-                    _no_data_rebuild_count = 0  # 데이터 수신 → 재구독 실패 카운터 리셋
+                    # [260624] WSS 전용 무수신 판정: REST보충(FHKST01010100)은 _last_any_recv_ts 갱신 제외.
+                    #   REST 가 이 값을 갱신하면, WSS 좀비(전 tr_id 무수신)인데도 REST 폴백으로 연명할 때
+                    #   무수신 watchdog(_wss_norecv_watchdog_loop os._exit + no-data 강제재접속)이 마스킹돼
+                    #   끝내 안 터진다. (260623 사고: 09:13 WSS 사망→종일 REST 연명, 장운영정보/사이드카·서킷 미수신)
+                    if trid != "FHKST01010100":
+                        _last_any_recv_ts = now
+                        _no_data_rebuild_count = 0  # 데이터 수신 → 재구독 실패 카운터 리셋
                     # 종목별 구독 전환 후 첫 실시간 시세 정상 수신 로깅
                     # (시장 시세 stck_prpr=현재가. 내 주문 체결[체결통보-체결]과 무관 — 혼동 방지 위해 용어 분리)
                     prev_trid = _last_trid_per_code.get(code)
@@ -13050,43 +13341,51 @@ def _register_trid(req) -> str | None:
             TRID_TO_KIND[rid] = "unknown"
     return rid
 
-def _send_subscribe(kws, req, data, tr_type: str) -> None:
+def _send_subscribe(kws, req, data, tr_type: str, reason: str = "") -> None:
     rid = _register_trid(req)
     action = "구독 추가" if tr_type == "1" else "구독 해제"
+    # 어떤 스트림에 대한 구독인지(주체) + 함수 객체에서 추출 실패한 tr_id 보완
+    req_name = getattr(req, "__name__", "")
+    stream_tr_id, stream_label = REQ_STREAM_INFO.get(req_name, ("", req_name or "unknown"))
+    rid = rid or stream_tr_id
+    # 구독 요청을 발생시킨 트리거(주체) — 비어있으면 표기 생략
+    by = f" by={reason}" if reason else ""
     for idx, chunk in enumerate(_chunks(data, MAX_CODES_PER_SESSION), start=1):
         try:
             kws.send_request(request=req, tr_type=tr_type, data=chunk)
             code_names = [f"{code_name_map.get(c, c)}({c})" for c in chunk]
             logger.info(
-                f"{ts_prefix()} [{action} 결과] TR_ID={rid or 'unknown'} "
+                f"{ts_prefix()} [{stream_label} {action}]{by} TR_ID={rid or 'unknown'} "
                 f"종목={', '.join(sorted(code_names))}"
             )
         except Exception as e:
             code_names = [f"{code_name_map.get(c, c)}({c})" for c in chunk]
             logger.warning(
-                f"{ts_prefix()} [{action} 실패] TR_ID={rid or 'unknown'} "
+                f"{ts_prefix()} [{stream_label} {action} 실패]{by} TR_ID={rid or 'unknown'} "
                 f"종목={', '.join(sorted(code_names))} err={e}"
             )
 
-def _apply_subscriptions(kws, desired: dict, force: bool = False) -> None:
+def _apply_subscriptions(kws, desired: dict, force: bool = False, reason: str = "") -> None:
     """
     desired: {request_func: set(종목코드)} — _desired_subscription_map()의 반환값
     종목별로 올바른 구독 타입을 적용합니다.
     구독 슬롯 초과 방지: 해제 완료 후 대기 → 신규 구독 (batch 10개씩)
+    reason: 구독 변경을 발생시킨 트리거(주체). 로그에 by=... 로 표기됨.
     """
     all_reqs = [ccnl_krx, exp_ccnl_krx, overtime_ccnl_krx, overtime_exp_ccnl_krx]  # noqa: F405
 
     if force:
         # ── force 재구독: ALREADY IN SUBSCRIBE 방지 위해 UNSUBSCRIBE 후 SUBSCRIBE ──
+        _by = f" by={reason}" if reason else ""
         for req in all_reqs:
             want = desired.get(req, set())
             if want:
                 _cnm = code_name_map if "code_name_map" in globals() else {}
                 _names = [_cnm.get(c, c) for c in sorted(want)]
-                logger.info(f"{ts_prefix()} [ws] force 재구독: {req.__name__} {len(want)}종목 {_names}")
-                _send_subscribe(kws, req, list(want), "2")  # UNSUBSCRIBE 먼저
+                logger.info(f"{ts_prefix()} [ws] force 재구독{_by}: {req.__name__} {len(want)}종목 {_names}")
+                _send_subscribe(kws, req, list(want), "2", reason=reason)  # UNSUBSCRIBE 먼저
                 time.sleep(0.05)
-                _send_subscribe(kws, req, list(want), "1")  # SUBSCRIBE
+                _send_subscribe(kws, req, list(want), "1", reason=reason)  # SUBSCRIBE
                 _subscribed[req.__name__] = set(want)
             else:
                 _subscribed.pop(req.__name__, None)
@@ -13108,7 +13407,7 @@ def _apply_subscriptions(kws, desired: dict, force: bool = False) -> None:
             # batch 단위 해제 (10개씩)
             for i in range(0, len(to_del), 10):
                 batch = to_del[i:i+10]
-                _send_subscribe(kws, req, batch, "2")
+                _send_subscribe(kws, req, batch, "2", reason=reason)
             any_unsub = True
         if to_add:
             pending_adds.append((req, to_add))
@@ -13121,7 +13420,7 @@ def _apply_subscriptions(kws, desired: dict, force: bool = False) -> None:
     for req, add_list in pending_adds:
         for i in range(0, len(add_list), 10):
             batch = add_list[i:i+10]
-            _send_subscribe(kws, req, batch, "1")  # SUBSCRIBE
+            _send_subscribe(kws, req, batch, "1", reason=reason)  # SUBSCRIBE
 
     # ── 3단계: 전송 완료 후 _subscribed 갱신 ──────────────────────
     for req in all_reqs:
@@ -13155,10 +13454,16 @@ def _desired_subscription_map(now: datetime) -> dict:
         return {exp_ccnl_krx: all_codes}  # noqa: F405
 
     if dtime(9, 0) <= t < dtime(15, 20):
-        # ── VI / 57·59(30분 단일가) / 일반 종목 분리 ──
+        # ── VI / 57·59(30분 단일가) / 서킷브레이커 / 일반 종목 분리 ──
         vi_codes = _vi_delayed_codes & all_codes
         single_codes = (_single_price_codes.keys() | _single_price_pending.keys()) & all_codes
-        rest_codes = all_codes - vi_codes - single_codes
+        # [260611] 서킷브레이커/시장임시정지 발동 시장의 종목 → 예상체결가(10분 단일가 구간 수신).
+        #   해제(또는 30분 자동복귀)로 _market_wide_event 가 비워지면 자동으로 실시간 체결 복귀.
+        cb_codes = (
+            {c for c in all_codes if _code_market_map.get(c) in _market_wide_event}
+            if _market_wide_event else set()
+        )
+        rest_codes = all_codes - vi_codes - single_codes - cb_codes
 
         # 57/59: XX:29:29~XX:00:05 / XX:59:29~XX:30:05 = 실시간 체결가, 그 외 예상체결가
         minute, second = t.minute, t.second
@@ -13169,11 +13474,12 @@ def _desired_subscription_map(now: datetime) -> dict:
         single_exp = single_codes - single_real
 
         result = {}
-        exp_set = vi_codes | single_exp
+        exp_set = vi_codes | single_exp | cb_codes
         if exp_set:
             result[exp_ccnl_krx] = exp_set
-        if rest_codes or single_real:
-            result[ccnl_krx] = rest_codes | single_real
+        ccnl_set = (rest_codes | single_real) - cb_codes
+        if ccnl_set:
+            result[ccnl_krx] = ccnl_set
         return result
 
     if dtime(15, 20) <= t < dtime(15, 21):
@@ -13757,6 +14063,10 @@ if __name__ == "__main__":
 
     t_ingest = threading.Thread(target=ingest_loop, daemon=True)
     t_ingest.start()
+
+    # [260609] H0STMKO0 장운영정보 처리 워커 (이벤트 루프 self-deadlock 방지)
+    t_mkstatus = threading.Thread(target=_mkstatus_recv_loop, name="mkstatus-recv", daemon=True)
+    t_mkstatus.start()
 
     # Str1 매도 워커 시작 (ingest → sell_queue → KIS API 주문)
     t_str1_sell = threading.Thread(target=_str1_sell_worker, daemon=True)

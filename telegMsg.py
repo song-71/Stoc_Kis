@@ -6,11 +6,35 @@
        tmsg("메시지 내용")
 """
 import requests
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
+from pathlib import Path
 
 # 텔레그램 설정
 BOT_TOKEN = "8282014572:AAFVC5IiVNLKq5BwGVfuJjkYi3lXdr9M1XY"  # BotFather가 준 토큰
 CHAT_ID = "5901426769"  # userinfobot이 알려준 숫자
+
+# [260625] 날짜별 텔레그램 로그 단일 기록 지점.
+#   - 서버는 UTC 이므로 반드시 한국시각(KST=UTC+9) 기준으로 날짜/시각을 기록한다.
+#   - 모든 프로그램이 tmsg() 한 곳을 거치므로, 여기서 기록하면
+#     프로덕션(ws_realtime_trading.py) 종료 후 다른 프로그램이 보내는 메시지도
+#     같은 날짜별 텔레로그에 빠짐없이 남는다.
+_KST = timezone(timedelta(hours=9))
+_TELE_LOG_DIR = Path(__file__).resolve().parent / "out" / "logs"
+
+
+def _append_tele_log(msg):
+    """날짜별 텔레그램 로그(out/logs/{YYMMDD}_telegram.log)에 한 줄 기록.
+    형식: 'YYYY-MM-DD HH:MM:SS | {메시지}' (프로덕션 기존 형식과 동일).
+    기록 실패는 텔레그램 전송을 막지 않도록 조용히 무시한다."""
+    try:
+        now = datetime.now(_KST)
+        path = _TELE_LOG_DIR / f"{now.strftime('%y%m%d')}_telegram.log"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(f"{now.strftime('%Y-%m-%d %H:%M:%S')} | {msg}\n")
+    except Exception:
+        pass
+
 
 def tmsg(msg, mode=None):
     """
@@ -30,7 +54,12 @@ def tmsg(msg, mode=None):
         #now = datetime.now().strftime("[%H:%M:%S]")
         #msg_ = f"{now} {msg}"
         msg_ = f"{msg}"
-        
+
+        # [260625] 날짜별 텔레로그 기록을 네트워크 호출보다 먼저 수행.
+        #   _notify_async 처럼 데몬 스레드에서 fire-and-forget 으로 호출되는 경우에도
+        #   기록이 전송 시도보다 앞서 남도록 하여 누락 위험을 최소화한다.
+        _append_tele_log(msg_)
+
         # 텔레그램 API 호출
         url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
         payload = {"chat_id": CHAT_ID, "text": msg_}

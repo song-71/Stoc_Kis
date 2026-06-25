@@ -11,7 +11,7 @@ NXT(넥스트레이드) 프리마켓/애프터마켓 1분봉 다운로드
   - EC2 로컬: *_NXT.parquet 최근 2일치만 유지
 
 실행 (하루 2회):
-    # 아침(프리마켓 08:00~08:50만, 당일 오전 분석용) — 09:05 KST
+    # 아침(프리마켓 08:00~08:50만, 당일 오전 분석용) — 08:51 KST (프리마켓 종료 직후)
     nohup .../venv/bin/python .../kis_1m_API_to_Parquet_NXT.py --session=morning > .../out/1m_nxt_parquet_morning.log 2>&1 &
     # 저녁(애프터마켓 15:40~20:00만, 아침 프리마켓 파일과 병합) — 20:01 KST
     nohup .../venv/bin/python .../kis_1m_API_to_Parquet_NXT.py --session=evening > .../out/1m_nxt_parquet.log 2>&1 &
@@ -39,7 +39,7 @@ import boto3
 
 sys.path.extend(['../..', '.'])
 import kis_auth as ka
-from kis_utils import LogManager, load_kis_data_layout, load_symbol_master, print_table, stQueryDB, is_holiday, send_telegram
+from kis_utils import LogManager, load_kis_data_layout, load_symbol_master, print_table, stQueryDB, is_holiday
 from inquire_time_itemchartprice import inquire_time_itemchartprice
 
 logging.basicConfig(level=logging.INFO)
@@ -200,8 +200,14 @@ def main():
     log_manager = LogManager(str(log_dir), log_name=log_name, run_tag=run_tag)
 
     def _log(msg: str) -> None:
+        """화면 + 로그 + 텔레그램 (시작/완료/이상 종료 등 핵심 알림 전용)."""
         out = f"{ts_prefix()} {msg}"
         log_manager.log_tm(out)
+        logging.info("%s", out)
+
+    def _log_q(msg: str) -> None:
+        """화면 + 로그만 (텔레그램 없음, 진행 단계 상세용)."""
+        out = f"{ts_prefix()} {msg}"
         logging.info("%s", out)
 
     _log("[1m_NXT] 프로그램 시작")
@@ -210,8 +216,7 @@ def main():
     try:
         if is_holiday():
             msg = f"[{Path(__file__).name}(1m NXT data download)] => 휴일로 프로그램을 종료합니다."
-            _log(msg)
-            send_telegram(msg)
+            _log(msg)  # _log 가 텔레그램까지 전송 (send_telegram 중복 제거)
             return
     except Exception as e:
         # 휴일 판정 실패 시 다운로드는 진행하되 경고만 남김
@@ -220,11 +225,13 @@ def main():
     any_written = False
     summary_rows = []
     now_kst = datetime.now(kst)
-    default_biz_date = now_kst.strftime("%Y%m%d") if now_kst.hour >= 9 else (now_kst - timedelta(days=1)).strftime("%Y%m%d")
+    # 프리마켓은 08:00 개시이므로 08시 이후 실행이면 당일을 영업일로 간주(아침 실행 08:51 KST 대응).
+    # 08시 이전 실행은 전일을 폴백 영업일로 사용. (API 응답에 거래일이 있으면 그 값이 우선)
+    default_biz_date = now_kst.strftime("%Y%m%d") if now_kst.hour >= 8 else (now_kst - timedelta(days=1)).strftime("%Y%m%d")
 
     session = _resolve_session(now_kst)
     query_times = _build_query_times(session)
-    _log(f"[1m_NXT] 실행 세션={session} (조회시각 {len(query_times)}개: {query_times[0]}~{query_times[-1]})")
+    _log_q(f"[1m_NXT] 실행 세션={session} (조회시각 {len(query_times)}개: {query_times[0]}~{query_times[-1]})")
 
     biz_date = None
     pdy_cache: dict[str, dict[str, float]] = {}
@@ -242,10 +249,10 @@ def main():
         if "nxt" in sdf.columns:
             nxt_df = sdf[sdf["nxt"].astype(str).str.strip().str.upper() == "Y"]
             target_codes = nxt_df["code"].tolist()
-            _log(f"[1m_NXT] NXT 종목 {len(target_codes)}개 (전체 {len(sdf)}개 중 nxt=Y)")
+            _log_q(f"[1m_NXT] NXT 종목 {len(target_codes)}개 (전체 {len(sdf)}개 중 nxt=Y)")
         else:
             target_codes = sdf["code"].tolist()
-            _log(f"[1m_NXT] 종목마스터에 nxt 컬럼 없음 → 전체 {len(target_codes)}종목 대상")
+            _log_q(f"[1m_NXT] 종목마스터에 nxt 컬럼 없음 → 전체 {len(target_codes)}종목 대상")
     except Exception as e:
         logging.warning("%s 종목마스터 로드 실패: %s", ts_prefix(), e)
         target_codes = TARGET_CODES
@@ -267,7 +274,7 @@ def main():
             return
         pct = int((idx * 100) / total_codes)
         while pct >= progress_state["next_pct"]:
-            _log(f"전체 데이터중 {progress_state['next_pct']}%({idx}/{total_codes}건) 수신 완료")
+            _log_q(f"전체 데이터중 {progress_state['next_pct']}%({idx}/{total_codes}건) 수신 완료")
             progress_state["next_pct"] += 10
 
     out_dir = Path(__file__).resolve().parent / "data" / "1m_data"
@@ -455,8 +462,8 @@ def main():
         _report_progress(idx)
 
     if not any_written:
-        _log("[1m_NXT] 저장할 데이터가 없습니다. (NXT 거래 없는 날 또는 시간 확인)")
-        _log("[1m_NXT] 프로그램 종료")
+        _log("[1m_NXT] 저장할 데이터가 없습니다. (NXT 거래 없는 날 또는 시간 확인) → 프로그램 종료")
+        _log_q("[1m_NXT] 프로그램 종료")
         return
 
     if not biz_date:
@@ -464,11 +471,11 @@ def main():
     temp_dir = temp_root / biz_date
     temp_files = sorted(temp_dir.glob("*.parquet"))
     if not temp_files:
-        _log("[1m_NXT] 임시 parquet 파일이 없습니다.")
-        _log("[1m_NXT] 프로그램 종료")
+        _log("[1m_NXT] 임시 parquet 파일이 없습니다. → 프로그램 종료")
+        _log_q("[1m_NXT] 프로그램 종료")
         return
 
-    _log(f"[1m_NXT] 데이터 병합 시작 (임시 파일 {len(temp_files)}개)")
+    _log_q(f"[1m_NXT] 데이터 병합 시작 (임시 파일 {len(temp_files)}개)")
     frames = [pd.read_parquet(p) for p in temp_files]
 
     # NXT 파일명: _NXT suffix
@@ -481,13 +488,13 @@ def main():
         try:
             existing = pd.read_parquet(parquet_path)
             frames.append(existing)
-            _log(f"[1m_NXT] 기존 NXT parquet 병합 (기존 {len(existing)}건 + 신규 temp {len(temp_files)}개)")
+            _log_q(f"[1m_NXT] 기존 NXT parquet 병합 (기존 {len(existing)}건 + 신규 temp {len(temp_files)}개)")
         except Exception as e:
-            _log(f"[1m_NXT][WARN] 기존 parquet 읽기 실패, 신규 데이터만 저장: {e}")
+            _log_q(f"[1m_NXT][WARN] 기존 parquet 읽기 실패, 신규 데이터만 저장: {e}")
 
     merged = pd.concat(frames, ignore_index=True)
 
-    _log(f"[1m_NXT] 중복 제거 시작 (기준={','.join(key_cols)})")
+    _log_q(f"[1m_NXT] 중복 제거 시작 (기준={','.join(key_cols)})")
     merged["_v_ok"] = merged["volume"].fillna(0) > 0 if "volume" in merged.columns else False
     merged["_a_ok"] = merged["acml_value"].fillna(0) > 0 if "acml_value" in merged.columns else False
     merged["_c_ok"] = merged["close"].fillna(0) > 0 if "close" in merged.columns else False
@@ -506,11 +513,11 @@ def main():
     # volume 합계가 0이면 유효 데이터 없음 (개장 전 더미 데이터 방지)
     total_vol = merged["volume"].fillna(0).sum() if "volume" in merged.columns else 0
     if total_vol == 0:
-        _log(f"[1m_NXT] ⚠ 전체 volume 합계가 0 → 유효 데이터 없음. 저장 스킵 (biz_date={biz_date})")
-        _log("[1m_NXT] 프로그램 종료 (개장 전 또는 NXT 거래 없는 날)")
+        _log(f"[1m_NXT] ⚠ 전체 volume 합계가 0 → 유효 데이터 없음. 저장 스킵 (biz_date={biz_date}) → 프로그램 종료 (개장 전 또는 NXT 거래 없는 날)")
+        _log_q("[1m_NXT] 프로그램 종료 (개장 전 또는 NXT 거래 없는 날)")
         return
 
-    _log(f"[1m_NXT] parquet 저장 (총 {len(merged)}건)")
+    _log_q(f"[1m_NXT] parquet 저장 (총 {len(merged)}건)")
     merged.to_parquet(parquet_path, index=False)
 
     if summary_rows:
@@ -526,7 +533,7 @@ def main():
 
     time.sleep(0.2)
     logging.info("%s 저장 완료: %s", ts_prefix(), parquet_path)
-    _log(f"[1m_NXT] 저장 완료: {parquet_path.name}")
+    _log_q(f"[1m_NXT] 저장 완료: {parquet_path.name}")
 
     # ── S3 업로드 (1m_nxt 경로) ──
     try:
@@ -540,7 +547,7 @@ def main():
         s3 = boto3.client("s3")
         s3.upload_file(str(parquet_path), s3_bucket, s3_key)
         logging.info("%s [S3] uploaded %s -> %s", ts_prefix(), parquet_path.name, s3_url)
-        _log(f"[1m_NXT] S3 업로드 완료: {s3_url}")
+        _log_q(f"[1m_NXT] S3 업로드 완료: {s3_url}")
     except Exception as e:
         logging.error("%s [S3] 업로드 실패: %s", ts_prefix(), e)
 
@@ -570,11 +577,11 @@ def main():
             for f in temp_dir.glob("*.parquet"):
                 f.unlink()
             temp_dir.rmdir()
-            _log(f"[1m_NXT] temp 정리 완료: {temp_dir}")
+            _log_q(f"[1m_NXT] temp 정리 완료: {temp_dir}")
     except Exception as e:
         logging.warning("%s [cleanup] temp 정리 실패: %s", ts_prefix(), e)
 
-    _log("[1m_NXT] 프로그램 종료")
+    _log(f"[1m_NXT] 다운로드 완료 (세션={session}, 총 {len(merged)}건) → 프로그램 종료")
 
 
 if __name__ == "__main__":

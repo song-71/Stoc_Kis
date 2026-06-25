@@ -231,7 +231,7 @@ def main():
         target_codes = TARGET_CODES
 
     total_codes = len(target_codes)
-    progress_state = {"next_pct": 10, "tele_sent": False}
+    progress_state = {"next_pct": 10}
 
     def _report_progress(idx: int) -> None:
         if total_codes <= 0:
@@ -240,12 +240,8 @@ def main():
         while pct >= progress_state["next_pct"]:
             cur = progress_state["next_pct"]
             line = f"전체 데이터중 {cur}%({idx}/{total_codes}건) 수신"
-            # 텔레그램은 중간(50% 도달) 1회만 "다운로드 중", 나머지 단계는 로그전용
-            if cur >= 50 and not progress_state["tele_sent"]:
-                progress_state["tele_sent"] = True
-                _log_tm_and_info(f"[1m_ohlcv] 다운로드 중 … {line}")
-            else:
-                _log_info_only(line)
+            # 진행 단계는 로그전용 (텔레그램은 시작/완료 메시지만 전송)
+            _log_info_only(line)
             progress_state["next_pct"] += 10
 
     out_dir = Path(__file__).resolve().parent / "data" / "1m_data"
@@ -532,8 +528,8 @@ def main():
         _log_tm_and_info("[1m_ohlcv] 임시 parquet 파일이 없습니다.")
         _log_info_only("[1m_ohlcv_All_code_download] 프로그램 종료")
         return
-    # ★ 다운로드(수신) 완료 — 총 소요시간 포함 (텔레그램)
-    _log_tm_and_info(f"[1m_ohlcv] 다운로드 완료 (총 {total_codes}종목, 소요 {_fmt_elapsed(time.time() - _t_start)})")
+    # 다운로드(수신) 완료 — 로그전용 (완료 텔레그램은 파일병합 완료 1건으로 통합)
+    _log_info_only(f"[1m_ohlcv] 다운로드 완료 (총 {total_codes}종목, 소요 {_fmt_elapsed(time.time() - _t_start)})")
     _log_info_only(f"[1m_ohlcv] 데이터 병합 시작 (임시 파일 {len(temp_files)}개)")
     merged = pd.concat([pd.read_parquet(p) for p in temp_files], ignore_index=True)
 
@@ -574,8 +570,11 @@ def main():
     # 요약 출력이 완전히 끝난 뒤 로그를 남기도록 순서 보장
     time.sleep(0.2)
     logging.info("%s 저장 완료: %s", ts_prefix(), parquet_path)
-    # ★ 파일병합 완료 (텔레그램)
-    _log_tm_and_info(f"[1m_ohlcv] 파일병합 완료: {parquet_path.name} (총 {len(merged)}건)")
+    # ★ 완료 (텔레그램) — 다운로드·병합 통합 완료 메시지
+    _log_tm_and_info(
+        f"[1m_ohlcv] 다운로드·병합 완료: {parquet_path.name} "
+        f"(총 {total_codes}종목 {len(merged)}건, 소요 {_fmt_elapsed(time.time() - _t_start)})"
+    )
 
     # ── S3 업로드 ──
     try:

@@ -1,6 +1,6 @@
 # Stoc_Kis Trading Project — Main Plan
 
-_Last updated: 2026-06-04 (by: intent-tracker)_
+_Last updated: 2026-06-23 (by: intent-tracker)_
 _Source: `ws_realtime_trading.py` 운영 흐름 + 사용자 의도_
 
 이 문서는 Stoc_Kis 프로젝트의 **운영 의도·방향·판정 기준**의 단일 소스다.
@@ -24,6 +24,7 @@ _Source: `ws_realtime_trading.py` 운영 흐름 + 사용자 의도_
 4. **거래용 계좌 순회는 `_iter_enabled_accounts(trade_only=True)` 로 `trade_enabled=false` 제외**
 5. **VI 매수는 `exclude_cash` 무시, `INIT_CASH` 기반 수량 계산** (test_mode=1주 고정)
 6. **잔고조회는 `kis_inquire_balance_simple.fetch_balance_simple()` 경로로 통일** (검증된 심플 경로)
+7. **로그파일 자율 확인 허용**: 에러·증상 점검 목적의 로그/진단 파일(`out/**`, `data/logs/**`, `data/**`, `*.out`) 확인은 사용자 사전 확인 없이 Claude 가 직접 수행한다 (읽기 전용). 권한은 `.claude/settings.local.json` 의 `Read(...)` allow 로 보장. 단, 파일 **수정/삭제/이동**은 이 규칙에 포함되지 않으며 별도 확인이 필요하다.
 
 ### 데일리 스크립트 휴일 가드 의무
 
@@ -253,6 +254,29 @@ _(배경: str2 전략(전일 상한가 종목 매수/매도)을 서버 라이브
 - **no_sell_codes**: 매도 금지 종목 리스트 (config.json)
 - **`trade_enabled` 필드 값**: JSON 소문자 `true` / `false`
 
+### NXT 1분봉 데이터 수집 (`kis_1m_API_to_Parquet_NXT.py`) — 하루 2회 분리 운영
+
+**운영 방식 (2026-06-23 변경 — 기존 저녁 1회 일괄 → 아침/저녁 2회 분리)**
+
+| 실행 시각 | 크론 | 세션 인수 | 수집 대상 | 목적 |
+|---|---|---|---|---|
+| 09:05 KST (평일) | crontab | `--session=morning` | NXT 프리마켓(08:00~08:50) | 당일 오전 분석 시 당일 프리마켓 데이터 즉시 확보 |
+| 20:01 KST (평일) | crontab | `--session=evening` | NXT 애프터마켓(15:40~20:00) | 아침 파일과 병합하여 하루치 완성 |
+
+**병합 원칙 (저녁 실행 시)**:
+- 아침 프리마켓 파일을 **다시 받지 않는다**.
+- 최종 저장 시 아침 파일과 `date,time,code` 기준 중복제거 후 병합하여 하루치 완성.
+
+**세션 자동판정 (인수 미지정 시)**:
+- KST 12:00 이전 실행 → `morning` 세션으로 자동처리
+- KST 12:00 이후 실행 → `evening` 세션으로 자동처리
+
+**예외/복구**:
+- 아침 실행이 누락된 날은 저녁에 `--session=full`(프리+애프터 둘 다)로 수동 보강 가능.
+
+**조회 기준점 보강 (2026-06-23 확정)**:
+- NXT 프리마켓 첫 봉은 08:00 정각. 조회 기준점에 `081000` 추가로 08:00 봉까지 포함. (기존: 08:01부터만 수집 → 08:00 봉 누락이었음)
+
 ---
 
 ## 3. 관측 포인트 & 이상 판정 기준 (Claude 검토 기준)
@@ -316,3 +340,4 @@ _신규 항목은 `changelog-manager` 에이전트가 append._
 - 2026-05-26 (intent-tracker) — WSS 자동복구 표준 패턴 4개 항목 수립 (send_request timeout 필수, 무수신 watchdog 독립 스레드, 활성 시간창 09:00~15:20, 연속실패 os._exit 에스컬레이션). 커밋 04f9e92
 - 2026-05-26 (intent-tracker) — 매도 체결 텔레그램 필수 정보 원칙 수립 (매수가+사유+PNL 포함 의무). 커밋 04f9e92
 - 2026-06-04 (intent-tracker) — REST access_token 공유 표준 수립. 캐시 파일명 a1/a2 단일 체계 통일, appkey당 1발급+공용 재사용, /oauth2/tokenP 직접 호출 금지. 260604 파편화로 인한 카톡 알림톡 다발 사고 재발 방지.
+- 2026-06-23 (intent-tracker) — NXT 1분봉 수집 저녁 1회 일괄 → 아침(09:05, morning=프리마켓)/저녁(20:01, evening=애프터마켓) 2회 분리 운영으로 변경. 저녁에 아침 파일과 date,time,code 중복제거 병합. full 세션 복구 옵션 추가. 08:00 봉 누락 보강(081000 기준점 추가).

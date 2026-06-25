@@ -94,6 +94,13 @@ MARKET_CLOSE = "15:30"
 # 이 표식이 (15:30 이후에) 보이면 모니터도 일일 리뷰 후 정상 종료한다.
 NORMAL_EOD_EXIT_PATTERN = re.compile(r"\[scheduler\] EXIT 모드 정리 완료")
 
+# 신호(SIGTERM/SIGINT)에 의한 종료 표식 — 수동 재시작/중지(ws_realtime_trading_Restart.py),
+# watchdog 재시작, restart 스크립트 등이 보내는 신호를 프로덕션의 _shutdown("signal=NN")가
+# 로그로 남긴다. 정상 EOD 종료([scheduler] EXIT)와 구분해 "수동 강제종료"로 표시한다.
+SIGNAL_SHUTDOWN_PATTERN = re.compile(r"\[shutdown\]\s*signal=(\d+)")
+# 신호 종료 직후 os._exit(좀비 thread) 줄을 같은 수동종료로 묶는 시간창(초)
+SIGNAL_SHUTDOWN_WINDOW_SEC = 30
+
 
 class LogMonitor:
     def __init__(self):
@@ -127,15 +134,39 @@ class LogMonitor:
         # 추가 CRITICAL 패턴 (watchdog 강제 종료, 시스템 재시작)
         for pat, cat in CRITICAL_PATTERNS_EXTRA:
             if pat.search(line):
-                # os._exit 정상 종료(EOD)는 장 마감(15:30) 이후엔 CRITICAL 오탐이므로
-                # 비정상종료와 동일하게 INFO(정상종료)로 강등한다.
-                if cat == "시스템강제종료" and self._extract_time(line) >= MARKET_CLOSE:
-                    return ("INFO", "정상종료")
+                # os._exit / '강제 종료' 류는 종료코드·문맥으로 세분 분류한다.
+                # (정상종료 / 정상재시작 / 강제종료예고 / 비정상강제종료)
+                if cat == "시스템강제종료":
+                    return self._classify_exit(line)
                 return ("CRITICAL", cat)
         for pat, cat in MODERATE_PATTERNS:
             if pat.search(line):
                 return ("MODERATE", cat)
         return ("INFO", "")
+
+    def _classify_exit(self, line: str) -> tuple[str, str]:
+        """os._exit / '강제 종료' 류 로그를 종료코드·문맥으로 세분 분류한다.
+
+        - watchdog 예고문('... 프로세스 강제 종료 예정')  → INFO  강제종료예고 (실제 종료 아님)
+        - os._exit(0) + scheduler EXIT(EOD 정리 완료)      → INFO  정상종료
+        - os._exit(0) (좀비 thread 차단 등 재시작 절차)     → INFO  정상재시작
+        - os._exit(N≠0) (watchdog 무수신 자폭 등)          → CRITICAL 비정상강제종료
+        """
+        # 1) 예고문: 실제 종료가 아니라 '~ 예정' 경고일 뿐
+        if "예정" in line:
+            return ("INFO", "강제종료예고")
+        # 2) 종료 코드로 정상/비정상 구분
+        m = re.search(r"os\._exit\((\d+)\)", line)
+        if m:
+            if int(m.group(1)) == 0:
+                # 종료코드 0 = 정상. EOD 정리 종료와 단순 재시작 절차를 구분한다.
+                if NORMAL_EOD_EXIT_PATTERN.search(line) or "[scheduler]" in line:
+                    return ("INFO", "정상종료")
+                return ("INFO", "정상재시작")
+            # 종료코드가 0이 아니면 비정상 강제종료
+            return ("CRITICAL", "비정상강제종료")
+        # 3) 종료코드가 안 보이는 '프로세스 강제 종료' 류 — 보수적으로 비정상 처리
+        return ("CRITICAL", "비정상강제종료")
 
     # ─── 중복 억제 ──────────────────────────────────────────────────
     def _dedup_key(self, category: str, line: str) -> str:
@@ -143,6 +174,10 @@ class LogMonitor:
         if category == "Traceback":
             # Traceback은 마지막 줄(에러 메시지)로 시그니처
             return f"TB:{line.strip()[-100:]}"
+        if category == "비정상강제종료":
+            # 한 번의 강제종료가 예고/실행 등 여러 줄로 찍혀 중복 집계되지 않도록
+            # 분(分) 단위로 묶는다 (같은 분의 os._exit 라인은 1건으로).
+            return f"비정상강제종료:{self._extract_time(line)}"
         return f"{category}:{line.strip()[-80:]}"
 
     def _is_duplicate(self, key: str) -> bool:
@@ -430,6 +465,13 @@ class LogMonitor:
             key = self._dedup_key(category, line)
             if not self._is_duplicate(key):
                 self._handle_moderate(category, line.strip())
+        elif severity == "INFO" and category in ("정상종료", "정상재시작", "강제종료예고"):
+            # 정상 생명주기 이벤트 — 경보(텔레그램/Claude)는 울리지 않고
+            # 일일 리포트에 INFO 건수로만 '표시'한다.
+            key = self._dedup_key(category, line)
+            if not self._is_duplicate(key):
+                self.daily_stats[f"INFO_{category}"] += 1
+                self._log_issue(line.strip(), "INFO", category)
 
         # 프로덕션 정상 종료(EOD) 감지 → 일일 리뷰 후 모니터도 정상 종료
         if (self._extract_time(line) >= MARKET_CLOSE

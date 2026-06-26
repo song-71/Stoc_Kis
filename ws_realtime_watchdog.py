@@ -12,6 +12,12 @@ ws_realtime_trading.py 워치독 (강제 종료 전용)
   2) 현재 KST 시각이 20:00 이후이고, ws_realtime_trading.py 프로세스가 살아있음
      → status 무관하게 SIGTERM → 5초 → SIGKILL
 
+[자체 종료]
+- 20:00(NIGHT_KILL_HOUR) 이후 점검에서 위 규칙 2 처리까지 끝나 감시 대상이
+  하나도 남지 않으면, 워치독도 스스로 종료한다.
+  → 장 마감 후 새벽까지 5분마다 빈 점검 로그를 남기던 노이즈 제거.
+  → 다음 영업일 08:25 cron 이 다시 기동.
+
 [배경]
 - 4/28 ~ 5/6 사건: 종료 신호 후에도 kws.start() 의 자동 reconnect 루프가
   47시간 좀비로 살아남아 같은 IP 에서 KIS WSS 에 폭주 reconnect 시도 → IP 단위 throttle
@@ -165,7 +171,8 @@ def _force_kill(pids: list[int], reason: str) -> None:
         _log(f"[FORCE_KILL] SIGTERM 으로 모두 종료 확인")
 
 
-def _check_once() -> None:
+def _check_once() -> bool:
+    """1회 점검. 반환값 True 이면 (장 마감·야간 정리 완료) 워치독 자체 종료."""
     now = datetime.now(KST)
     pids = _find_target_pids()
     status = _read_status()
@@ -176,13 +183,23 @@ def _check_once() -> None:
         f"hhmm={now.strftime('%H:%M')} night_window={is_night}"
     )
 
-    if not pids:
-        return
-
-    # 규칙 2: 20:00 이후 살아있으면 무조건 강제 종료
+    # 규칙 2 + 자체 종료: 20:00 이후
+    #  - 잔존 프로세스가 있으면 강제 종료(기존 안전망 그대로 유지)
+    #  - 정리 완료(잔존 없음)되면 워치독도 스스로 종료 → 야간 빈 점검 로그 제거
     if is_night:
-        _force_kill(pids, reason=f"{NIGHT_KILL_HOUR}:00 이후 잔존 (status={status})")
-        return
+        if pids:
+            _force_kill(pids, reason=f"{NIGHT_KILL_HOUR}:00 이후 잔존 (status={status})")
+            if _find_target_pids():
+                # 아직 잔존 → 종료하지 말고 다음 주기에 재시도
+                return False
+        _log(
+            f"[shutdown] {NIGHT_KILL_HOUR}:00 이후 감시 대상 없음 — 워치독 자체 종료",
+            tele=True,
+        )
+        return True
+
+    if not pids:
+        return False
 
     # 규칙 1: status=2 인데 프로세스 살아있음 → 좀비
     if status == RUNTIME_STATUS_STOPPED:
@@ -190,22 +207,28 @@ def _check_once() -> None:
             pids,
             reason=f"config status={status}(STOPPED) 인데 프로세스 잔존 (좀비 의심)",
         )
-        return
+        return False
 
     # 정상 (status=1 + 시각 < 20:00 + 프로세스 살아있음)
+    return False
 
 
 def main() -> int:
     _log(
         f"[start] {PROGRAM_NAME} interval={CHECK_INTERVAL_SEC}s "
-        f"target={TARGET_SCRIPT} night_kill_after={NIGHT_KILL_HOUR}:00",
+        f"target={TARGET_SCRIPT} night_kill_after={NIGHT_KILL_HOUR}:00 "
+        f"(자체 종료: {NIGHT_KILL_HOUR}:00 이후 정리 완료 시)",
         tele=True,
     )
     while True:
         try:
-            _check_once()
+            should_exit = _check_once()
         except Exception as e:
             _log(f"[check_once] 예외: {type(e).__name__}: {e}")
+            should_exit = False
+        if should_exit:
+            _log("[stop] 장 마감 후 정리 완료 — 워치독 정상 종료", tele=True)
+            return 0
         time.sleep(CHECK_INTERVAL_SEC)
 
 

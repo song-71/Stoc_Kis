@@ -12,6 +12,13 @@ ws_realtime_trading.py 워치독 (강제 종료 전용)
   2) 현재 KST 시각이 20:00 이후이고, ws_realtime_trading.py 프로세스가 살아있음
      → status 무관하게 SIGTERM → 5초 → SIGKILL
 
+[개장일에만 가동]
+- 기동 시 kis_utils.is_holiday() 로 오늘 개장 여부를 확인한다.
+  휴장일이면 감시 루프에 진입하지 않고 즉시 정상 종료한다.
+  → cron 은 평일(KST 월~금)만 기동하나 한국 공휴일은 거르지 못하므로,
+    공휴일에 떠도 곧장 종료해 불필요한 가동을 막는다.
+  → 판단 실패(API/토큰 오류) 시에는 개장일로 간주하고 가동(안전망 우선).
+
 [자체 종료]
 - 20:00(NIGHT_KILL_HOUR) 이후 점검에서 위 규칙 2 처리까지 끝나 감시 대상이
   하나도 남지 않으면, 워치독도 스스로 종료한다.
@@ -51,6 +58,13 @@ try:
     from telegMsg import tmsg
 except Exception:
     tmsg = None
+
+try:
+    # 국내휴장일조회 API(opnd_yn) + config today_open_chk 캐시 기반 단일 판단 함수.
+    # 메인 트레이딩(ws_realtime_trading.py)과 동일 소스 사용.
+    from kis_utils import is_holiday
+except Exception:
+    is_holiday = None
 
 KST = timezone(timedelta(hours=9))
 PROGRAM_NAME = Path(__file__).name
@@ -214,6 +228,23 @@ def _check_once() -> bool:
 
 
 def main() -> int:
+    # 개장일에만 가동: 휴장일이면 감시 루프 없이 즉시 종료
+    if is_holiday is not None:
+        try:
+            holiday = is_holiday()
+        except Exception as e:
+            _log(
+                f"[start] 휴장일 판단 실패({type(e).__name__}: {e}) "
+                f"— 안전하게 개장일로 간주하고 가동",
+                tele=True,
+            )
+            holiday = False
+        if holiday:
+            _log("[start] 오늘은 휴장일 — 워치독 미가동, 즉시 종료", tele=True)
+            return 0
+    else:
+        _log("[start] is_holiday 임포트 실패 — 휴장일 확인 없이 가동")
+
     _log(
         f"[start] {PROGRAM_NAME} interval={CHECK_INTERVAL_SEC}s "
         f"target={TARGET_SCRIPT} night_kill_after={NIGHT_KILL_HOUR}:00 "

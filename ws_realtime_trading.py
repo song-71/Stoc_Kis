@@ -74,7 +74,14 @@ CODE_TEXT = """
 """
 
 # Top5 추가 구독 (False면 CODE_TEXT만 18:00까지 수신, Top50 다운/저장만 수행)
-TOP5_ADD = True   # False: Top50 다운·저장 O, Top5 추가/해제/종가매매전환/미수신구독해제 X
+# [260630] False 로 전환 — top30 동적 구독 추가/제거 중단(전일 상한가 데이터수집 모드).
+#          base_codes(=전일 상한가 morning_target)는 그대로 보호 구독·저장됨.
+#          ★ False 시 함께 비활성화되는 것:
+#            - top30 동적 구독 추가/제거(30분 간격 5개씩 추가 / 20%↓ 해제 / LRU 해제)
+#            - 미수신 구독 10분 경과 해제
+#            - 종가매매 종목 선정(15:19) 및 종가매매 구독 전환(15:20)  ← 종가매매 매수 사실상 중단
+#          ★ 필요 시 True 로 되돌리면 기존 동작(top30 추가/제거 + 종가매매선정/전환) 그대로 복원.
+TOP5_ADD = False  # True: Top5 추가/해제/종가매매선정·전환(15:19/15:20)/미수신구독해제 O / False: Top50 다운·저장만, 위 동작 전부 X
 
 # 한도 초과 시 폴백 계정 사용 여부 (True: 한도 초과 시 계정2(syw_2)로 재시도)
 USE_FALLBACK_ACCOUNT = False
@@ -8519,7 +8526,8 @@ def _on_market_status_krx(result) -> None:
                 msg = (f"{ts_prefix()} [VI발동] {name}({code}) "
                        f"vi_cls={vi_cls} ({cnt}회차)")
                 logger.warning(msg)
-                _notify(msg, tele=True)
+                # [260630] VI 발생현황은 텔레그램 제거 → 로그만 (서킷/사이드카만 텔레 유지)
+                _notify(msg)
             elif was_active and not is_active:            # 발동 → 해제
                 _vi_exp_sub_restore(code)
                 _vi_end_ts[code] = datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S")
@@ -8528,7 +8536,8 @@ def _on_market_status_krx(result) -> None:
                 msg = (f"{ts_prefix()} [VI해제] {name}({code}) "
                        f"vi_cls={vi_cls}")
                 logger.info(msg)
-                _notify(msg, tele=True)
+                # [260630] VI 발생현황은 텔레그램 제거 → 로그만 (서킷/사이드카만 텔레 유지)
+                _notify(msg)
                 # H0STMKO0 동적 구독 해제 (keepalive/보유 종목 제외)
                 keepalive_set = set(_mkt_keepalive_current.values())
                 if code not in keepalive_set:

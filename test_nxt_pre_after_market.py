@@ -456,10 +456,26 @@ def sleep_until(hms: tuple[int, int, int], grace_sec: int = 90) -> bool:
 # ─────────────────────────────────────────────────────────────────────────────
 def run_round_trip(client: KisClient, acct: dict, target: dict, label: str,
                    sell_hms: tuple[int, int, int] | None = None,
-                   sell_after_sec: int = 60) -> None:
+                   sell_after_sec: int = 60, use_limit: bool = False) -> None:
+    """
+    use_limit=True 면 시장가(01) 대신 지정가(00)로 매매한다.
+    (NXT 프리마켓은 시장가 주문 불가 — KIS APBK0918 '[프리마켓] 시장가 매매 불가 시간'.
+     체결을 위해 기준가 대비 매수는 +1%, 매도는 −1% 의 '시장가성 지정가'로 넣어
+     호가를 가로질러 체결되게 하되 슬리피지는 1% 로 제한한다.)
+    """
     code, name = target["code"], target["name"]
-    notify(f"=== [{label}] 시작: {name}({code}) NXT 시장가 1주 매수 ===")
-    buy = order_cash(client, acct, "buy", code, ORDER_QTY, 0, "01", EXCG_NXT)
+    ref = float(target.get("price") or 0)
+    if use_limit:
+        ord_dvsn = "00"
+        buy_px = round_to_tick(ref * 1.01) if ref > 0 else 0
+        sell_px = round_to_tick(ref * 0.99) if ref > 0 else 0
+        px_desc = f"지정가 매수{int(buy_px):,}/매도{int(sell_px):,}원(기준 {int(ref):,})"
+    else:
+        ord_dvsn = "01"
+        buy_px = sell_px = 0
+        px_desc = "시장가"
+    notify(f"=== [{label}] 시작: {name}({code}) NXT {px_desc} 1주 매수 ===")
+    buy = order_cash(client, acct, "buy", code, ORDER_QTY, buy_px, ord_dvsn, EXCG_NXT)
     notify(f"[{label}] 매수 접수확인(REST) ok={buy['ok']} 주문번호={buy['odno']} msg={buy['msg']}")
 
     # 매도 시각까지 대기 (매수 +1분)
@@ -475,14 +491,14 @@ def run_round_trip(client: KisClient, acct: dict, target: dict, label: str,
     logger.info(f"{_ts()} [{label}] 매수 후 보유수량={hold}")
     sell_qty = ORDER_QTY if hold < 0 else min(hold, ORDER_QTY)
     if sell_qty <= 0:
-        notify(f"[{label}] ⚠ 매수 미체결 추정(보유 0) → 매도 스킵. (NXT {label} 시장가 매수 미체결 점검 필요)")
+        notify(f"[{label}] ⚠ 매수 미체결 추정(보유 0) → 매도 스킵. (NXT {label} 매수 미체결 점검 필요)")
         # 혹시 미체결 매수주문이 남아있으면 취소
         if buy["ok"] and buy["odno"] not in ("", "DRYRUN"):
-            cancel_order(client, acct, buy["odno"], buy["orgno"], code, ORDER_QTY, "01", EXCG_NXT)
+            cancel_order(client, acct, buy["odno"], buy["orgno"], code, ORDER_QTY, ord_dvsn, EXCG_NXT)
         return
 
-    notify(f"=== [{label}] {name}({code}) NXT 시장가 {sell_qty}주 매도 ===")
-    sell = order_cash(client, acct, "sell", code, sell_qty, 0, "01", EXCG_NXT)
+    notify(f"=== [{label}] {name}({code}) NXT {'지정가' if use_limit else '시장가'} {sell_qty}주 매도 ===")
+    sell = order_cash(client, acct, "sell", code, sell_qty, sell_px, ord_dvsn, EXCG_NXT)
     notify(f"[{label}] 매도 접수확인(REST) ok={sell['ok']} 주문번호={sell['odno']} msg={sell['msg']}")
     notify(f"=== [{label}] 종료 ===")
 
@@ -582,10 +598,10 @@ def main() -> None:
 
     # 단일 단계 즉시 실행
     if args.phase == "premarket":
-        run_round_trip(client, acct, target, "프리마켓", sell_hms=None, sell_after_sec=60)
+        run_round_trip(client, acct, target, "프리마켓", sell_hms=None, sell_after_sec=60, use_limit=True)
         return
     if args.phase == "aftermarket":
-        run_round_trip(client, acct, target, "애프터마켓", sell_hms=None, sell_after_sec=60)
+        run_round_trip(client, acct, target, "애프터마켓", sell_hms=None, sell_after_sec=60, use_limit=True)
         return
     if args.phase == "cancel":
         run_opening_cancel(client, acct, target)
@@ -594,12 +610,24 @@ def main() -> None:
     # ── 종일 스케줄러 ──
     notify("[스케줄러] ① 프리마켓 08:05 / ② 취소점검 08:50~09:00 / ③ 애프터마켓 15:45 대기 시작")
 
-    # ① 프리마켓
-    if sleep_until(T_PRE_BUY, grace_sec=120):
+    # ① 프리마켓 (NXT 08:00~08:50)
+    #   08:05 매수목표를 놓쳤어도 "프리마켓 장중"이면 즉시 실행한다.
+    #   (08:48 이후엔 취소점검(08:50:05)과 겹치고 프리마켓 마감이 임박하므로 스킵)
+    now = datetime.now(KST)
+    pre_buy_target = _target_dt(T_PRE_BUY)
+    pre_market_close = _target_dt((8, 48, 0))
+    if now < pre_market_close:
+        if now > pre_buy_target:
+            notify(f"[프리마켓] 매수목표(08:05) 경과했으나 프리마켓 장중 → 즉시 매수 실행 "
+                   f"(현재 {now.strftime('%H:%M:%S')})")
+        else:
+            sleep_until(T_PRE_BUY, grace_sec=120)
         try:
-            run_round_trip(client, acct, target, "프리마켓", T_PRE_SELL)
+            run_round_trip(client, acct, target, "프리마켓", T_PRE_SELL, use_limit=True)
         except Exception as e:
             notify(f"[프리마켓] 예외: {e}")
+    else:
+        notify(f"[프리마켓] 프리마켓 마감 임박/종료(08:48 이후, 현재 {now.strftime('%H:%M:%S')}) → 스킵")
 
     # ② 09:00 전 취소점검
     if sleep_until(T_CANCEL_A_PLACE, grace_sec=120):
@@ -611,7 +639,7 @@ def main() -> None:
     # ③ 애프터마켓
     if sleep_until(T_AFTER_BUY, grace_sec=120):
         try:
-            run_round_trip(client, acct, target, "애프터마켓", T_AFTER_SELL)
+            run_round_trip(client, acct, target, "애프터마켓", T_AFTER_SELL, use_limit=True)
         except Exception as e:
             notify(f"[애프터마켓] 예외: {e}")
 

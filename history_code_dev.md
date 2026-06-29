@@ -2,6 +2,30 @@
 
 ---
 
+## [2026-06-30] ca18b55
+- **Category**: feat
+- **Title**: TOP5_ADD=False 데이터수집 모드 전환 · VI텔레그램 제거 · 실시간 호가기록기 신규
+- **Files**: `ws_realtime_trading.py`, `orderbook_recorder.py` (신규), `test_nxt_pre_after_market.py`
+- **Changes**:
+  1. **`ws_realtime_trading.py` — TOP5_ADD True→False 전환**
+     - top30 동적 WSS 구독 추가/제거 중단(전일 상한가 데이터수집 모드)
+     - base_codes(=전일 상한가 morning_target) 보호 구독·저장은 그대로 유지
+     - False 시 비활성: top30 30분 5개 추가 / 20%↓ 해제 / LRU 해제, 미수신 10분 경과 해제, 종가매매 종목 선정(15:19)·구독 전환(15:20) → 종가매매 매수 사실상 중단
+     - True 복원 시 기존 동작 전체 자동 복원
+  2. **`ws_realtime_trading.py` — VI 발동·해제 텔레그램 제거**
+     - `[VI발동]`/`[VI해제]` 알림: `_notify(msg, tele=True)` → `_notify(msg)` (로그·콘솔만 유지)
+     - 서킷브레이커·사이드카·`[VI매도]` 텔레그램은 그대로 유지
+  3. **`orderbook_recorder.py` 신규 — 실시간 호가(H0STASP0) 기록기**
+     - a2 계정 독립 접속(프로덕션 a1 approval_key 무효화 방지)
+     - 전일 상한가 ST 전체 다종목 구독(`_select_codes`, `--code` 쉼표 다중 지정)
+     - parquet 조각+병합 저장(수신→메모리 버퍼→flush 주기 조각 기록, 종료 시 단일 parquet 병합, 조각은 parts/ 백업 보존)
+     - 출력: `data/wss_data/orderbook/{YYMMDD}_orderbook_{code}.parquet`
+  4. **`test_nxt_pre_after_market.py` — 프리마켓·애프터마켓 지정가 지원**
+     - `use_limit=True` 옵션 추가: 기준가 ±1% 시장가성 지정가(NXT 프리마켓 시장가 불가 대응)
+     - 프리마켓·애프터마켓 단일 실행 기본값을 `use_limit=True` 로 전환
+  5. **기타**: `docs/KIS H0STMKO0 장운영코드 260626` 문의 문서, `ws_monitoring_research_260626.md` 추가
+- **Impact**: 단기과열 상한가 종목 전종목 호가 데이터 수집 인프라 확보. 프로덕션 WSS는 전일 상한가 기반 구독만으로 안정 운영. VI 텔레그램 노이즈 제거로 중요 알림(서킷·VI매도) 가시성 향상.
+
 ## [2026-06-26] 638af7b
 - **Category**: feat
 - **Title**: 워치독 기동 시 휴장일 확인 — 공휴일 빈 가동 방지

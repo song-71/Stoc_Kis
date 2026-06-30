@@ -83,6 +83,7 @@ import kis_auth_llm as ka                       # noqa: E402
 sys.modules["kis_auth"] = ka
 from kis_utils import load_config, load_symbol_master  # noqa: E402
 from domestic_stock_functions_ws import asking_price_krx  # noqa: E402  H0STASP0
+from market_bus import MarketDataBus  # noqa: E402  공유메모리 시장데이터 버스(생산자)
 
 CONFIG_PATH = SCRIPT_DIR / "config.json"
 TARGET_CSV = SCRIPT_DIR / "symulation" / "Select_Tr_target_list.csv"
@@ -342,7 +343,36 @@ class OrderbookStore:
 
 
 _store: OrderbookStore | None = None
+_bus: MarketDataBus | None = None        # 공유메모리 버스(생산자) — 소비자(프로덕션)가 읽음
 _last_progress = 0.0
+
+
+def _rec_int(rec: dict, key: str) -> int:
+    """H0STASP0 레코드 값(문자열)을 정수로. 빈값/오류는 0."""
+    try:
+        return int(float(str(rec.get(key) or 0).replace(",", "") or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _publish_bus(code: str, name: str, rec: dict, recv_epoch: float) -> None:
+    """종목 최신 호가를 공유메모리 버스에 발행(latest-wins). 버스 없으면 무시."""
+    if _bus is None:
+        return
+    try:
+        _bus.update_orderbook(
+            code, recv_epoch,
+            bsop_hour=str(rec.get("bsop_hour") or ""),
+            askp=[_rec_int(rec, f"askp{k}") for k in range(1, 11)],
+            bidp=[_rec_int(rec, f"bidp{k}") for k in range(1, 11)],
+            askp_rsqn=[_rec_int(rec, f"askp_rsqn{k}") for k in range(1, 11)],
+            bidp_rsqn=[_rec_int(rec, f"bidp_rsqn{k}") for k in range(1, 11)],
+            total_askp_rsqn=_rec_int(rec, "total_askp_rsqn"),
+            total_bidp_rsqn=_rec_int(rec, "total_bidp_rsqn"),
+            name=name,
+        )
+    except Exception:
+        pass
 
 
 def on_result(ws, tr_id, result, data_info):
@@ -364,8 +394,12 @@ def on_result(ws, tr_id, result, data_info):
         if not c or c == "000000":
             continue
         by_code.setdefault(c, []).append(rec)
+    recv_epoch = time.time()
     for c, recs in by_code.items():
         _store.add(c, recv_ts, recs)
+        # 버스에는 그 종목의 최신 1건만 발행(전략은 현재 호가상태만 필요)
+        if _bus is not None and c in _store.allowed:
+            _publish_bus(c, _store.name_map.get(c, c), recs[-1], recv_epoch)
 
     now = time.time()
     if now - _last_progress >= 5.0:
@@ -425,11 +459,12 @@ def _arm_until(until_hhmm: str) -> None:
 # main
 # ============================================================================
 def main() -> None:
-    global _store
-    ap = argparse.ArgumentParser(description="전일 상한가 종목 실시간 호가(H0STASP0) 기록기 (a2 계정, parquet)")
+    global _store, _bus
+    ap = argparse.ArgumentParser(description="전일 상한가 종목 실시간 호가(H0STASP0) 기록기 (a2 계정, parquet + 공유메모리 버스)")
     ap.add_argument("--code", default=None, help="종목코드(6자리, 쉼표로 여러 개). 미지정 시 전일 상한가 ST 전체")
     ap.add_argument("--until", default="15:40", help="종료 시각 HH:MM (KST, 기본 15:40)")
     ap.add_argument("--flush", type=float, default=20.0, help="parquet flush 주기(초, 기본 20)")
+    ap.add_argument("--bus", default="stockbus", help="공유메모리 버스 이름(빈 문자열이면 버스 비활성)")
     args = ap.parse_args()
 
     _setup_a2_auth()
@@ -440,6 +475,16 @@ def main() -> None:
 
     yymmdd = datetime.now(KST).strftime("%y%m%d")
     _store = OrderbookStore(OUT_DIR, yymmdd, name_map, allowed)
+
+    # 공유메모리 버스(생산자) — 프로덕션 등 소비자가 실시간 호가를 읽음
+    if args.bus:
+        try:
+            _bus = MarketDataBus.create(args.bus, capacity=256)
+            _bus.set_codes(codes)
+            _log(f"공유메모리 버스 생성: '{args.bus}' ({len(codes)}종목 슬롯 배정)")
+        except Exception as e:
+            _bus = None
+            _log(f"⚠ 버스 생성 실패(저장만 진행): {type(e).__name__}: {e}")
 
     _arm_flush(args.flush)
     _arm_until(args.until)
@@ -462,6 +507,8 @@ def main() -> None:
             _log(f"종료 — 종목={_store.code_count()}/{len(allowed)} frames={_store.frames} "
                  f"rows={_store.rows} 제외={_store.dropped()} parts={_store.parts_written} "
                  f"| 병합 총 {n}행 → {_store._final_path().name}")
+        if _bus is not None:
+            _bus.close(unlink=True)
 
 
 if __name__ == "__main__":

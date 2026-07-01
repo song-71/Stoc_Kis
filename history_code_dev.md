@@ -2,6 +2,38 @@
 
 ---
 
+## [2026-06-30] f6aad4e
+- **Category**: feat
+- **Title**: 시장데이터 공유메모리 버스 도입 · 호가기록기 생산자 배선 · VI전환 검증 테스트
+- **Files**: `market_bus.py` (신규), `ws_orderbook_recorder.py` (수정), `test_vi_switch_exp_to_real.py` (신규)
+- **Changes**:
+  1. **`market_bus.py` 신규 — 락 없는 시장데이터 공유메모리 버스**
+     - `multiprocessing.shared_memory` + `numpy` 구조화 슬롯으로 프로세스 간 데이터 공유
+     - seqlock(쓰기 홀수→짝수, 읽기 전후 seq 동일+짝수 검증)으로 torn read 방지
+     - latest-wins 방식: 생산자 비차단, 소비자는 항상 최신 호가 상태만 읽음
+     - 헤더 `generation` 필드로 구독목록 변경 시 소비자 code→슬롯 매핑 자동 재구성
+     - 슬롯 구성: 코드/종목명/recv_epoch/거래소시각(bsop_hour) + 10호가(매도·매수) + 10잔량 + 매도/매수 총잔량
+     - `MarketDataBus.create(name, capacity)` / `attach(name)` / `update_orderbook` / `read_orderbook` / `close(unlink)` API
+     - `__main__` 자체검증(생산자→소비자 라운드트립, torn read 없음) 통과
+     - 목적: 호가를 한 번 수신해 공유메모리에 올리고 프로덕션·다계좌·다인 소비자가 읽는 단일출처. 다계좌 수평확장 토대.
+  2. **`ws_orderbook_recorder.py` 수정 — 생산자 배선**
+     - `--bus` 옵션 추가(기본 `"stockbus"`, 빈 문자열이면 버스 비활성)
+     - `on_result` 에서 parquet 저장과 동시에 `MarketDataBus.update_orderbook` 으로 종목별 최신 1건 발행
+     - `_publish_bus` / `_rec_int` 헬퍼 추가(문자열 호가 필드 → 정수 변환)
+     - 종료 시 `_bus.close(unlink=True)` 로 공유메모리 회수
+     - 버스 생성 실패 시 예외 포착 후 저장 전용 모드로 계속 진행
+  3. **`test_vi_switch_exp_to_real.py` 신규 — VI 해제 기준 실시간체결 전환 검증 테스트**
+     - 프로덕션 미적용 상태에서 "VI 해제 순간 예상체결→실시간체결 전환" 타당성 검증
+     - a2 독립 WSS 접속(프로덕션 approval_key 무효화 방지)
+     - 09:00:05 상승률 상위 조회 → 전일대비 +15% 최상위 1종목 선정
+     - H0STANC0(예상체결) + H0STMKO0(장운영정보) 동시 구독
+     - H0STMKO0 의 `vi_cls_code` 로 VI 발동(비0)/해제(0) 추적
+     - VI 해제 순간 워커 스레드에서 H0STANC0 해제 + H0STCNT0(실시간체결) 전환(`send_request`)
+     - `is_holiday` 가드 보유, 장운영 프레임 `data/vi_switch_test/` CSV 저장
+     - 08:55 평일 크론 등록됨
+     - 목적: 현재 프로덕션의 "09:01:59 시각 기준 전환"을 "VI 해제 기준 전환"으로 바꾸는 게 타당한지 실거래일 검증
+- **Impact**: 호가 데이터를 공유메모리 버스로 추상화하는 인프라 확보. 향후 프로덕션이 ws_orderbook_recorder 의 공유메모리를 구독하면 WSS 슬롯 절약 + 다계좌 확장 시 수신 중복 제거 가능. VI 해제 전환 테스트 결과에 따라 프로덕션 09:01:59 전환 로직 개선 여부 결정 예정.
+
 ## [2026-06-30] ca18b55
 - **Category**: feat
 - **Title**: TOP5_ADD=False 데이터수집 모드 전환 · VI텔레그램 제거 · 실시간 호가기록기 신규
@@ -2222,3 +2254,23 @@
   3. **분석 문서 추가**: `ws_monitoring_research_260520.md` — 260520 handshake storm 원인 분석,
      legacy 패치 0-catch 실증, asyncio API 경로 확인, Part A/B 검증 기록.
 - **Impact**: 깨진 UTF-8 바이트로 인한 WSS 1007 단절 근원 차단. 개장 직전 handshake 실패 시 시초 구간 손실 방지.
+
+## [2026-07-01] 23fc7c4
+- **Category**: feat
+- **Title**: VI 공식 해제(vi_cls 'Y'→'N') 순간 실시간체결 전환 신호 추가
+- **Files**: `ws_realtime_trading.py`
+- **Changes**:
+  1. **VI_SWITCH_BY_VICLS 옵션 신설 (~100번 줄)**
+     - True: H0STMKO0 장운영정보에서 vi_cls_code 'Y'→'N' 수신 즉시 실시간체결 전환
+     - False: 기존 방식만 (예상체결 stck_oprc 시가형성 + 09:02 타이머)
+     - True여도 stck_oprc·09:02 타이머는 폴백으로 유지 (H0STMKO0 누락/미발동 대비)
+  2. **_on_market_status_krx VI해제 분기 추가 (~8550번 줄)**
+     - `_vi_delayed_codes`에 있는 종목이 vi_cls 'Y'→'N' 되면 즉시 discard
+     - delayed 셋이 빌 때 `_trigger_ws_rebuild()` 1회만 호출 (재구독 스톰 방지)
+     - 기존 stck_oprc 경로(:13021)와 동일한 rebuild 1회 정책 적용
+     - 260701 실측: 코퍼스코리아 09:02:12 vi_cls 'Y'→'N' 확인 → 기존 방식 대비 더 빠르고 정확
+  3. **안전 설계**
+     - H0STMKO0 는 08:59 [VI관찰-0859]가 이미 구독 중 (delayed ⊆ observed) → 별도 구독 불필요
+     - 260609 붕괴 영역: MKO 전용 스레드에서 실행(메인 체결 수신 비차단), rebuild 1회 제한
+     - 현재 실행 중인 프로세스에 영향 없음, 다음 기동부터 적용
+- **Impact**: 09:00 예상체결 연장 종목의 실시간체결 전환이 VI 공식 해제 시점(vi_cls)에 즉각 이뤄져 구간 진입 타이밍 개선. 기존 폴백 유지로 안전성 확보.

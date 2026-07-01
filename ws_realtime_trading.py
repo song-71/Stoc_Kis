@@ -93,6 +93,11 @@ CLOSE_BUY = True
 STR1_SELL_ENABLED = True
 # VI 발동 매매 옵션: "test_mode"=1주만 매수/매도, "run_mode"=정상 매수/매도, "off"=적용 제외
 VI_TRADE_MODE = "off"
+# [260701] 09:00 예상체결 연장(prdy>=10% 종목) → 실시간체결 전환 신호.
+#   True : 장운영정보(H0STMKO0) vi_cls_code 'Y'→'N'(VI 공식 해제) 순간 즉시 전환 (더 빠르고 정확)
+#   False: 기존 방식만 (예상체결 stck_oprc 시가형성 + 09:02 타이머)
+#   ※ True 여도 stck_oprc·09:02 타이머는 폴백으로 유지(H0STMKO0 누락/미발동 대비). 셋이 빌 때 rebuild 1회.
+VI_SWITCH_BY_VICLS = True
 # 상한가 스톱 연속 이탈 확인 틱 수 (서버 스톱지정가 대신 클라이언트에서 N틱 연속 확인 후 매도)
 STOP_LIMIT_CONFIRM_TICKS = 30
 # 매수가 손절 N틱 연속 이탈 확인 (단일 틱 fake 가격 차단). 임계 회복 시 카운터 리셋.
@@ -8538,6 +8543,18 @@ def _on_market_status_krx(result) -> None:
                 logger.info(msg)
                 # [260630] VI 발생현황은 텔레그램 제거 → 로그만 (서킷/사이드카만 텔레 유지)
                 _notify(msg)
+                # [260701] 09:00 예상체결 연장 종목 → VI 공식 해제(vi_cls 'Y'→'N') 순간 실시간체결 전환.
+                #   기존 신호(예상체결 stck_oprc 시가형성 :12974 / 09:02 타이머 :6135)에 더한 조기·정확 전환.
+                #   rebuild 는 delayed 셋이 빌 때 1회만(스톰 방지, stck_oprc 경로 :13021 과 동일 정책).
+                #   이 핸들러는 260609 수정으로 전용 MKO 스레드에서 실행 → 메인 체결 수신 비차단.
+                if VI_SWITCH_BY_VICLS and code in _vi_delayed_codes:
+                    _vi_delayed_codes.discard(code)
+                    logger.info(
+                        f"{ts_prefix()} [VI지연해제] {name}({code}) vi_cls 'Y'→'N' "
+                        f"→ 실시간체결 전환 (H0STMKO0, 잔여 {len(_vi_delayed_codes)}종목)"
+                    )
+                    if not _vi_delayed_codes:
+                        _trigger_ws_rebuild()
                 # H0STMKO0 동적 구독 해제 (keepalive/보유 종목 제외)
                 keepalive_set = set(_mkt_keepalive_current.values())
                 if code not in keepalive_set:

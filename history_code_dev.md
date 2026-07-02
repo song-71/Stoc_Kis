@@ -2,6 +2,24 @@
 
 ---
 
+## [2026-07-02] 41d3211
+- **Category**: feat
+- **Title**: 프로덕션 호가 레코더 subprocess 기동 + 공유메모리 버스 소비 배선 (호가 통합 A+B)
+- **Files**: `ws_realtime_trading.py`
+- **Changes**:
+  1. **신규 옵션(~107번 줄)**: `ORDERBOOK_ENABLED=True`, `ORDERBOOK_BUS_NAME="stockbus"`, `ORDERBOOK_LOG_SEC=60`
+  2. **A) 레코더 subprocess 기동** — `_start_orderbook_recorder()`
+     - 기존 `ws_orderbook_recorder.py` 인스턴스를 pkill 로 먼저 종료(ALREADY IN USE 방지) 후 subprocess.Popen 으로 재기동
+     - 실행 인자: `--flush 60 --until 15:40 --bus stockbus`, 로그는 `data/wss_data/orderbook/run_{yymmdd}.log`
+     - `main` 의 `run_ws_forever()` 호출 직전에서 기동
+     - `_stop_orderbook_recorder()`: `_shutdown()` 에서 호출해 subprocess 정리
+  3. **B) 공유메모리 버스 소비** — `_orderbook_bus_consumer_loop()` 스레드
+     - `market_bus.MarketDataBus.attach("stockbus")` 를 버스 생성될 때까지 재시도(FileNotFoundError 시 3초 간격)
+     - 60초 주기로 `[orderbook-bus] 수신 N/M종목 | 샘플 …` 을 프로덕션 로그에 기록
+     - 전략용 헬퍼 `_get_orderbook(code)` 추가 — 버스에서 최신 10호가를 마이크로초 단위로 조회(현재 호출처 없음, 전략 배선 대기용으로 의도된 상태)
+  4. **아키텍처**: 1프로세스=1WSS연결 라이브러리 제약으로 인해 호가 수신은 a2 별도 프로세스가 담당하고, 프로덕션(a1)은 공유메모리 버스로 데이터만 소비
+- **Impact**: a2 는 별도 프로세스이므로 a1 의 40슬롯/지연에 영향 없음(0). 라이브 버스 소비자 종단 검증 통과(28/29종목 실시간 호가 조회 확인). 현재 실행 중인 프로세스에는 영향 없고 다음 기동부터 적용(변경 당일은 장중이라 재시작하지 않음). 전략 로직에서 `_get_orderbook()` 을 호출하도록 배선하면 호가 기반 매수/매도 조건 추가 가능.
+
 ## [2026-06-30] f6aad4e
 - **Category**: feat
 - **Title**: 시장데이터 공유메모리 버스 도입 · 호가기록기 생산자 배선 · VI전환 검증 테스트

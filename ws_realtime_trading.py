@@ -98,6 +98,15 @@ VI_TRADE_MODE = "off"
 #   False: 기존 방식만 (예상체결 stck_oprc 시가형성 + 09:02 타이머)
 #   ※ True 여도 stck_oprc·09:02 타이머는 폴백으로 유지(H0STMKO0 누락/미발동 대비). 셋이 빌 때 rebuild 1회.
 VI_SWITCH_BY_VICLS = True
+
+# [260702] 호가(orderbook) 통합 옵션
+#   True : 프로덕션이 호가 레코더(ws_orderbook_recorder.py, a2 별도 프로세스)를 subprocess 로 기동하고,
+#          공유메모리 버스(market_bus)를 attach 해 최신 10호가를 읽는다(전략/로그 반영).
+#   False: 호가 미기동·미소비 (회귀).
+#   ★ a2 별도 프로세스라 a1 40슬롯/지연에 영향 0. 재기동 시 기존 레코더 먼저 종료(ALREADY IN USE 방지).
+ORDERBOOK_ENABLED = True
+ORDERBOOK_BUS_NAME = "stockbus"     # 공유메모리 버스 이름 (생산자·소비자 일치)
+ORDERBOOK_LOG_SEC = 60             # 버스 수신현황 로그 주기(초)
 # 상한가 스톱 연속 이탈 확인 틱 수 (서버 스톱지정가 대신 클라이언트에서 N틱 연속 확인 후 매도)
 STOP_LIMIT_CONFIRM_TICKS = 30
 # 매수가 손절 N틱 연속 이탈 확인 (단일 틱 fake 가격 차단). 임계 회복 시 카운터 리셋.
@@ -13223,6 +13232,7 @@ def _shutdown(reason: str):
     logger.warning(f"\n{'=' * 66}\n[shutdown] {reason}  @ {_ts_now}\n{'=' * 66}")
     _stop_event.set()
     _ws_rebuild_event.set()
+    _stop_orderbook_recorder()   # [260702] 호가 레코더(a2 subprocess) 정리
     t0 = time.time()  # [260423] 단계별 경과시간 측정
     # WSS 종료 (새 데이터 유입 차단) — snapshot pattern
     # [260511] lock 안에서 _request_ws_close 호출하면 좀비 hang 시 close 자체가 hang
@@ -13985,6 +13995,107 @@ def run_ws_forever():
     logger.info(f"{ts_prefix()} [ws] stopped")
 
 # =============================================================================
+# [260702] 호가(orderbook) 통합 — A) 레코더 subprocess 기동  B) 공유메모리 버스 소비
+#   생산자(a2 별도 프로세스)가 호가를 받아 버스에 발행 → 소비자(이 프로덕션)가 읽음.
+#   1프로세스=1WSS연결 라이브러리 제약 때문에 a2 는 별도 프로세스, 데이터만 버스로 공유.
+# =============================================================================
+_orderbook_proc = None            # 레코더 subprocess 핸들
+_orderbook_bus = None             # MarketDataBus 리더(소비자)
+
+
+def _start_orderbook_recorder():
+    """호가 레코더(a2)를 subprocess 로 기동. 기존 인스턴스는 먼저 종료(ALREADY IN USE 방지)."""
+    global _orderbook_proc
+    if not ORDERBOOK_ENABLED:
+        logger.info(f"{ts_prefix()} [orderbook] ORDERBOOK_ENABLED=False → 레코더 미기동")
+        return
+    import subprocess as _sp
+    script = SCRIPT_DIR / "ws_orderbook_recorder.py"
+    if not script.exists():
+        logger.warning(f"{ts_prefix()} [orderbook] 레코더 스크립트 없음: {script}")
+        return
+    try:
+        _sp.run(["pkill", "-f", "ws_orderbook_recorder.py"], check=False)  # a2 WSS 중복 방지
+        time.sleep(2.0)
+    except Exception:
+        pass
+    try:
+        _logdir = OUT_DIR / "orderbook"
+        _logdir.mkdir(parents=True, exist_ok=True)
+        _logf = open(_logdir / f"run_{today_yymmdd}.log", "a", buffering=1)
+        _orderbook_proc = _sp.Popen(
+            [sys.executable, "-u", str(script),
+             "--flush", "60", "--until", "15:40", "--bus", ORDERBOOK_BUS_NAME],
+            stdout=_logf, stderr=_logf, cwd=str(SCRIPT_DIR),
+        )
+        logger.info(f"{ts_prefix()} [orderbook] 레코더 subprocess 기동 PID={_orderbook_proc.pid} "
+                    f"(bus={ORDERBOOK_BUS_NAME}, log={_logdir}/run_{today_yymmdd}.log)")
+        _notify(f"{ts_prefix()} [orderbook] 호가 레코더 기동 (a2, PID={_orderbook_proc.pid})")
+    except Exception as e:
+        logger.warning(f"{ts_prefix()} [orderbook] 레코더 기동 실패: {type(e).__name__}: {e}")
+
+
+def _stop_orderbook_recorder():
+    """프로덕션 종료 시 레코더 subprocess 정리."""
+    global _orderbook_proc
+    try:
+        if _orderbook_proc is not None and _orderbook_proc.poll() is None:
+            _orderbook_proc.terminate()
+            logger.info(f"{ts_prefix()} [orderbook] 레코더 종료 요청 PID={_orderbook_proc.pid}")
+    except Exception:
+        pass
+
+
+def _get_orderbook(code: str):
+    """전략용: 공유메모리 버스에서 종목 최신 호가 조회(마이크로초). 없으면 None.
+    반환: {code,name,recv_epoch,bsop_hour,askp[10],bidp[10],askp_rsqn[10],bidp_rsqn[10],...}"""
+    b = _orderbook_bus
+    if b is None:
+        return None
+    try:
+        return b.get(str(code).zfill(6))
+    except Exception:
+        return None
+
+
+def _orderbook_bus_consumer_loop():
+    """공유메모리 버스 attach(생성될 때까지 재시도) + 주기적 수신현황 로그(프로덕션 로그 반영)."""
+    global _orderbook_bus
+    if not ORDERBOOK_ENABLED:
+        return
+    try:
+        from market_bus import MarketDataBus
+    except Exception as e:
+        logger.warning(f"{ts_prefix()} [orderbook-bus] market_bus import 실패: {e}")
+        return
+    while not _stop_event.is_set() and _orderbook_bus is None:
+        try:
+            _orderbook_bus = MarketDataBus.attach(ORDERBOOK_BUS_NAME)
+            logger.info(f"{ts_prefix()} [orderbook-bus] attach 성공 (버스={ORDERBOOK_BUS_NAME}, "
+                        f"{len(_orderbook_bus.codes)}종목)")
+        except FileNotFoundError:
+            time.sleep(3.0)   # 생산자가 아직 버스 생성 전
+        except Exception as e:
+            logger.warning(f"{ts_prefix()} [orderbook-bus] attach 실패: {type(e).__name__}: {e}")
+            time.sleep(5.0)
+    while not _stop_event.is_set():
+        time.sleep(ORDERBOOK_LOG_SEC)
+        try:
+            codes_b = _orderbook_bus.codes
+            recv = 0
+            sample = ""
+            for c in codes_b:
+                d = _orderbook_bus.get(c)
+                if d is not None:
+                    recv += 1
+                    if not sample:
+                        sample = f"{d.get('name') or c}({c}) askp1={d['askp'][0]} bidp1={d['bidp'][0]}"
+            logger.info(f"{ts_prefix()} [orderbook-bus] 수신 {recv}/{len(codes_b)}종목 | 샘플 {sample}")
+        except Exception as e:
+            logger.warning(f"{ts_prefix()} [orderbook-bus] 상태로그 실패: {e}")
+
+
+# =============================================================================
 # main
 # =============================================================================
 if __name__ == "__main__":
@@ -14123,6 +14234,11 @@ if __name__ == "__main__":
     # 상위 랭킹 추가 구독 루프 시작
     t_top = threading.Thread(target=_top_rank_loop, daemon=True)
     t_top.start()
+
+    # [260702] 호가 통합 — A) 레코더(a2) subprocess 기동  B) 버스 소비/로그 스레드
+    _start_orderbook_recorder()
+    t_orderbook = threading.Thread(target=_orderbook_bus_consumer_loop, name="orderbook-bus", daemon=True)
+    t_orderbook.start()
 
     try:
         run_ws_forever()

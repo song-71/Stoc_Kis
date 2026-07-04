@@ -2,6 +2,19 @@
 
 ---
 
+## [2026-07-04] a236ddd
+- **Category**: feat
+- **Title**: H0STMKO0 장운영코드 AF8/AF1/BF9 실측 병행 감지 + 판정 로직 순수모듈 분리 + 리플레이 검증 하네스 + 로직 파일 신설
+- **Files**: `mkop_events.py`(신규), `ws_realtime_trading.py`, `test_mkop_replay.py`(신규), `rules/ws_realtime_trading_logic.md`(신규), `CLAUDE.md`
+- **Changes**:
+  1. **근본원인(260626 실측, `docs/KIS문의_H0STMKO0_장운영코드_260626.md`)**: KIS 운영 WSS는 매뉴얼의 숫자 서킷/사이드카 코드(174/184/187/388/397/398)를 실제로는 보내지 않고, 서킷발동=AF8 / 서킷해제=AF1 / VI단일가=BF9 로 보냄. 기존 코드는 매뉴얼 숫자코드만 매핑해 실질적으로 서킷/사이드카를 못 잡는 상태였음.
+  2. **`mkop_events.py` 신규** — 부작용 없는 순수 모듈. `MKOP_EVENT_NAMES`(매뉴얼+AF8/AF1/BF9 병행), `CB_TRIGGER_CODES`/`CB_RELEASE_CODES`/`MARKET_EVENT_CLEAR_CODES`, `classify_mkop_event(mkop, antc_mkop)` 판정 함수로 분리.
+  3. **`ws_realtime_trading.py`**: 기존에 파일 내 인라인 딕셔너리로 정의돼 있던 장운영코드 상수(:6593 부근)를 `mkop_events` import 로 대체, `_on_market_status_krx`의 인라인 분기(:8461 부근)를 `classify_mkop_event()` 판정 결과(`cb_trigger`/`cb_release`/`clear_market_event`) 사용으로 교체. AF8→시장전파(174/184/164와 동일 취급), AF1→시장전파 해제(175/185와 동일), BF9→정보성(사이드카처럼 로그+텔레만, 시장전파 없음). 기존 동작은 그대로 보존.
+  4. **`test_mkop_replay.py` 신규** — 프로덕션을 import하지 않고 `mkop_events`만 import해 260626 실프레임(`out/logs/wss_TR_260626.log`의 AF8/AF1/BF9 7건) + 매뉴얼 합성코드 + 상태기계(AF8→BF9→AF1) 재생으로 판정 검증. 실행결과 PASS=46/FAIL=0.
+  5. **`rules/ws_realtime_trading_logic.md` 신규** — `ws_realtime_trading.py` 작동 로직 파일("로직 파일"). §0 계좌·연결구조, §1 구독생명주기(+§1.1 아침구독대상), §2 VI 2경로, §3 장운영이벤트(AF8/AF1/BF9), §4 텔레정책, §5 호가레코더, §6 스케줄/시간대모드, §7 검증방법(백테스트/리플레이/라이브), 맨 아래 변경 이력 포함.
+  6. **`CLAUDE.md`**: "코드 검토·수정 규칙" 신설 — `ws_realtime_trading.py` 검토·수정 전 로직 파일 선독 의무화, 수정 시 로직 파일 관련 섹션+변경이력 동시 갱신 의무화, 로직 파일에 없던 신규 로직 발견 시 그 자리에서 추가. 프로덕션 로그(`out/logs/wss_TR_*.log`)는 널바이트 혼입으로 `grep`이 이진파일로 오인해 매칭을 건너뛰므로 `grep -a` 사용 의무화(260703 실사고 반영).
+- **Impact**: 실운영 WSS가 실제로 보내는 AF8/AF1/BF9 코드를 이제 정확히 감지·판정하게 됨(기존엔 매뉴얼 코드만 봐서 서킷/사이드카 감지가 실질 미작동). 판정 로직이 순수 함수로 분리되어 프로덕션을 기동하지 않고도 리플레이/단위테스트로 검증 가능. `rules/ws_realtime_trading_logic.md` 신설로 이후 프로덕션 검토·수정 시 기존 로직을 잊고 뒤엎는 오판을 CLAUDE.md 강제 장치로 방지.
+
 ## [2026-07-02] 41d3211
 - **Category**: feat
 - **Title**: 프로덕션 호가 레코더 subprocess 기동 + 공유메모리 버스 소비 배선 (호가 통합 A+B)

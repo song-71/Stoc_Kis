@@ -6587,17 +6587,10 @@ _MKT_KEEPALIVE_INITIAL = {
     "KOSDAQ": "293490",  # 카카오게임즈
 }
 _mkt_keepalive_current: dict[str, str] = {}   # market → 현재 keep-alive 중인 code
-# MKOP_CLS_CODE 정의 (H0STMKO0 문서)
-_MKOP_SIDECAR_CODES = {"187", "388", "397", "398"}
-_MKOP_CIRCUIT_CODES = {"174", "175", "182", "184", "185"}
-_MKOP_EVENT_NAMES = {
-    "187": "사이드카발동", "388": "사이드카해제",
-    "397": "사이드카매수발동", "398": "사이드카매수해제",
-    "174": "서킷브레이크발동", "175": "서킷브레이크해제",
-    "182": "서킷브레이크장종동시마감", "184": "서킷브레이크개시", "185": "서킷브레이크해제",
-    "164": "시장임시정지",
-}
-_CB_ACTIVE_EVENTS = {"서킷브레이크발동", "서킷브레이크개시", "서킷브레이크동시호가"}
+# MKOP_CLS_CODE 정의·판정은 부작용 없는 mkop_events 모듈로 분리(리플레이/단위테스트용).
+# [260703] 매뉴얼 숫자코드 + 260626 실측 A/B 접두코드(AF8/AF1/BF9) 병행 매핑은 mkop_events 에 있음.
+#   상세 배경: docs/KIS문의_H0STMKO0_장운영코드_260626.md, rules/ws_realtime_trading_logic.md §3.
+from mkop_events import classify_mkop_event  # noqa: E402
 _rest_fail_backoff: dict[str, int] = {}       # REST 500 에러 연속 횟수 (백오프용)
 _price_block_until: dict[str, float] = {}     # [v_1] code → TTL 만료 unix_ts (500 에러 3회+ 종목 30분 조회 차단)
 PRICE_BLOCK_FAIL_THRESHOLD = 3                # 500 에러 N회 연속 시 차단 시작
@@ -8464,24 +8457,22 @@ def _on_market_status_krx(result) -> None:
             )
         # [260611] 감지 필드 보강: 현재값(mkop) 우선, 비었으면 예상값(antc_mkop)으로도 감지.
         #   실측상 단일가/서킷 구간에 mkop='None'·antc_mkop='311' 처럼 예상필드로만 오는 경우가
-        #   있어 둘 다 본다. 어느 필드로 잡았는지(_evt_src)를 로그에 남긴다.
-        _evt_code, _evt_src = "", ""
-        if _MKOP_EVENT_NAMES.get(mkop):
-            _evt_code, _evt_src = mkop, "mkop_cls_code"
-        elif _MKOP_EVENT_NAMES.get(antc_mkop):
-            _evt_code, _evt_src = antc_mkop, "antc_mkop_cls_code"
-        if _evt_code:
+        #   있어 둘 다 본다. [260703] 판정(매뉴얼+실측 병행)은 mkop_events.classify_mkop_event 로 위임.
+        _evt = classify_mkop_event(mkop, antc_mkop)
+        if _evt:
+            _evt_code, _evt_src = _evt["evt_code"], _evt["evt_src"]
             prev_mkop = _last_mkop_event.get(code, "")
             if _evt_code != prev_mkop:
                 _last_mkop_event[code] = _evt_code
-                event_name = _MKOP_EVENT_NAMES.get(_evt_code)
+                event_name = _evt["event_name"]
                 _market_event[code] = event_name
                 msg = f"{ts_prefix()} [장운영] {name}({code}) {_evt_src}={_evt_code} ({event_name})"
                 logger.warning(msg)
                 _notify(msg, tele=True)
                 # 사이드카(187/397)=프로그램매매 호가효력정지로 개인거래와 무관 → 정보성 로깅만.
-                # 시장 전파(REST 폴링 생략)는 서킷브레이커류(174=발동/184=개시/164=시장임시정지)만.
-                if _evt_code in ("174", "184", "164") and market:
+                #   BF9(VI단일가)도 개별종목 단일가라 정보성 로깅만(시장 전파 없음).
+                # 시장 전파(REST 폴링 생략)는 서킷브레이커류(174/184/164 + 실측 AF8)만.
+                if _evt["cb_trigger"] and market:
                     _newly = not _market_wide_event.get(market)
                     now_iso = datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S")
                     _market_wide_event[market] = event_name
@@ -8498,12 +8489,12 @@ def _on_market_status_krx(result) -> None:
                     if _newly:
                         # 서킷 시장 전 종목 ccnl→exp 즉시 적용 (해제는 175/185 또는 30분 타이머)
                         _trigger_ws_rebuild()
-                # 사이드카/서킷 해제 → 종목 이벤트 클리어 (사이드카 해제 388/398 포함)
-                if _evt_code in ("175", "185", "388", "398"):
+                # 사이드카/서킷 해제 → 종목 이벤트 클리어 (사이드카 해제 388/398, 실측 서킷해제 AF1 포함)
+                if _evt["clear_market_event"]:
                     _market_event.pop(code, None)
-                # 시장 전파 해제(REST 폴링 재개)는 서킷브레이커 해제(175/185)만.
+                # 시장 전파 해제(REST 폴링 재개)는 서킷브레이커 해제(175/185 + 실측 AF1)만.
                 # 사이드카 해제(388/398)는 애초에 시장 전파를 안 했으므로 진입 금지.
-                if _evt_code in ("175", "185"):
+                if _evt["cb_release"]:
                     if market and _market_wide_event.get(market):
                         prev_evt = _market_wide_event.pop(market, "")
                         _market_wide_mkop.pop(market, None)

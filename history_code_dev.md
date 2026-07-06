@@ -2,6 +2,19 @@
 
 ---
 
+## [2026-07-06] 41873e5
+- **Category**: fix
+- **Title**: WSS 틱 저장 병합 중복제거 데이터 소실 버그 수정(하루 수신 약 54% 소실 → 무손실)
+- **Files**: `ws_realtime_trading.py`, `ws_merge_wss_parts.py`, `wss_recv_ts_util.py`(신규), `recover_wss_daily_lossless.py`(신규), `rules/ws_realtime_trading_logic.md`, `CLAUDE.md`
+- **Changes**:
+  1. **근본원인(260706 진단)**: 한 WSS 프레임에는 국내주식 실시간체결(H0STCNT0)이 최대 20건 묶여 오는데, `recv_ts`가 프레임당 1번만 찍혀(`ws_realtime_trading.py:12788`) 그 20행에 동일하게 복사됨(`:12852`). 이후 최종 병합의 `drop_duplicates(subset=[code, recv_ts])`(`:10340`)가 서로 다른 실체결을 "중복"으로 삭제 → 260706 실측 301,031행 → 137,079행(가격경로·거래량 포함 약 54% 소실). 저장 part 자체는 무손실이며 손실은 병합 단계에서만 발생.
+  2. **`ws_realtime_trading.py:13006~`** — 저장(save) 경로에서 종목별 프레임 내 순번 2자리를 recv_ts에 붙여 6→8자리로 유일화(Polars 인라인). 이후 병합 dedup(`:10340`)이 실체결을 삭제하지 않음.
+  3. **`wss_recv_ts_util.py`(신규)** — 오프라인 병합/복구 공용 모듈 `unique_recv_ts`. 완전 동일 행만 제거하고 같은 (code, recv_ts) 실체결은 수신순(acml_vol) 순번으로 유일화. 구 6자리는 순번 복원, 신규 8자리는 통과(멱등). NaN 키는 groupby dropna=False로 처리.
+  4. **`ws_merge_wss_parts.py:160~`** — 기존 `drop_duplicates(subset=["recv_ts"])`(code도 없이 단독) 제거하고 공용 모듈 사용으로 교체.
+  5. **`recover_wss_daily_lossless.py`(신규)** — backup 조각으로 과거 daily parquet 무손실 재생성(기본 dry-run, --apply 시에만 기록, 기존 손상본은 `.collapsed.bak` 보존). 260706 복구 실행 완료(137,079→301,031행 검증, 종목 내 recv_ts 100% 유일).
+  6. **문서**: 로직 파일 §8 신설(저장·병합·recv_ts 3사이트 흐름 + 공용모듈 + 지표 틱단위 원칙) 및 변경이력 추가, `CLAUDE.md` 에 "WSS 저장 데이터 형식 주의" 절 추가.
+- **Impact**: 실시간체결 저장·병합 파이프라인이 완전 무손실로 전환됨. **데이터 형식 경계(주의)**: ~2026-07-05 daily parquet 은 프레임당 1행 축약손상본, 2026-07-06+ 는 무손실. 날짜 간 비교 시 이 경계 감안 필요.
+
 ## [2026-07-04] a236ddd
 - **Category**: feat
 - **Title**: H0STMKO0 장운영코드 AF8/AF1/BF9 실측 병행 감지 + 판정 로직 순수모듈 분리 + 리플레이 검증 하네스 + 로직 파일 신설

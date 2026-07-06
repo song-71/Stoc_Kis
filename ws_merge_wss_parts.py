@@ -159,12 +159,14 @@ def _merge_date_group(
     df = combined.to_pandas()
     if "recv_ts" in df.columns:
         try:
-            df = df.sort_values("recv_ts", kind="mergesort").reset_index(drop=True)
-            before = len(df)
-            df = df.drop_duplicates(subset=["recv_ts"]).reset_index(drop=True)
-            removed = before - len(df)
-            if removed:
-                logger.info(f"{base_msg} 중복 제거: {removed:,}건")
+            # [260706] 같은 프레임(동일 recv_ts)에 묶여온 서로 다른 실체결을 삭제하지 않고
+            # 수신순 순번을 붙여 유일화(6→8자리). 완전 동일 행만 진짜 중복으로 제거.
+            # (구 subset=["recv_ts"] 단독 dedup 은 다른 종목·다른 체결까지 지워 하루 ~54% 소실)
+            from wss_recv_ts_util import unique_recv_ts
+            df, n_full, n_dis = unique_recv_ts(df)
+            if n_full or n_dis:
+                logger.info(f"{base_msg} dedup: 완전중복 {n_full:,}행 제거 / "
+                            f"동일 recv_ts 실체결 {n_dis:,}행 순번 유일화(6→8자리)")
         except Exception as e:
             stock_names = df["종목명"].unique().tolist() if "종목명" in df.columns else ["(종목명 없음)"]
             ts_range = ""

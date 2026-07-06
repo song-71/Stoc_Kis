@@ -13004,6 +13004,19 @@ def ingest_loop():
 
                 # ── (4) 저장 + 지표 계산 ──
                 if save:
+                    # ── recv_ts 프레임 내 순번 유일화 (6자리→8자리) ──────────────
+                    # 한 WSS 프레임엔 체결이 최대 20건 묶여 오는데 recv_ts 는 프레임당 1번만
+                    # 찍혀(:12788→:12852) 20행이 같은 값을 갖는다. 그대로 두면 최종 병합의
+                    # drop_duplicates(subset=[code, recv_ts], :10340)가 20→1로 실체결을 삭제한다
+                    # (260706 진단: 하루 수신의 약 54% 소실). 종목별 프레임 내 순번(00~19,
+                    # acml_vol 오름차순=수신순)을 소수점 뒤 2자리로 붙여 틱마다 유일하게 만든다.
+                    # 8자리여도 문자열 정렬·차트(str.slice 고정위치)·pandas to_datetime(나노초)
+                    # 모두 안전(파이썬 strptime "%f" 6자리 고정 파싱만 회피).
+                    if "recv_ts" in df_code.columns:
+                        df_code = df_code.with_columns(
+                            (pl.col("recv_ts")
+                             + pl.int_range(0, pl.len()).cast(pl.Utf8).str.zfill(2)).alias("recv_ts")
+                        )
                     # ── 기술적 지표 계산 (EMA + BB) — Polars 네이티브 ──
                     _pr_col_save = "stck_prpr"
                     if _pr_col_save in df_code.columns:

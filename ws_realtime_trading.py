@@ -8593,7 +8593,28 @@ def _mkstatus_recv_loop() -> None:
             logger.warning(f"{ts_prefix()} [mkstatus] H0STMKO0 처리 오류: {e}")
 
 
-H0STMKO0_MAX_SLOTS: int = 5  # 데이터(ccnl/exp) 슬롯 ≥35 보장 위한 보수적 cap
+# [260714] H0STMKO0 슬롯 상한 — 정적 5 → 동적. 데이터 구독이 적을 땐 여유 슬롯을
+#   장초 고등락(VI 급등) 종목 관찰에 넉넉히 허용해, VI_SWITCH_BY_VICLS 주력 조기전환
+#   경로(:8550)가 살아나도록 한다. (260713 디와이에이(002880): 데이터 8종목뿐이라
+#   여유 슬롯 ~26개인데도 고정 cap 5 에 막혀 관찰구독 탈락 → 09:04 VI 조기전환 실패.)
+#   총 슬롯(H0STCNI0 1 + MKO0 + 데이터) <= MAX_WSS_SUBSCRIBE 는 _mkstatus_sub_add·
+#   open_map rebuild 의 우선순위 컷 + rebuild 말미 '구독 상한 준수' 데이터 축소가 보장.
+H0STMKO0_MIN_SLOTS: int = 5     # 항상 최소 보장(보유/VI/keepalive 추적)
+H0STMKO0_DATA_RESERVE: int = 5  # 데이터(top-rank 등) 추가 구독 여지로 남길 여유
+
+
+def _h0stmko0_slot_cap() -> int:
+    """H0STMKO0 동적 슬롯 상한(현재 데이터 구독 수에 따라 가변).
+
+    가용 = MAX_WSS_SUBSCRIBE − 1(H0STCNI0) − 현재 데이터구독수 − 예약여유.
+    데이터가 많을 땐 하한(H0STMKO0_MIN_SLOTS)만 확보한다.
+    """
+    try:
+        data_cnt = len(codes)
+    except Exception:
+        data_cnt = 0
+    return max(H0STMKO0_MIN_SLOTS,
+               MAX_WSS_SUBSCRIBE - 1 - data_cnt - H0STMKO0_DATA_RESERVE)
 
 
 def _mkstatus_sub_add(codes_to_add: set[str]) -> None:
@@ -8616,7 +8637,8 @@ def _mkstatus_sub_add(codes_to_add: set[str]) -> None:
             f"{ts_prefix()} [H0STMKO0] WSS 미연결 → {len(new_codes)}건 보류(연결 후 구독)"
         )
         return
-    available = max(0, H0STMKO0_MAX_SLOTS - len(_mkstatus_sub_codes))
+    _mko_cap = _h0stmko0_slot_cap()
+    available = max(0, _mko_cap - len(_mkstatus_sub_codes))
     if available < len(new_codes):
         held: set[str] = set()
         try:
@@ -8630,7 +8652,7 @@ def _mkstatus_sub_add(codes_to_add: set[str]) -> None:
         ordered = list(priority_held) + list(priority_vi) + list(priority_rest)
         new_codes = set(ordered[:available])
         logger.warning(
-            f"{ts_prefix()} [H0STMKO0] 슬롯 cap({H0STMKO0_MAX_SLOTS}) 초과 → 보유/VI 우선만 구독"
+            f"{ts_prefix()} [H0STMKO0] 슬롯 cap({_mko_cap}) 초과 → 보유/VI 우선만 구독"
         )
     if not new_codes:
         return
@@ -8838,6 +8860,39 @@ def _price_watchdog_loop() -> None:
             time.sleep(0.5)
             continue
 
+        # ================================================================
+        # [260714] "갑자기 끊김 → VI 의심" 감지 — 09:00~15:30 전 구간
+        #   기존엔 이 감지가 (C) 블록의 09:10 게이트 안에만 있어, 개장 직후
+        #   09:00~09:10 에 상승 VI 가 걸린(이미 시가를 받은) 종목을 놓쳤다
+        #   (260713 디와이에이 09:04:48 VI 미감지 → 예상체결가 미수신 사건).
+        #   섹션 (A) 의 early-return 과 무관하게 항상 돌도록 앞으로 빼고 09:00 부터 적용.
+        #   - 활발히 거래되던 종목(avg_itv<5s)이 갑자기 멈추면 VI 로 의심 → REST 상태확인.
+        #   - _avg_tick_interval 은 데이터 부족 시 999.0 → 웜업/저유동 종목 오탐 없음.
+        #   - 09:00~09:02 예상체결 연장(_vi_delayed_codes) 종목은 정상 무수신이므로 제외.
+        if dtime(9, 0) <= now_t <= dtime(15, 30):
+            with _lock:
+                for c in list(codes):
+                    if c in _rest_pending:
+                        continue
+                    last_wss = _last_wss_recv_ts.get(c, 0.0)
+                    if last_wss <= 0:
+                        continue
+                    avg_itv = _avg_tick_interval(c)
+                    idle = now - last_wss
+                    if (avg_itv < 5.0
+                            and idle >= max(10.0, avg_itv * 3)
+                            and c not in _vi_exp_sub_ts
+                            and c not in _halted_codes
+                            and c not in _vi_delayed_codes):
+                        last_check = _last_stale_check_ts.get(c, 0.0)
+                        if (now - last_check) >= 10.0:
+                            _last_stale_check_ts[c] = now
+                            _rest_pending.add(c)
+                            try:
+                                _price_queue.put_nowait(("stale_check", c))
+                            except Exception:
+                                pass
+
         # --- 모드 판별 ---
         wss_alive = (_last_any_recv_ts > 0 and (now - _last_any_recv_ts) < 5.0)
         wss_ever  = (_last_any_recv_ts > 0)
@@ -8946,22 +9001,8 @@ def _price_watchdog_loop() -> None:
                     last_wss = _last_wss_recv_ts.get(c, 0.0)
                     idle = (now - last_wss) if last_wss > 0 else (now - start_ts)
 
-                    # ── "갑자기 끊김" 감지: 활발히 거래되던 종목이 갑자기 멈춤 → VI 의심 ──
-                    avg_itv = _avg_tick_interval(c)
-                    if (avg_itv < 5.0
-                            and last_wss > 0
-                            and idle >= max(10.0, avg_itv * 3)
-                            and c not in _vi_exp_sub_ts
-                            and c not in _halted_codes):
-                        last_check = _last_stale_check_ts.get(c, 0.0)
-                        if (now - last_check) >= 10.0:
-                            _last_stale_check_ts[c] = now
-                            _rest_pending.add(c)
-                            try:
-                                _price_queue.put_nowait(("stale_check", c))
-                            except Exception:
-                                pass
-                            continue
+                    # ── "갑자기 끊김 → VI 의심" 감지는 09:00 부터 전 구간 적용되도록
+                    #    상단 [260714] 블록으로 이동(개장 직후 09:00~09:10 커버). ──
 
                     # 상태별 재확인 간격 적용
                     if c in _halted_codes:
@@ -13673,9 +13714,10 @@ def run_ws_forever():
                 _mkstatus_sub_codes |= _mkstatus_pending
                 _mkstatus_pending.clear()
             mkstatus_target = set(_mkstatus_sub_codes) | keepalive_codes
-            # H0STMKO0_MAX_SLOTS cap: 초과 시 보유 > VI > keepalive 우선
+            # H0STMKO0 동적 cap: 초과 시 보유 > VI > keepalive 우선
             # (_mkstatus_sub_add 의 cap 우선순위와 동일 패턴)
-            if len(mkstatus_target) > H0STMKO0_MAX_SLOTS:
+            _mko_cap = _h0stmko0_slot_cap()
+            if len(mkstatus_target) > _mko_cap:
                 held_mk: set[str] = set()
                 try:
                     with _str1_sell_state_lock:
@@ -13688,9 +13730,9 @@ def run_ws_forever():
                 priority_rest = mkstatus_target - priority_held - priority_vi - priority_ka
                 ordered = (list(priority_held) + list(priority_vi)
                            + list(priority_ka) + list(priority_rest))
-                mkstatus_target = set(ordered[:H0STMKO0_MAX_SLOTS])
+                mkstatus_target = set(ordered[:_mko_cap])
                 logger.warning(
-                    f"{ts_prefix()} [H0STMKO0] open_map cap({H0STMKO0_MAX_SLOTS}) 초과 "
+                    f"{ts_prefix()} [H0STMKO0] open_map cap({_mko_cap}) 초과 "
                     f"→ 보유/VI/keepalive 우선만 구독"
                 )
             _mkstatus_sub_codes = mkstatus_target

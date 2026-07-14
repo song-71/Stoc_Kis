@@ -948,23 +948,22 @@ def list_s3_1d_paths(layout: KisDataLayout, date_from: str, date_to: str) -> lis
 
 
 def _kr_tick_size(price: float, market: str = "KOSPI") -> int:
-    """호가단위 반환. KOSDAQ은 2,000원 미만 1원, 10,000~50,000원 구간 10원."""
-    is_kosdaq = str(market).upper() == "KOSDAQ"
-    if is_kosdaq:
-        if price < 2000:
-            return 1
-        if price < 5000:
-            return 5
-    else:
-        if price < 1000:
-            return 1
-        if price < 5000:
-            return 5
-    if price < 10000:
+    """호가단위 반환 (KRX 2023.1.25 개편 통합표. KOSPI/KOSDAQ/코넥스 동일).
+
+    market 인자는 하위호환용으로 유지하되 값은 사용하지 않음(개편 후 시장 무관).
+      ~2,000:1 / ~5,000:5 / ~20,000:10 / ~50,000:50 /
+      ~200,000:100 / ~500,000:500 / 그 이상:1,000
+    ※ ETF/ETN/ELW(5원 고정)는 예외 — 이 함수는 개별주 기준.
+    """
+    if price < 2000:
+        return 1
+    if price < 5000:
+        return 5
+    if price < 20000:
         return 10
     if price < 50000:
-        return 10 if is_kosdaq else 50
-    if price < 100000:
+        return 50
+    if price < 200000:
         return 100
     if price < 500000:
         return 500

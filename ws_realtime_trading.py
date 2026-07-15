@@ -104,7 +104,9 @@ VI_SWITCH_BY_VICLS = True
 #          공유메모리 버스(market_bus)를 attach 해 최신 10호가를 읽는다(전략/로그 반영).
 #   False: 호가 미기동·미소비 (회귀).
 #   ★ a2 별도 프로세스라 a1 40슬롯/지연에 영향 0. 재기동 시 기존 레코더 먼저 종료(ALREADY IN USE 방지).
-ORDERBOOK_ENABLED = True
+#   [260715] False 로 전환 — 호가(orderbook) 전략 당분간 미사용 + a2 를 다계좌 WSS 구독 연결로
+#            전용하기 위해 a2 orderbook 레코더 기동 제거. (다계좌 구독 리팩터, 로직 §5)
+ORDERBOOK_ENABLED = False
 ORDERBOOK_BUS_NAME = "stockbus"     # 공유메모리 버스 이름 (생산자·소비자 일치)
 ORDERBOOK_LOG_SEC = 60             # 버스 수신현황 로그 주기(초)
 # 상한가 스톱 연속 이탈 확인 틱 수 (서버 스톱지정가 대신 클라이언트에서 N틱 연속 확인 후 매도)

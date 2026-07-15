@@ -1,0 +1,515 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+실시간 호가(orderbook) 기록기 — 전일 상한가 종목 전체 H0STASP0 수신
+================================================================
+
+목적
+----
+전일 상한가 종목 전체에 대해 **순수 실시간 호가 스트림(H0STASP0)** 을 당일 내내 받아
+수신 즉시 종목별 CSV 로 저장한다. (체결 데이터는 프로덕션 ws_realtime_trading.py 가
+base_codes=전일 상한가로 이미 수신·저장하므로, 여기서는 호가만 보완 수집한다.)
+나중에 프로덕션 wss_data(체결) 와 recv_ts 기준으로 겹쳐 그려(plot) 호가/체결 도착
+시점 차이를 비교하거나, 호가 기반 전략 검증에 사용한다.
+
+[260630] 단일 샘플종목 → 전일 상한가 ST 전체 다종목 수신으로 확장.
+
+안전 (★ 반드시 a2 계정으로 접속)
+--------------------------------
+프로덕션(ws_realtime_trading.py)은 **a1 계좌 단일 프로세스 · 단일 WSS 연결**로 동작한다
+(a1+a2 복수 WSS 동시 사용이 아님). 체결·예상체결·장운영정보·체결통보를 모두 a1 한
+연결에서 tr_id 로 멀티 수신한다. 이유: 현 라이브러리(kis_auth_llm)는 approval_key·
+open_map·data_map 이 전부 모듈 전역이라 "1프로세스=1연결" 구조이기 때문이다(한
+프로세스에서 a1·a2 두 연결을 띄우면 전역 open_map/approval_key 가 엉켜 서로의 구독을
+침범한다 — 과거 a1/a2 이중연결 실패의 근본원인).
+
+프로덕션 WSS 는 a1 appkey 로 approval_key 를 발급해 사용한다. 같은 appkey 로 새
+approval_key 를 발급하면 직전 키가 무효화되어 프로덕션이 즉사한다(메모리: WSS
+approval_key 무효화). 따라서 이 기록기는 **a2 appkey** 로만, **별도 프로세스**로 접속한다.
+a2 는 거래 폴백용 REST 계정이며 프로덕션은 a2 로 WSS 를 쓰지 않으므로 a1 과 독립이다.
+
+수신 데이터 (프로덕션 wss_data 와 컬럼명 통일)
+---------------------------------------------
+- recv_ts        : 수신 시각. datetime.now(KST) "%Y-%m-%d %H:%M:%S.%f"
+                   (프로덕션 on_result 와 동일 클럭·동일 포맷 → 딜레이 직접 비교 가능)
+- mksc_shrn_iscd : 종목코드 (프로덕션과 동일 컬럼명)
+- name           : 종목명   (프로덕션과 동일 컬럼명)
+- 이하 H0STASP0 원본 컬럼(소문자): askp1..askp10, bidp1..bidp10, 잔량 등
+  ※ 사용자가 말한 "askp0/bidp0"(최우선 매도/매수호가)는 여기서 askp1/bidp1 이며,
+    프로덕션 체결데이터의 askp1/bidp1 과 컬럼명이 그대로 일치한다.
+
+저장 (parquet — CSV 대비 저장·읽기 빠름)
+----------------------------------------
+[260630] CSV → parquet 전환. parquet 는 행 단위 즉시 append 가 불가능한 컬럼형
+포맷이므로, 프로덕션 wss_data 와 동일한 사상으로 **메모리 버퍼 + 주기적 원자 저장**
+방식을 쓴다:
+  - 수신 프레임을 종목별 메모리 버퍼에 누적
+  - FLUSH_INTERVAL_SEC(기본 20초)마다 종목별 parquet 를 임시파일에 쓴 뒤
+    os.replace() 로 원자적 교체 → 쓰기 도중 중단돼도 직전 완결본은 보존
+  - 종료(--until/ Ctrl+C) 시 마지막 1회 flush
+파일: data/wss_data/orderbook/{YYMMDD}_orderbook_{code}.parquet (종목별 1개)
+
+사용법
+------
+  python3 orderbook_recorder.py                 # 전일 상한가 ST 종목 전체 자동 구독
+  python3 orderbook_recorder.py --code 001210   # 종목 직접 지정(쉼표로 여러 개 가능)
+  python3 orderbook_recorder.py --until 15:40    # 종료 시각 지정(기본 15:40, KST)
+  python3 orderbook_recorder.py --flush 10       # flush 주기(초) 지정(기본 20)
+  (Ctrl+C 로 언제든 중단 — 직전 flush 까지의 데이터는 손실 없음)
+"""
+
+import argparse
+import json
+import os
+import sys
+import threading
+import time
+from datetime import datetime, time as dtime
+from pathlib import Path
+from zoneinfo import ZoneInfo
+
+import pandas as pd
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+sys.path.extend([str(SCRIPT_DIR)])
+
+KST = ZoneInfo("Asia/Seoul")
+
+# ── 프로젝트 모듈 ──────────────────────────────────────────────────────────
+import kis_auth_llm as ka                       # noqa: E402
+# [260630] 프로덕션과 동일하게 kis_auth → kis_auth_llm 별칭. domestic_stock_functions_ws 가
+#   `import kis_auth as ka` 로 data_fetch 를 호출하므로, import 전에 반드시 교체해야 한다
+#   (없으면 구 kis_auth.py 가 로드돼 'data_fetch 없음' 오류 발생).
+sys.modules["kis_auth"] = ka
+from kis_utils import load_config, load_symbol_master  # noqa: E402
+from domestic_stock_functions_ws import asking_price_krx  # noqa: E402  H0STASP0
+from market_bus import MarketDataBus  # noqa: E402  공유메모리 시장데이터 버스(생산자)
+
+CONFIG_PATH = SCRIPT_DIR / "config.json"
+TARGET_CSV = SCRIPT_DIR / "symulation" / "Select_Tr_target_list.csv"
+KRX_CODE_CSV = SCRIPT_DIR / "data" / "admin" / "symbol_master" / "KRX_code.csv"
+OUT_DIR = SCRIPT_DIR / "data" / "wss_data" / "orderbook"
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+RECV_TS_FMT = "%Y-%m-%d %H:%M:%S.%f"   # 프로덕션 on_result 와 동일
+
+
+def _log(msg: str) -> None:
+    print(f"[{datetime.now(KST).strftime('%H:%M:%S')}] {msg}", flush=True)
+
+
+# ============================================================================
+# 1) a2 계정 자격으로 WSS 인증 (프로덕션 a1 과 분리)
+# ============================================================================
+def _setup_a2_auth() -> dict:
+    cfg = load_config(str(CONFIG_PATH))
+    # [260630] load_config() 는 V2 config 를 평탄화해 반환한다.
+    #   raw json 의 users.<uid>.accounts.a2 가 아니라 최상위 cfg["accounts"]["a2"] 로 노출됨.
+    #   (1순위) 평탄화된 accounts → (2순위) raw json users 순회 폴백.
+    a2 = None
+    accounts = cfg.get("accounts") or {}
+    if isinstance(accounts, dict) and "a2" in accounts:
+        a2 = accounts["a2"]
+    if not a2:
+        # 폴백: raw json 구조 직접 탐색
+        try:
+            raw = json.load(open(str(CONFIG_PATH), encoding="utf-8"))
+            for _uid, u in (raw.get("users") or {}).items():
+                accts = (u or {}).get("accounts") or {}
+                if "a2" in accts:
+                    a2 = accts["a2"]
+                    break
+        except Exception:
+            pass
+    if not a2 or not a2.get("appkey") or not a2.get("appsecret"):
+        raise RuntimeError("config.json 에서 a2 계정의 appkey/appsecret 을 찾지 못했습니다.")
+
+    # ★ a1(루트)로 평탄화된 _cfg 를 a2 자격으로 덮어쓴다 → approval_key 가 a2 appkey 로 발급됨
+    ka._cfg["my_app"] = a2["appkey"]
+    ka._cfg["my_sec"] = a2["appsecret"]
+
+    # 토큰 파일을 a2 호가기록기 전용으로 분리 (프로덕션 a1/a2 캐시와 충돌 방지)
+    tok = Path(ka.config_root) / f"KIS_a2_obrec_{datetime.now(KST).strftime('%Y%m%d')}"
+    if not tok.exists():
+        tok.touch()
+    ka.token_tmp = str(tok)
+
+    _log(f"a2 계정으로 인증 시작 (appkey={a2['appkey'][:8]}…{a2['appkey'][-4:]}, token={tok.name})")
+    ka.auth(svr="prod")          # REST env(my_url_ws 포함) 세팅 + access_token
+    ka.auth_ws(svr="prod")       # a2 appkey 전용 approval_key (a1 과 독립)
+    if not getattr(ka, "_base_headers_ws", {}).get("approval_key"):
+        raise RuntimeError("auth_ws() 실패: a2 appkey/secret 확인 필요")
+    _log("a2 approval_key 확보 — 프로덕션(a1) 과 독립된 WSS 슬롯")
+    return cfg
+
+
+# ============================================================================
+# 2) 종목 선택 (전일 상한가 = Select_Tr_target_list.csv 최신일자 ST 종목)
+# ============================================================================
+def _st_code_set() -> set[str]:
+    if not KRX_CODE_CSV.exists():
+        return set()
+    df = pd.read_csv(KRX_CODE_CSV, dtype=str, usecols=["code", "group"])
+    df["code"] = df["code"].str.strip().str.zfill(6)
+    df["group"] = df["group"].str.strip().str.upper()
+    return set(df.loc[df["group"] == "ST", "code"])
+
+
+def _select_codes(explicit: str | None) -> list[tuple[str, str]]:
+    """반환: [(code6, name), ...].
+
+    explicit 지정 시 해당 종목만(쉼표로 여러 개 가능),
+    미지정 시 Select_Tr_target_list.csv 최신일자 ST(전일 상한가) **전체**.
+    """
+    name_map = _code_name_map()
+    if explicit:
+        out = []
+        for raw in str(explicit).split(","):
+            c = raw.strip().zfill(6)
+            if c and c != "000000":
+                out.append((c, name_map.get(c, c)))
+        if not out:
+            raise RuntimeError(f"--code 파싱 실패: {explicit!r}")
+        _log(f"--code 직접 지정 {len(out)}종목: {[c for c, _ in out]}")
+        return out
+
+    if not TARGET_CSV.exists():
+        raise RuntimeError(f"대상 CSV 없음: {TARGET_CSV} (--code 로 직접 지정하세요)")
+    df = pd.read_csv(TARGET_CSV, dtype=str, encoding="utf-8-sig")
+    if df.empty or "date" not in df.columns or "symbol" not in df.columns:
+        raise RuntimeError("Select_Tr_target_list.csv 형식 이상 (--code 로 직접 지정하세요)")
+    last_date = df["date"].max()
+    day = df[df["date"] == last_date].copy()
+    day["symbol"] = day["symbol"].str.strip().str.zfill(6)
+    codes = day["symbol"].tolist()
+    csv_names = dict(zip(day["symbol"], day.get("name", pd.Series(dtype=str)).astype(str))) if "name" in day.columns else {}
+
+    st_set = _st_code_set()
+    st_codes = [c for c in codes if c in st_set] if st_set else codes
+    if not st_codes:
+        raise RuntimeError(f"CSV({last_date}) 에서 ST 종목을 찾지 못했습니다.")
+
+    out = [(c, name_map.get(c) or csv_names.get(c) or c) for c in st_codes]
+    _log(f"전일 상한가({last_date}) ST {len(out)}종목 전체 구독: "
+         f"{', '.join(f'{n}({c})' for c, n in out)}")
+    return out
+
+
+# [260630] H0STASP0 실제 wire 필드(62) > asking_price_krx 등록컬럼(59) 보정용.
+#   부족분 3개를 잉여 컬럼으로 채워 라이브러리 reshape 가 프레임당 1레코드로 정렬되게 한다.
+#   (값은 실측상 0,0,0 — KIS 미문서 trailing 필드. 위치만 맞으면 코드 오정렬이 사라짐.)
+_ASP0_EXTRA_COLS = ["aspr_rsv1", "aspr_rsv2", "aspr_rsv3"]
+
+
+def asking_price_krx_full(tr_type: str, tr_key: str):
+    """asking_price_krx 래퍼 — 등록컬럼을 실제 wire 필드수(62)에 맞춘다."""
+    msg, cols = asking_price_krx(tr_type, tr_key)
+    return msg, list(cols) + _ASP0_EXTRA_COLS
+
+
+def _code_name_map() -> dict[str, str]:
+    try:
+        sdf = load_symbol_master()
+        sdf["code"] = sdf["code"].astype(str).str.zfill(6)
+        return dict(zip(sdf["code"], sdf["name"].astype(str)))
+    except Exception:
+        return {}
+
+
+# ============================================================================
+# 3) 수신 → 메모리 버퍼 누적 → 주기적 parquet "조각" 저장 → 종료 시 병합
+#    (production wss_data 와 동일 패턴: 조각마다 완결 parquet → 메모리·쓰기 일정)
+# ============================================================================
+# 컬럼 정렬: recv_ts, mksc_shrn_iscd, name 을 앞으로, 나머지는 수신 순서 유지
+_FRONT_COLS = ["recv_ts", "mksc_shrn_iscd", "name"]
+
+
+class OrderbookStore:
+    """전 종목 호가 프레임을 하나의 메모리 버퍼에 누적하고, flush() 마다 그동안 쌓인
+    분량을 **단일 parquet 조각**으로 기록한 뒤 버퍼를 비운다(메모리·쓰기 비용 일정).
+    각 조각은 완결된 parquet 이므로 쓰기 중 중단돼도 이전 조각은 안전하다.
+    종료 시 merge_all() 로 모든 조각을 모아 최종 parquet 1개로 병합한다.
+
+    저장 단위: 종목 구분 없이 **하나의 파일**(각 행에 mksc_shrn_iscd·name 포함).
+      읽을 때 코드로 거르면 됨(parquet 컬럼 필터). production wss_data 와 동일 방식.
+
+    수신대상(allowed) 외 코드는 저장하지 않는다(라이브러리 파싱 잔여/오정렬 방어).
+
+    파일명 시각은 모두 **KST**(CLAUDE.md 규정: 서버 UTC, 항상 KST). production wss 조각
+    규칙과 동일하게 `일자_시각(HHMMSS)_연번` 형식. 연번은 같은 초 중복 대비(01부터).
+
+    산출물:
+      - 조각:  {out_dir}/parts/{yymmdd}_orderbook_{HHMMSS_KST}_{nn}.parquet  (백업 보존)
+      - 최종:  {out_dir}/{yymmdd}_orderbook.parquet  (병합본, 전 종목, recv_ts 정렬)
+    """
+
+    def __init__(self, out_dir: Path, yymmdd: str, name_map: dict[str, str],
+                 allowed: set[str]):
+        self.out_dir = out_dir
+        self.parts_dir = out_dir / "parts"
+        self.parts_dir.mkdir(parents=True, exist_ok=True)
+        self.yymmdd = yymmdd
+        self.name_map = name_map
+        self.allowed = allowed                # 수신대상 종목코드 (이 외엔 제외)
+        self._buf: list[dict] = []            # 전 종목 공용 버퍼
+        self._codes_seen: set[str] = set()
+        self._dropped = 0                     # 대상外 제외 행수 (진단용)
+        self._lock = threading.Lock()
+        self.frames = 0          # 누적 프레임 수
+        self.rows = 0            # 누적 저장 행 수 (대상 종목만)
+        self.parts_written = 0   # 누적 조각 파일 수
+
+    def _final_path(self) -> Path:
+        return self.out_dir / f"{self.yymmdd}_orderbook.parquet"
+
+    def _new_part_path(self) -> Path:
+        """일자_시각(HHMMSS, KST)_연번 형식 조각 경로. 연번은 같은 초 중복 대비(01부터)."""
+        stamp = datetime.now(KST).strftime("%H%M%S")   # ★ KST
+        n = 1
+        while True:
+            path = self.parts_dir / f"{self.yymmdd}_orderbook_{stamp}_{n:02d}.parquet"
+            if not path.exists():
+                return path
+            n += 1
+
+    def add(self, code: str, recv_ts: str, records: list[dict]) -> None:
+        """code 가 수신대상(allowed)일 때만 버퍼에 누적. 그 외는 제외."""
+        if not records:
+            return
+        if code not in self.allowed:
+            with self._lock:
+                self._dropped += len(records)
+            return
+        name = self.name_map.get(code, code)
+        with self._lock:
+            for rec in records:
+                rec = dict(rec)
+                rec["recv_ts"] = recv_ts
+                rec["mksc_shrn_iscd"] = code      # 안전: 프레임 코드 보정
+                rec["name"] = name
+                self._buf.append(rec)
+            self._codes_seen.add(code)
+            self.rows += len(records)
+            self.frames += 1
+
+    def flush(self) -> int:
+        """버퍼 전체를 단일 조각 parquet 로 저장하고 버퍼를 비운다. 저장 행수 반환."""
+        with self._lock:
+            if not self._buf:
+                return 0
+            rows = self._buf
+            self._buf = []
+        try:
+            df = pd.DataFrame(rows)
+            cols = _FRONT_COLS + [c for c in df.columns if c not in _FRONT_COLS]
+            df = df[cols]
+            path = self._new_part_path()          # KST 시각(HHMMSS) 파일명
+            tmp = path.with_name(path.name + ".tmp")
+            df.to_parquet(str(tmp), index=False, engine="pyarrow", compression="zstd")
+            os.replace(tmp, path)                 # 원자 교체
+            self.parts_written += 1
+            return len(rows)
+        except Exception as e:
+            _log(f"⚠ 조각 저장 실패: {type(e).__name__}: {e}")
+            with self._lock:
+                self._buf[:0] = rows              # 되돌려 다음 주기 재시도
+            return 0
+
+    def merge_all(self) -> int:
+        """모든 조각을 모아 최종 parquet 1개로 병합(recv_ts 정렬). 총 행수 반환.
+        조각 파일은 백업용으로 남겨 둔다."""
+        parts = sorted(self.parts_dir.glob(f"{self.yymmdd}_orderbook_*.parquet"))
+        if not parts:
+            return 0
+        try:
+            df = pd.concat([pd.read_parquet(p) for p in parts], ignore_index=True)
+            df = df.sort_values("recv_ts", kind="stable").reset_index(drop=True)  # 수신순(KST)
+            final = self._final_path()
+            tmp = final.with_name(final.name + ".merge.tmp")
+            df.to_parquet(str(tmp), index=False, engine="pyarrow", compression="zstd")
+            os.replace(tmp, final)
+            return len(df)
+        except Exception as e:
+            _log(f"⚠ 병합 실패: {type(e).__name__}: {e}")
+            return 0
+
+    def code_count(self) -> int:
+        with self._lock:
+            return len(self._codes_seen)
+
+    def dropped(self) -> int:
+        with self._lock:
+            return self._dropped
+
+
+_store: OrderbookStore | None = None
+_bus: MarketDataBus | None = None        # 공유메모리 버스(생산자) — 소비자(프로덕션)가 읽음
+_last_progress = 0.0
+
+
+def _rec_int(rec: dict, key: str) -> int:
+    """H0STASP0 레코드 값(문자열)을 정수로. 빈값/오류는 0."""
+    try:
+        return int(float(str(rec.get(key) or 0).replace(",", "") or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _publish_bus(code: str, name: str, rec: dict, recv_epoch: float) -> None:
+    """종목 최신 호가를 공유메모리 버스에 발행(latest-wins). 버스 없으면 무시."""
+    if _bus is None:
+        return
+    try:
+        _bus.update_orderbook(
+            code, recv_epoch,
+            bsop_hour=str(rec.get("bsop_hour") or ""),
+            askp=[_rec_int(rec, f"askp{k}") for k in range(1, 11)],
+            bidp=[_rec_int(rec, f"bidp{k}") for k in range(1, 11)],
+            askp_rsqn=[_rec_int(rec, f"askp_rsqn{k}") for k in range(1, 11)],
+            bidp_rsqn=[_rec_int(rec, f"bidp_rsqn{k}") for k in range(1, 11)],
+            total_askp_rsqn=_rec_int(rec, "total_askp_rsqn"),
+            total_bidp_rsqn=_rec_int(rec, "total_bidp_rsqn"),
+            name=name,
+        )
+    except Exception:
+        pass
+
+
+def on_result(ws, tr_id, result, data_info):
+    """KISWebSocket 콜백. result = polars DataFrame (컬럼 대문자)."""
+    global _last_progress
+    if result is None or len(result) == 0:
+        return
+    if str(tr_id) != "H0STASP0":
+        return
+    # 수신 시점 기록 (프로덕션 on_result 와 동일 포맷)
+    recv_ts = datetime.now(KST).strftime(RECV_TS_FMT)
+    # 컬럼 소문자 통일 (프로덕션 wss_data 와 동일)
+    result = result.rename({c: c.strip().lower() for c in result.columns})
+    records = result.to_dicts()
+    # 프레임을 종목별로 분류 (다종목 동시 수신 대비). 수신대상 외 코드는 store.add 가 제외.
+    by_code: dict[str, list[dict]] = {}
+    for rec in records:
+        c = str(rec.get("mksc_shrn_iscd") or "").strip().zfill(6)
+        if not c or c == "000000":
+            continue
+        by_code.setdefault(c, []).append(rec)
+    recv_epoch = time.time()
+    for c, recs in by_code.items():
+        _store.add(c, recv_ts, recs)
+        # 버스에는 그 종목의 최신 1건만 발행(전략은 현재 호가상태만 필요)
+        if _bus is not None and c in _store.allowed:
+            _publish_bus(c, _store.name_map.get(c, c), recs[-1], recv_epoch)
+
+    now = time.time()
+    if now - _last_progress >= 5.0:
+        _last_progress = now
+        try:
+            r0 = records[0]
+            _log(f"수신중 종목={_store.code_count()}/{len(_store.allowed)} "
+                 f"frames={_store.frames} rows={_store.rows} 제외={_store.dropped()} "
+                 f"[{r0.get('mksc_shrn_iscd')}] askp1={r0.get('askp1')} bidp1={r0.get('bidp1')} "
+                 f"(bsop_hour={r0.get('bsop_hour')})")
+        except Exception:
+            pass
+
+
+# ============================================================================
+# 4) 주기 flush 스레드 + 종료 타이머
+# ============================================================================
+def _arm_flush(interval_sec: float) -> None:
+    def _loop():
+        while True:
+            time.sleep(max(2.0, interval_sec))
+            try:
+                n = _store.flush() if _store else 0
+                if n:
+                    _log(f"flush: {n}행 저장 (누적 frames={_store.frames} rows={_store.rows})")
+            except Exception as e:
+                _log(f"⚠ 주기 flush 예외: {e}")
+
+    threading.Thread(target=_loop, name="flush-loop", daemon=True).start()
+    _log(f"주기 flush 설정: {interval_sec:.0f}초마다 parquet 저장")
+
+
+def _arm_until(until_hhmm: str) -> None:
+    try:
+        hh, mm = (int(x) for x in until_hhmm.split(":"))
+    except Exception:
+        _log(f"--until 형식 오류('{until_hhmm}') → 종료 타이머 미설정")
+        return
+    target = dtime(hh, mm)
+
+    def _watch():
+        while True:
+            if datetime.now(KST).time() >= target:
+                _log(f"종료 시각 {until_hhmm} 도달 → 마지막 flush + 병합 후 종료")
+                if _store:
+                    _store.flush()
+                    n = _store.merge_all()
+                    _log(f"병합 완료: 총 {n}행 → {_store._final_path().name}")
+                os._exit(0)
+            time.sleep(2.0)
+
+    threading.Thread(target=_watch, name="until-watch", daemon=True).start()
+    _log(f"종료 타이머 설정: {until_hhmm} (KST)")
+
+
+# ============================================================================
+# main
+# ============================================================================
+def main() -> None:
+    global _store, _bus
+    ap = argparse.ArgumentParser(description="전일 상한가 종목 실시간 호가(H0STASP0) 기록기 (a2 계정, parquet + 공유메모리 버스)")
+    ap.add_argument("--code", default=None, help="종목코드(6자리, 쉼표로 여러 개). 미지정 시 전일 상한가 ST 전체")
+    ap.add_argument("--until", default="15:40", help="종료 시각 HH:MM (KST, 기본 15:40)")
+    ap.add_argument("--flush", type=float, default=20.0, help="parquet flush 주기(초, 기본 20)")
+    ap.add_argument("--bus", default="stockbus", help="공유메모리 버스 이름(빈 문자열이면 버스 비활성)")
+    args = ap.parse_args()
+
+    _setup_a2_auth()
+    targets = _select_codes(args.code)
+    codes = [c for c, _ in targets]
+    name_map = {c: n for c, n in targets}
+    allowed = set(codes)
+
+    yymmdd = datetime.now(KST).strftime("%y%m%d")
+    _store = OrderbookStore(OUT_DIR, yymmdd, name_map, allowed)
+
+    # 공유메모리 버스(생산자) — 프로덕션 등 소비자가 실시간 호가를 읽음
+    if args.bus:
+        try:
+            _bus = MarketDataBus.create(args.bus, capacity=256)
+            _bus.set_codes(codes)
+            _log(f"공유메모리 버스 생성: '{args.bus}' ({len(codes)}종목 슬롯 배정)")
+        except Exception as e:
+            _bus = None
+            _log(f"⚠ 버스 생성 실패(저장만 진행): {type(e).__name__}: {e}")
+
+    _arm_flush(args.flush)
+    _arm_until(args.until)
+
+    # 전일 상한가 종목 전체 H0STASP0 구독 → 끊김 시 라이브러리 내부 재연결(open_map 재전송)
+    #   ★ asking_price_krx 등록컬럼(59) < 실제 H0STASP0 wire 필드(62) → 라이브러리 reshape 가
+    #     잉여 3필드를 유령 레코드로 분리(코드 자리에 가격값) → 가짜 종목 발생.
+    #     62컬럼 반환 래퍼로 프레임당 정확히 1레코드 파싱되게 보정한다. (수신대상 필터로 이중 방어)
+    kws = ka.KISWebSocket(api_url="/tryitout", max_retries=50)
+    kws.subscribe(request=asking_price_krx_full, data=codes)
+    _log(f"H0STASP0 구독 시작: {len(codes)}종목 → {OUT_DIR}/{yymmdd}_orderbook.parquet")
+    try:
+        kws.start(on_result=on_result)
+    except KeyboardInterrupt:
+        _log("Ctrl+C 중단")
+    finally:
+        if _store:
+            _store.flush()
+            n = _store.merge_all()
+            _log(f"종료 — 종목={_store.code_count()}/{len(allowed)} frames={_store.frames} "
+                 f"rows={_store.rows} 제외={_store.dropped()} parts={_store.parts_written} "
+                 f"| 병합 총 {n}행 → {_store._final_path().name}")
+        if _bus is not None:
+            _bus.close(unlink=True)
+
+
+if __name__ == "__main__":
+    main()

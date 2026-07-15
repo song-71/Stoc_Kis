@@ -1,0 +1,1207 @@
+"""
+설정 파일 관리 유틸리티
+"""
+import json
+import logging
+import os
+import sys
+import unicodedata
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from typing import Any, Callable, Dict, Iterable, Optional, Sequence, Tuple
+
+import hashlib
+import pandas as pd
+import polars as pl
+import requests
+
+# 국내휴장일조회 API (국내주식-040)
+_API_PATH_HOLIDAY = "/uapi/domestic-stock/v1/quotations/chk-holiday"
+_TR_ID_HOLIDAY = "CTCA0903R"
+_KST = timezone(timedelta(hours=9))
+_CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+
+
+def _is_open_day_via_api(target_dt: datetime) -> bool:
+    """국내휴장일조회 API 호출로 개장일(Y) 여부 판단. kis_API_ohlcv_download_Utils는 lazy import로 순환 참조 방지."""
+    from kis_API_ohlcv_download_Utils import DEFAULT_BASE_URL, KisClient, KisConfig
+
+    cfg = load_config(_CONFIG_PATH)
+    appkey = cfg.get("appkey")
+    appsecret = cfg.get("appsecret")
+
+    # V2 멀티계좌 구조: 최상위에 appkey 없으면 default_user → main 계좌에서 가져옴
+    if not appkey or not appsecret:
+        try:
+            default_user = cfg["default_user"]
+            acct = cfg["users"][default_user]["accounts"]["a1"]
+            appkey = acct["appkey"]
+            appsecret = acct["appsecret"]
+        except (KeyError, TypeError):
+            pass
+
+    if not appkey or not appsecret:
+        raise RuntimeError("config에 appkey/appsecret이 없습니다.")
+
+    base_dir = os.path.dirname(_CONFIG_PATH)
+    token_path = os.path.join(base_dir, "kis_token_a1.json") if base_dir else "kis_token_a1.json"
+
+    client = KisClient(
+        KisConfig(
+            appkey=appkey,
+            appsecret=appsecret,
+            base_url=cfg.get("base_url") or DEFAULT_BASE_URL,
+            custtype=cfg.get("custtype") or "P",
+            market_div=cfg.get("market_div") or "J",
+            token_cache_path=token_path,
+        )
+    )
+    client.ensure_token()
+
+    yyyymmdd = target_dt.strftime("%Y%m%d")
+    url = f"{client.cfg.base_url}{_API_PATH_HOLIDAY}"
+    headers = client._headers(tr_id=_TR_ID_HOLIDAY)
+    params = {"BASS_DT": yyyymmdd, "CTX_AREA_NK": "", "CTX_AREA_FK": ""}
+
+    r = requests.get(url, headers=headers, params=params, timeout=10)
+    r.raise_for_status()
+    j = r.json()
+    if str(j.get("rt_cd")) != "0":
+        raise RuntimeError(f"API오류: {j.get('msg1', '')}")
+
+    output = j.get("output") or []
+    if isinstance(output, dict):
+        output = [output]
+    row = output[0] if output else {}
+    opnd_yn = str(row.get("opnd_yn", "N")).upper()
+    return opnd_yn == "Y"
+
+
+def is_holiday() -> bool:
+    """
+    오늘이 휴장일인지 반환합니다.
+
+    - config의 today_open_chk: {date: "YYYY-MM-DD", status: "open"|"holiday"}
+    - date가 오늘과 다르면 API 호출 후 결과를 config에 저장하고 반환
+    - date가 오늘이면 저장된 status로 판단
+
+    Returns:
+        True: 휴장일, False: 개장일
+    """
+    cfg = load_config(_CONFIG_PATH)
+    today = datetime.now(_KST).strftime("%Y-%m-%d")
+
+    chk = cfg.get("today_open_chk")
+    if isinstance(chk, dict):
+        stored_date = str(chk.get("date", ""))
+        stored_status = str(chk.get("status", "")).lower()
+    else:
+        stored_date = ""
+        stored_status = ""
+
+    if stored_date == today and stored_status in ("open", "holiday"):
+        return stored_status == "holiday"
+
+    # API 호출 후 config 저장
+    try:
+        target_dt = datetime.now(_KST)
+        is_open = _is_open_day_via_api(target_dt)
+    except Exception:
+        raise
+
+    status = "open" if is_open else "holiday"
+    cfg["today_open_chk"] = {"date": today, "status": status}
+    save_config(cfg, _CONFIG_PATH)
+    return not is_open
+
+
+def _detect_config_version(raw: dict) -> int:
+    """config dict의 버전 감지. V2는 'users' 키 + _config_version=2."""
+    if raw.get("_config_version") == 2 and "users" in raw:
+        return 2
+    return 1
+
+
+class ConfigProxy(dict):
+    """V2 config를 V1 플랫 뷰로 투영하는 dict 서브클래스.
+
+    읽기: cfg.get("appkey") → users.{default_user}.accounts.main.appkey
+    쓰기: cfg["strategy_swap"] = {...} → raw["strategy_swap"] = {...}
+    직렬화: get_raw() → V2 원본 구조 반환
+    """
+
+    USER_KEYS = {"BOT_TOKEN", "CHAT_ID", "my_htsid", "htsid"}
+    ACCOUNT_KEYS = {"appkey", "appsecret", "cano", "acnt_prdt_cd", "exclude_cash"}
+
+    def __init__(self, raw: dict):
+        self._raw = raw
+        flat = self._build_flat(raw)
+        super().__init__(flat)
+
+    def _build_flat(self, raw: dict) -> dict:
+        flat = {}
+        # global keys (users 제외 모든 루트 키)
+        for k, v in raw.items():
+            if k != "users":
+                flat[k] = v
+        # default user → flat
+        uid = raw.get("default_user", "")
+        user = raw.get("users", {}).get(uid, {})
+        for k, v in user.items():
+            if k != "accounts":
+                flat[k] = v
+        # my_htsid 호환: V2에서 htsid로 저장되지만 기존 코드는 my_htsid 사용
+        if "htsid" in user and "my_htsid" not in flat:
+            flat["my_htsid"] = user["htsid"]
+        # main account → flat (appkey, cano 등)
+        main_acct = user.get("accounts", {}).get("a1", {})
+        for k, v in main_acct.items():
+            flat[k] = v
+        # accounts dict 유지 (syw_2 접근용) - main 제외
+        if "accounts" in user:
+            flat["accounts"] = {
+                aid: dict(acfg) for aid, acfg in user["accounts"].items()
+                if aid != "a1"
+            }
+        return flat
+
+    def __setitem__(self, key, value):
+        super().__setitem__(key, value)
+        # 쓰기 시 raw에도 반영
+        uid = self._raw.get("default_user", "")
+        users = self._raw.get("users", {})
+        user = users.get(uid, {})
+        main_acct = user.get("accounts", {}).get("a1", {})
+
+        if key in self.ACCOUNT_KEYS and "a1" in user.get("accounts", {}):
+            main_acct[key] = value
+        elif key in self.USER_KEYS and uid in users:
+            user[key] = value
+        else:
+            self._raw[key] = value
+
+    def get_raw(self) -> dict:
+        """V2 원본 구조 반환 (save_config에서 사용)."""
+        return self._raw
+
+
+def _migrate_config_to_v2(v1: dict) -> dict:
+    """V1 플랫 config → V2 users 중심 구조로 변환 (메모리 내)."""
+    htsid = v1.get("my_htsid", "default")
+
+    # main account (루트의 appkey/cano 등)
+    main_acct = {}
+    for k in ("appkey", "appsecret", "cano", "acnt_prdt_cd", "exclude_cash"):
+        if k in v1:
+            main_acct[k] = v1[k]
+
+    # 기존 accounts (syw_2 등)
+    old_accounts = v1.get("accounts", {})
+    accounts = {"a1": main_acct}
+    for aid, acfg in old_accounts.items():
+        accounts[aid] = dict(acfg)
+
+    # user block
+    user = {
+        "htsid": htsid,
+        "BOT_TOKEN": v1.get("BOT_TOKEN", ""),
+        "CHAT_ID": v1.get("CHAT_ID", ""),
+        "accounts": accounts,
+    }
+
+    # global (users/account 키 제외한 나머지)
+    skip = {"appkey", "appsecret", "cano", "acnt_prdt_cd", "exclude_cash",
+            "BOT_TOKEN", "CHAT_ID", "my_htsid", "accounts"}
+    v2 = {"_config_version": 2, "default_user": htsid}
+    for k, v in v1.items():
+        if k not in skip:
+            v2[k] = v
+    v2["users"] = {htsid: user}
+    return v2
+
+
+def load_config(config_path: str = "config.json", account_id: str | None = None) -> Dict[str, str]:
+    """
+    설정 파일을 읽어서 딕셔너리로 반환합니다.
+    
+    Args:
+        config_path: 설정 파일 경로 (기본값: config.json)
+        account_id: 계정 ID (accounts 하위에서 오버라이드)
+        
+    Returns:
+        설정 값들이 담긴 딕셔너리
+        
+    Raises:
+        FileNotFoundError: 설정 파일이 존재하지 않을 때
+        json.JSONDecodeError: JSON 파싱 오류
+    """
+    if not os.path.exists(config_path):
+        raise FileNotFoundError(f"설정 파일을 찾을 수 없습니다: {config_path}")
+
+    with open(config_path, "r", encoding="utf-8") as f:
+        raw = json.load(f)
+
+    ver = _detect_config_version(raw)
+
+    if ver == 1:
+        # V1: account_id 지정 시 기존 병합 로직
+        if account_id:
+            accounts = raw.get("accounts", {})
+            if isinstance(accounts, dict) and account_id in accounts:
+                base_cfg = {k: v for k, v in raw.items() if k != "accounts"}
+                merged = dict(base_cfg)
+                merged.update(accounts.get(account_id, {}))
+                if "cano" in merged:
+                    merged.setdefault("cano1", merged.get("cano", ""))
+                    merged.setdefault("cano2", merged.get("cano", ""))
+                return merged
+        return raw  # V1은 기존대로 plain dict 반환
+
+    # V2: ConfigProxy로 감싸서 반환
+    if account_id:
+        # V2에서 account_id 지정 시: 해당 계좌의 키를 플랫으로 오버라이드
+        uid = raw.get("default_user", "")
+        user = raw.get("users", {}).get(uid, {})
+        acct = user.get("accounts", {}).get(account_id, {})
+        if acct:
+            proxy = ConfigProxy(raw)
+            for k, v in acct.items():
+                dict.__setitem__(proxy, k, v)  # 플랫 뷰만 업데이트
+            return proxy
+    return ConfigProxy(raw)
+
+
+def resolve_account_config(config_path: str = "config.json", account_id: str | None = None) -> Dict[str, str]:
+    """
+    공통 설정 + 계정별 오버라이드를 병합한 설정을 반환합니다.
+    """
+    return load_config(config_path=config_path, account_id=account_id)
+
+
+def stQueryDB(code: str, parquet_path: str | None = None) -> Dict[str, Any]:
+    """
+    1d 파케이트 DB에서 종목코드 기준 최신 행을 반환합니다.
+    반환 키 예: open, high, low, close, volume, value, pdy_close, R_avr 등
+    """
+    if not code:
+        return {}
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    path = parquet_path or os.path.join(base_dir, "data", "1d_data", "kis_1d_unified_parquet_DB.parquet")
+    if not os.path.exists(path):
+        return {}
+    cols = [
+        "date",
+        "symbol",
+        "code",
+        "name",
+        "open",
+        "high",
+        "low",
+        "close",
+        "volume",
+        "value",
+        "pdy_close",
+        "R_avr",
+    ]
+    try:
+        df = pl.read_parquet(path, columns=cols)
+    except Exception:
+        try:
+            df = pl.read_parquet(path)
+        except Exception:
+            return {}
+    if df.is_empty():
+        return {}
+    if "symbol" in df.columns:
+        df = df.filter(pl.col("symbol").cast(pl.Utf8) == str(code))
+    elif "code" in df.columns:
+        df = df.filter(pl.col("code").cast(pl.Utf8) == str(code))
+    if df.is_empty():
+        return {}
+    if "date" in df.columns:
+        try:
+            df = df.sort("date")
+        except Exception:
+            pass
+    row = df.tail(1).to_dicts()[0]
+    return row
+
+
+def now_kst_str() -> str:
+    kst = timezone(timedelta(hours=9))
+    return datetime.now(kst).strftime("%y%m%d_%H%M%S")
+
+
+class KSTFormatter(logging.Formatter):
+    def formatTime(self, record, datefmt=None):
+        kst = timezone(timedelta(hours=9))
+        dt = datetime.fromtimestamp(record.created, tz=kst)
+        if datefmt:
+            return dt.strftime(datefmt)
+        return dt.isoformat()
+
+
+class _DropNoConsoleFilter(logging.Filter):
+    """no_console=True 레코드는 콘솔 핸들러에서 제외 (중복 방지)"""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return not getattr(record, "no_console", False)
+
+
+class LogManager:
+    """
+    출력 3단계 통합 로거 (화면 출력 항상 보장, 텔레그램 전송 시 반드시 화면 선행)
+
+    1단계 log_screen : 화면만
+    2단계 log       : 화면 + 로그파일
+    3단계 log_tm    : 화면 + 로그 + 텔레그램
+
+    사용법:
+        lm = LogManager(log_dir)
+        lm.log_screen("화면만")
+        lm.log("화면+로그")
+        lm.log_tm("화면+로그+텔레그램")
+
+    prefix_callback: 시간 접두어 함수 (예: lambda: "[260215_012345]") - 미지정 시 KST 현재시각 사용
+    """
+
+    def __init__(
+        self,
+        log_dir: str,
+        log_name: str | None = None,
+        run_tag: str | None = None,
+        prefix_callback: Callable[[], str] | None = None,
+    ):
+        self.log_dir = log_dir
+        os.makedirs(self.log_dir, exist_ok=True)
+
+        if log_name:
+            log_file = os.path.join(self.log_dir, log_name)
+        else:
+            timestamp = now_kst_str()
+            log_file = os.path.join(self.log_dir, f"KIS_log_{timestamp}.log")
+        self.log_file = log_file
+
+        kst = timezone(timedelta(hours=9))
+
+        def _default_prefix() -> str:
+            return "[" + datetime.now(kst).strftime("%y%m%d_%H:%M:%S") + "]"
+
+        self._prefix = prefix_callback if prefix_callback else _default_prefix
+
+        self.logger = logging.getLogger("KISLogger")
+        self.logger.setLevel(logging.INFO)
+        self.logger.propagate = False
+
+        if not self.logger.handlers:
+            ch = logging.StreamHandler()
+            ch.setLevel(logging.INFO)
+            ch.addFilter(_DropNoConsoleFilter())
+
+            fh = logging.FileHandler(log_file, encoding="utf-8")
+            fh.setLevel(logging.INFO)
+
+            formatter = KSTFormatter(
+                "[%(asctime)s] %(message)s",
+                datefmt="%y%m%d_%H:%M:%S",
+            )
+            ch.setFormatter(formatter)
+            fh.setFormatter(formatter)
+
+            self.logger.addHandler(ch)
+            self.logger.addHandler(fh)
+
+        if run_tag:
+            try:
+                with open(log_file, "a", encoding="utf-8") as f:
+                    f.write("\n" + "=" * 20 + "\n")
+                    f.write(run_tag + "\n")
+            except Exception:
+                pass
+        print(f"📝 로그 파일: {log_file}")
+
+    def _fmt(self, msg: str) -> str:
+        """접두어 + 메시지 (log_screen, log_tm 화면 출력용)"""
+        return self._prefix() + " " + msg
+
+    def log_screen(self, msg: str) -> None:
+        """1단계: 화면만 출력"""
+        out = self._fmt(msg)
+        sys.stdout.write(out + "\n")
+        sys.stdout.flush()
+
+    def log(self, msg: str) -> None:
+        """2단계: 화면 + 로그 파일"""
+        self.logger.info(msg)
+
+    def log_tm(self, msg: str) -> None:
+        """3단계: 화면 + 로그 + 텔레그램 (텔레그램 전송 시 반드시 화면 선행)"""
+        out = self._fmt(msg)
+        sys.stdout.write(out + "\n")
+        sys.stdout.flush()
+        self.logger.info(msg, extra={"no_console": True})
+        try:
+            from telegMsg import tmsg
+
+            tmsg(out, "-t")
+        except ImportError:
+            pass
+        except Exception as e:
+            self.logger.warning(f"텔레그램 메시지 전송 실패: {e}")
+
+    def log_raw(self, msg: str) -> None:
+        """2단계(raw): 화면 + 로그, msg 그대로 (호출자가 접두어 포함하여 전달, 파일은 msg 그대로 기록)"""
+        sys.stdout.write(msg + "\n")
+        sys.stdout.flush()
+        try:
+            with open(self.log_file, "a", encoding="utf-8") as f:
+                f.write(msg + "\n")
+        except Exception:
+            pass
+
+    def log_file_only(self, msg: str) -> None:
+        """파일만 기록 (화면 출력 없음)"""
+        try:
+            with open(self.log_file, "a", encoding="utf-8") as f:
+                f.write(msg + "\n")
+        except Exception:
+            pass
+
+    def log_tm_raw(self, msg: str) -> None:
+        """3단계(raw): 화면 + 로그 + 텔레그램, msg 그대로 (호출자가 접두어 포함하여 전달)"""
+        sys.stdout.write(msg + "\n")
+        sys.stdout.flush()
+        try:
+            with open(self.log_file, "a", encoding="utf-8") as f:
+                f.write(msg + "\n")
+        except Exception:
+            pass
+        try:
+            from telegMsg import tmsg
+
+            tmsg(msg, "-t")
+        except ImportError:
+            pass
+        except Exception as e:
+            self.logger.warning(f"텔레그램 메시지 전송 실패: {e}")
+
+
+class TeeStdout:
+    def __init__(self, log_file: str):
+        self.log_file = log_file
+        self._file = open(log_file, "a", encoding="utf-8")
+        self._stdout = sys.stdout
+
+    def write(self, data: str) -> None:
+        if data:
+            self._file.write(data)
+            self._file.flush()
+        self._stdout.write(data)
+        self._stdout.flush()
+
+    def flush(self) -> None:
+        self._file.flush()
+        self._stdout.flush()
+
+    def close(self) -> None:
+        try:
+            self._file.close()
+        except Exception:
+            pass
+
+
+def display_width(text: str) -> int:
+    width = 0
+    for ch in text:
+        if unicodedata.east_asian_width(ch) in ("W", "F"):
+            width += 2
+        else:
+            width += 1
+    return width
+
+
+def pad_text(text: str, width: int, align: str = "left") -> str:
+    text_width = display_width(text)
+    if text_width >= width:
+        return text
+    pad = width - text_width
+    if align == "right":
+        return " " * pad + text
+    if align == "center":
+        left = pad // 2
+        right = pad - left
+        return " " * left + text + " " * right
+    return text + " " * pad
+
+
+def print_table(rows: list[dict], columns: list[str], align: dict[str, str],
+                max_rows: int | None = None, no_print: bool = False,
+                header_sep: bool = True) -> str:
+    """
+    한글 폭 보정 정렬 테이블 출력 + 문자열 반환.
+      max_rows=None : 전체 행 출력
+      max_rows=20   : 앞 10행 + ... + 뒤 10행 (중간 생략)
+      no_print=True : stdout 출력 없이 문자열만 반환
+      header_sep=False : 헤더와 데이터 사이 ─ 구분선 생략
+    """
+    if not rows:
+        return ""
+    str_rows = []
+    widths = {col: display_width(col) for col in columns}
+    for row in rows:
+        srow = {}
+        for col in columns:
+            val = row.get(col, "")
+            s = "" if val is None else str(val)
+            srow[col] = s
+            widths[col] = max(widths[col], display_width(s))
+        str_rows.append(srow)
+    # 출력 대상 행 결정
+    n = len(str_rows)
+    if max_rows is not None and n > max_rows:
+        half = max_rows // 2
+        show_rows = str_rows[:half] + [None] + str_rows[-half:]
+    else:
+        show_rows = str_rows
+    # 헤더 + 구분선
+    lines: list[str] = []
+    header = "  ".join(pad_text(col, widths[col], align.get(col, "left")) for col in columns)
+    lines.append(header)
+    if header_sep:
+        lines.append("  ".join("─" * widths[col] for col in columns))
+    # 행 출력
+    for srow in show_rows:
+        if srow is None:
+            lines.append("  ".join(pad_text("...", widths[col], "center") for col in columns))
+        else:
+            lines.append("  ".join(pad_text(srow[col], widths[col], align.get(col, "left")) for col in columns))
+    result = "\n".join(lines)
+    if not no_print:
+        print(result)
+        print(f"[{n} rows x {len(columns)} columns]")
+    return result
+
+
+def save_config(config: Dict[str, str], config_path: str = "config.json") -> None:
+    """
+    설정을 파일에 저장합니다.
+    ConfigProxy인 경우 V2 raw 구조로 저장합니다.
+    """
+    # ConfigProxy면 V2 raw 구조로 저장
+    if isinstance(config, ConfigProxy):
+        raw = config.get_raw()
+    else:
+        raw = config
+    with open(config_path, "w", encoding="utf-8") as f:
+        json.dump(raw, f, ensure_ascii=False, indent=2)
+
+
+def get_config_value(config: Dict[str, str], key: str, default: Optional[str] = None) -> Optional[str]:
+    """
+    설정 딕셔너리에서 값을 가져옵니다.
+    
+    Args:
+        config: 설정 딕셔너리
+        key: 가져올 키
+        default: 기본값 (키가 없을 때)
+        
+    Returns:
+        설정 값 또는 기본값
+    """
+    return config.get(key, default)
+
+
+def get_user_config(config: dict, user_id: str | None = None) -> dict:
+    """V2 config에서 특정 사용자 설정 반환."""
+    raw = config.get_raw() if isinstance(config, ConfigProxy) else config
+    if _detect_config_version(raw) < 2:
+        return config
+    uid = user_id or raw.get("default_user", "")
+    return raw.get("users", {}).get(uid, {})
+
+
+def get_account_config(config: dict, account_id: str, user_id: str | None = None) -> dict:
+    """V2 config에서 특정 계좌 설정 반환."""
+    user = get_user_config(config, user_id)
+    return user.get("accounts", {}).get(account_id, {})
+
+
+def migrate_config_file_to_v2(config_path: str = "config.json") -> None:
+    """V1 config 파일을 V2로 변환 (백업 생성)."""
+    import shutil
+
+    with open(config_path, "r", encoding="utf-8") as f:
+        raw = json.load(f)
+    if _detect_config_version(raw) >= 2:
+        return  # 이미 V2
+    # 백업
+    backup_path = config_path + ".v1.bak"
+    shutil.copy2(config_path, backup_path)
+    # 변환 + 저장
+    v2 = _migrate_config_to_v2(raw)
+    with open(config_path, "w", encoding="utf-8") as f:
+        json.dump(v2, f, ensure_ascii=False, indent=2)
+
+
+def load_checkpoints(config_path: str = "config.json") -> Dict[str, str]:
+    try:
+        cfg = load_config(config_path)
+    except FileNotFoundError:
+        return {}
+    return cfg.get("checkpoints", {}) or {}
+
+
+def update_checkpoint(config_path: str, name: str, date_str: str) -> None:
+    cfg = load_config(config_path)
+    checkpoints = cfg.get("checkpoints", {}) or {}
+    checkpoints[name] = date_str
+    cfg["checkpoints"] = checkpoints
+    save_config(cfg, config_path)
+
+
+# =============================================================================
+# KIS Data Layout (local + S3) + DuckDB helpers
+# =============================================================================
+
+
+def _default_local_root() -> str:
+    return os.path.join(os.path.expanduser("~"), "Stoc_Kis", "data")
+
+
+@dataclass(frozen=True)
+class KisDataLayout:
+    """
+    표준 저장 구조 정의
+    - 로컬: /home/ubuntu/Stoc_Kis/data (TEMP -> OUT -> S3)
+    - S3: s3://tfttrain/KIS_DB/...
+    """
+
+    local_root: str = _default_local_root()
+    s3_bucket: str = "tfttrain"
+    s3_prefix: str = "KIS_DB"
+    bucket_count_1m: int = 16
+
+    # Local subpaths
+    def local_temp_by_symbol_1d(self) -> str:
+        return os.path.join(self.local_root, "temp", "by_symbol", "1d")
+
+    def local_temp_by_symbol_1m(self) -> str:
+        return os.path.join(self.local_root, "temp", "by_symbol", "1m")
+
+    def local_out_1d_date(self, date_str: str) -> str:
+        return os.path.join(
+            self.local_root, "temp_out", "market_data", "1d", f"date={date_str}", "ohlcv.parquet"
+        )
+
+    def local_out_1m_date(self, date_str: str) -> str:
+        return os.path.join(
+            self.local_root, "temp_out", "market_data", "1m", f"date={date_str}", "ohlcv.parquet"
+        )
+
+    def local_out_1m_bucket(self, date_str: str, bucket: str) -> str:
+        return os.path.join(
+            self.local_root,
+            "temp_out",
+            "market_data",
+            "1m",
+            f"date={date_str}",
+            f"bucket={bucket}",
+            "ohlcv.parquet",
+        )
+
+    def local_features_1d_signal(self, date_str: str) -> str:
+        return os.path.join(
+            self.local_root, "temp_out", "features", "1d_signal", f"date={date_str}", "signal.parquet"
+        )
+
+    # S3 subpaths
+    def s3_1d_date(self, date_str: str) -> str:
+        return f"s3://{self.s3_bucket}/{self.s3_prefix}/market_data/1d/date={date_str}/ohlcv.parquet"
+
+    def s3_1m_date(self, date_str: str) -> str:
+        return f"s3://{self.s3_bucket}/{self.s3_prefix}/market_data/1m/date={date_str}/ohlcv.parquet"
+
+    def s3_1m_bucket(self, date_str: str, bucket: str) -> str:
+        return (
+            f"s3://{self.s3_bucket}/{self.s3_prefix}/market_data/1m/"
+            f"date={date_str}/bucket={bucket}/ohlcv.parquet"
+        )
+
+    def s3_features_1d_signal(self, date_str: str) -> str:
+        return (
+            f"s3://{self.s3_bucket}/{self.s3_prefix}/features/1d_signal/"
+            f"date={date_str}/signal.parquet"
+        )
+
+    def s3_glob_1d(self) -> str:
+        return f"s3://{self.s3_bucket}/{self.s3_prefix}/market_data/1d/date=*/ohlcv.parquet"
+
+    def s3_glob_1m(self) -> str:
+        return f"s3://{self.s3_bucket}/{self.s3_prefix}/market_data/1m/date=*/ohlcv.parquet"
+
+
+def load_kis_data_layout(config_path: str = "config.json") -> KisDataLayout:
+    """
+    config.json에서 저장 구조 기본값을 읽어 KisDataLayout 반환
+    (없으면 기본값 사용)
+    """
+    cfg: Dict[str, str] = {}
+    try:
+        cfg = load_config(config_path)
+    except FileNotFoundError:
+        cfg = {}
+
+    return KisDataLayout(
+        local_root=cfg.get("local_root", _default_local_root()),
+        s3_bucket=cfg.get("s3_bucket", "tfttrain"),
+        s3_prefix=cfg.get("s3_prefix", "KIS_DB"),
+        bucket_count_1m=int(cfg.get("bucket_count_1m", 16)),
+    )
+
+
+def _tm(msg: str) -> None:
+    """
+    텔레그램 메시지 전송
+    - telegMsg.tmsg(msg, "-t") 사용 (TFT_utils 방식)
+    """
+    try:
+        from telegMsg import tmsg
+
+        tmsg(msg, "-t")
+        
+    except Exception:
+        return
+
+
+def send_telegram(msg: str) -> None:
+    _tm(msg)
+
+
+def symbol_master_path(layout: KisDataLayout) -> str:
+    return os.path.join(layout.local_root, "admin", "symbol_master", "KRX_code.parquet")
+
+
+def load_symbol_master(config_path: str = "config.json"):
+    import pandas as pd
+
+    layout = load_kis_data_layout(config_path)
+    path = symbol_master_path(layout)
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"symbol master parquet 없음: {path}")
+    return pd.read_parquet(path)
+
+
+_SYMBOL_MASTER_CACHE = {}
+
+
+def load_symbol_master_cached(config_path: str = "config.json"):
+    if config_path in _SYMBOL_MASTER_CACHE:
+        return _SYMBOL_MASTER_CACHE[config_path]
+    df = load_symbol_master(config_path)
+    _SYMBOL_MASTER_CACHE[config_path] = df
+    return df
+
+
+def _normalize_symbol_code(text: str) -> str:
+    return str(text).strip().zfill(6)
+
+
+def KRX_code(
+    query: str, config_path: str = "config.json"
+) -> tuple[str | None, str | None, str | None, str | None, str | None]:
+    """
+    입력된 종목코드/명에 대해 code, name, nxt, market, iscd_stat_cls_code(종목상태) 반환
+      * 종목코드/명 : 종목코드(6자리 미만 포함) 또는 종목명(한글 포함)
+      * 영문은 소문자도 검색 허용
+      * iscd_stat_cls_code: 57/59=30분 단일가, 58=상장폐지 예정(거래 제외) 등
+    """
+    q = str(query).strip()
+    if not q:
+        return None, None, None, None, None
+    df = load_symbol_master_cached(config_path)
+    if "code" not in df.columns or "name" not in df.columns:
+        return None, None, None, None, None
+
+    def _market_from_row(row) -> str | None:
+        if "market" not in row.index:
+            return None
+        v = row["market"]
+        if pd.isna(v) or v == "" or str(v) in ("nan", "None"):
+            return None
+        return str(v)
+
+    def _status_from_row(row) -> str | None:
+        if "iscd_stat_cls_code" not in row.index:
+            return None
+        v = row["iscd_stat_cls_code"]
+        if pd.isna(v) or v == "" or str(v) in ("nan", "None"):
+            return None
+        return str(v)
+
+    # code match
+    code = _normalize_symbol_code(q)
+    exact = df[df["code"].astype(str).map(_normalize_symbol_code) == code]
+    if not exact.empty:
+        row = exact.iloc[0]
+        nxt = str(row["nxt"]) if "nxt" in row.index else "N"
+        return code, str(row["name"]), nxt, _market_from_row(row), _status_from_row(row)
+    # name match (영문은 대소문자 구분 없이 검색: q.upper()와 비교)
+    match = df[df["name"].astype(str).str.upper() == q.upper()]
+    if not match.empty:
+        row = match.iloc[0]
+        code_val = _normalize_symbol_code(row["code"])
+        nxt = str(row["nxt"]) if "nxt" in row.index else "N"
+        return code_val, str(row["name"]), nxt, _market_from_row(row), _status_from_row(row)
+    return None, None, None, None, None
+
+
+def KRX_code_batch(
+    symbols: list[str], config_path: str = "config.json"
+) -> dict[str, str | None]:
+    """
+    여러 종목코드에 대해 iscd_stat_cls_code(종목상태) 반환. code -> status 매핑.
+    KRX_code와 동일 데이터 소스 사용. merge로 일괄 조회하여 성능 최적화.
+    """
+    if not symbols:
+        return {}
+    df = load_symbol_master_cached(config_path)
+    if "code" not in df.columns or "iscd_stat_cls_code" not in df.columns:
+        return {s: None for s in symbols}
+    lookup = pd.DataFrame(
+        {"_q": symbols, "_norm": [_normalize_symbol_code(s) for s in symbols]}
+    )
+    master = df[["code", "iscd_stat_cls_code"]].copy()
+    master["_norm"] = master["code"].astype(str).map(_normalize_symbol_code)
+    master = master.drop_duplicates(subset=["_norm"], keep="first")
+    merged = lookup.merge(master[["_norm", "iscd_stat_cls_code"]], on="_norm", how="left")
+    result: dict[str, str | None] = {}
+    for orig, val in zip(merged["_q"], merged["iscd_stat_cls_code"]):
+        if pd.isna(val) or str(val) in ("", "nan", "None"):
+            result[orig] = None
+        else:
+            result[orig] = str(val)
+    return result
+
+
+def resolve_symbol(query: str, df):
+    q = query.strip()
+    if not q:
+        return None, []
+    # code exact match
+    exact = df[df["code"] == q]
+    if not exact.empty:
+        row = exact.iloc[0]
+        return row, []
+    # name contains
+    matches = df[df["name"].str.contains(q, na=False)]
+    if len(matches) == 1:
+        return matches.iloc[0], []
+    return None, matches
+
+
+def bucket_for_symbol(symbol: str, bucket_count: int = 16) -> str:
+    """
+    symbol을 안정적으로 버킷 분배 (00 ~ N-1)
+    - hash(symbol) % N (SHA1 사용)
+    """
+    h = hashlib.sha1(symbol.encode("utf-8")).hexdigest()
+    idx = int(h, 16) % bucket_count
+    return f"{idx:02d}"
+
+
+def s3_paths_1m_for_symbols(
+    layout: KisDataLayout,
+    date_list: Sequence[str],
+    symbols: Sequence[str],
+) -> Sequence[str]:
+    """
+    1m 조회용 S3 경로 리스트 (date + bucket 제한)
+    """
+    buckets = {bucket_for_symbol(sym, layout.bucket_count_1m) for sym in symbols}
+    paths = []
+    for d in date_list:
+        for b in sorted(buckets):
+            paths.append(layout.s3_1m_bucket(d, b))
+    return paths
+
+
+def list_s3_1d_paths(layout: KisDataLayout, date_from: str, date_to: str) -> list[str]:
+    import boto3
+
+    s3 = boto3.client("s3")
+    prefix = f"{layout.s3_prefix}/market_data/1d/date="
+    paginator = s3.get_paginator("list_objects_v2")
+    paths: list[str] = []
+    for page in paginator.paginate(Bucket=layout.s3_bucket, Prefix=prefix):
+        for obj in page.get("Contents", []) or []:
+            key = obj.get("Key", "")
+            if not key.endswith("/ohlcv.parquet"):
+                continue
+            try:
+                part = key.split("date=", 1)[1]
+                date_str = part.split("/", 1)[0]
+            except Exception:
+                continue
+            if date_from <= date_str <= date_to:
+                paths.append(f"s3://{layout.s3_bucket}/{key}")
+    return sorted(paths)
+
+
+def _kr_tick_size(price: float, market: str = "KOSPI") -> int:
+    """호가단위 반환 (KRX 2023.1.25 개편 통합표. KOSPI/KOSDAQ/코넥스 동일).
+
+    market 인자는 하위호환용으로 유지하되 값은 사용하지 않음(개편 후 시장 무관).
+      ~2,000:1 / ~5,000:5 / ~20,000:10 / ~50,000:50 /
+      ~200,000:100 / ~500,000:500 / 그 이상:1,000
+    ※ ETF/ETN/ELW(5원 고정)는 예외 — 이 함수는 개별주 기준.
+    """
+    if price < 2000:
+        return 1
+    if price < 5000:
+        return 5
+    if price < 20000:
+        return 10
+    if price < 50000:
+        return 50
+    if price < 200000:
+        return 100
+    if price < 500000:
+        return 500
+    return 1000
+
+
+def calc_limit_up_price(prev_close: float, market: str = "KOSPI") -> float:
+    """KRX 공식 상한가: 변동폭(기준가×30%)을 호가단위로 절사 → 기준가+변동폭을 호가단위로 절사."""
+    if prev_close is None or prev_close != prev_close or prev_close <= 0:
+        return float("nan")
+    fluct_raw = prev_close * 0.3
+    tick_f    = _kr_tick_size(fluct_raw, market)
+    fluct     = int(fluct_raw / tick_f) * tick_f
+    raw_upper = prev_close + fluct
+    tick_u    = _kr_tick_size(raw_upper, market)
+    return int(raw_upper / tick_u) * tick_u
+
+
+def round_to_tick(price: float, market: str = "KOSPI") -> float:
+    """가격을 호가단위로 반올림."""
+    tick = _kr_tick_size(price, market)
+    return round(price / tick) * tick
+
+
+def price_minus_one_tick(price: float, market: str = "KOSPI") -> float:
+    """가격에서 1틱 낮춘 가격 반환."""
+    if price <= 0:
+        return price
+    tick = _kr_tick_size(price, market)
+    return max(tick, price - tick)
+
+
+def price_plus_n_ticks(price: float, n: int = 1, market: str = "KOSPI") -> float:
+    """가격 + N틱 (호가단위 기반). 상한가 초과 방지는 호출측 책임."""
+    if price <= 0 or n <= 0:
+        return price
+    tick = _kr_tick_size(price, market)
+    return round_to_tick(price + tick * n, market)
+
+
+# ── 수수료·세금 상수 (전략·실행·시뮬 공용 단일 출처) ──────────────────────────
+FEE_RATE_MARKET_BUY  = 0.0015   # 시장가 매수 수수료+세금+슬리피지 0.15%
+FEE_RATE_MARKET_SELL = 0.0035   # 시장가 매도 수수료+세금+슬리피지 0.35%
+FEE_RATE_LIMIT_BUY   = 0.00015  # 지정가 매수 수수료 0.015%
+FEE_RATE_LIMIT_SELL  = 0.002    # 지정가 매도 수수료+세금 0.2%
+
+
+def get_tick_size(price: float, market: str = "KOSPI") -> int:
+    """호가단위 공개 래퍼 (내부 _kr_tick_size)."""
+    return _kr_tick_size(price, market)
+
+
+def calc_sell_pnl(
+    buy_price: float,
+    sell_price: float,
+    qty: int,
+    market: str = "KOSPI",
+) -> dict:
+    """
+    매도 수익·손익 계산 (수수료·세금 포함). [str1 → kis_utils 이전: 전략 무관 공용 유틸]
+
+    buy_price  : 실제 매수 체결가 (전일 종가)
+    sell_price : 매도 주문 기준가 (bidp1 또는 시장가)
+    qty        : 수량
+
+    Returns dict:
+        actual_sell_price : 슬리피지 반영 실 매도가
+        buy_amt           : 매수 비용 (수수료 포함)
+        sell_amt          : 매도 수익 (수수료·세금 포함)
+        pnl               : 손익 (sell_amt - buy_amt)
+        ret_pct           : 수익률 (%)
+    """
+    actual_sell_price = round_to_tick(
+        sell_price * (1 - FEE_RATE_MARKET_SELL), market
+    )
+    buy_amt  = buy_price * qty * (1 + FEE_RATE_LIMIT_BUY)
+    sell_amt = actual_sell_price * qty
+    pnl      = sell_amt - buy_amt
+    ret_pct  = (actual_sell_price / buy_price - 1) * 100 if buy_price > 0 else 0.0
+    return {
+        "actual_sell_price": actual_sell_price,
+        "buy_amt":  buy_amt,
+        "sell_amt": sell_amt,
+        "pnl":      pnl,
+        "ret_pct":  ret_pct,
+    }
+
+
+def calc_limit_down_price(prev_close: float, market: str = "KOSPI") -> float:
+    """KRX 공식 하한가: 변동폭(기준가×30%)을 호가단위로 절사 → 기준가-변동폭을 호가단위로 올림(ceil)."""
+    if prev_close is None or prev_close != prev_close or prev_close <= 0:
+        return float("nan")
+    fluct_raw = prev_close * 0.3
+    tick_f    = _kr_tick_size(fluct_raw, market)
+    fluct     = int(fluct_raw / tick_f) * tick_f
+    raw_lower = prev_close - fluct
+    tick_l    = _kr_tick_size(raw_lower, market)
+    return -int(-raw_lower / tick_l) * tick_l   # ceil
+
+
+def _configure_duckdb_s3(con, config_path: str = "config.json") -> None:
+    def _imds_token() -> Optional[str]:
+        try:
+            import requests
+
+            r = requests.put(
+                "http://169.254.169.254/latest/api/token",
+                headers={"X-aws-ec2-metadata-token-ttl-seconds": "21600"},
+                timeout=1,
+            )
+            if r.status_code == 200:
+                return r.text
+        except Exception:
+            return None
+        return None
+
+    def _imds_region() -> Optional[str]:
+        try:
+            import requests
+
+            token = _imds_token()
+            headers = {"X-aws-ec2-metadata-token": token} if token else {}
+            r = requests.get(
+                "http://169.254.169.254/latest/dynamic/instance-identity/document",
+                headers=headers,
+                timeout=1,
+            )
+            if r.status_code == 200:
+                data = r.json()
+                return data.get("region")
+        except Exception:
+            return None
+        return None
+
+    try:
+        con.execute("INSTALL httpfs;")
+    except Exception:
+        pass
+    con.execute("LOAD httpfs;")
+    cfg: Dict[str, str] = {}
+    try:
+        cfg = load_config(config_path)
+    except FileNotFoundError:
+        cfg = {}
+    region = (
+        cfg.get("s3_region")
+        or os.getenv("AWS_REGION")
+        or os.getenv("AWS_DEFAULT_REGION")
+        or _imds_region()
+    )
+    access_key = cfg.get("aws_access_key_id") or os.getenv("AWS_ACCESS_KEY_ID")
+    secret_key = cfg.get("aws_secret_access_key") or os.getenv("AWS_SECRET_ACCESS_KEY")
+    session_token = cfg.get("aws_session_token") or os.getenv("AWS_SESSION_TOKEN")
+    endpoint = cfg.get("s3_endpoint") or os.getenv("AWS_S3_ENDPOINT")
+    try:
+        con.execute("SET s3_use_instance_profile=true;")
+    except Exception:
+        pass
+    if region:
+        con.execute(f"SET s3_region='{region}';")
+    if not access_key or not secret_key:
+        try:
+            import boto3
+
+            creds = boto3.Session().get_credentials()
+            if creds:
+                frozen = creds.get_frozen_credentials()
+                access_key = access_key or frozen.access_key
+                secret_key = secret_key or frozen.secret_key
+                session_token = session_token or frozen.token
+        except Exception:
+            pass
+
+    if access_key and secret_key:
+        con.execute(f"SET s3_access_key_id='{access_key}';")
+        con.execute(f"SET s3_secret_access_key='{secret_key}';")
+    if session_token:
+        con.execute(f"SET s3_session_token='{session_token}';")
+    if endpoint:
+        con.execute(f"SET s3_endpoint='{endpoint}';")
+
+
+def duckdb_read_1d_s3(
+    layout: KisDataLayout,
+    date_from: str,
+    date_to: str,
+    symbols: Sequence[str],
+) -> "object":
+    """
+    DuckDB로 S3 1d 데이터 조회 (date 파티션)
+    """
+    import duckdb
+    import pandas as pd
+
+    paths = list_s3_1d_paths(layout, date_from, date_to)
+    if not paths:
+        cols = ["date", "symbol", "open", "high", "low", "close", "volume", "value"]
+        return duckdb.from_df(pd.DataFrame(columns=cols)).df()
+
+    symbols_sql = ",".join([f"'{s}'" for s in symbols])
+    files_sql = "[" + ",".join([f"'{p}'" for p in paths]) + "]"
+    query = f"""
+    SELECT date, symbol, open, high, low, close, volume, value
+    FROM read_parquet({files_sql})
+    WHERE date BETWEEN '{date_from}' AND '{date_to}'
+      AND symbol IN ({symbols_sql})
+    ORDER BY symbol, date
+    """
+    con = duckdb.connect()
+    try:
+        _configure_duckdb_s3(con)
+        return con.execute(query).df()
+    finally:
+        con.close()
+
+
+def duckdb_read_1m_s3(
+    layout: KisDataLayout,
+    date_list: Sequence[str],
+    symbols: Sequence[str],
+) -> "object":
+    """
+    DuckDB로 S3 1m 데이터 조회 (date + bucket 제한)
+    """
+    import duckdb
+
+    symbols_sql = ",".join([f"'{s}'" for s in symbols])
+    date_sql = ",".join([f"'{d}'" for d in date_list])
+    query = f"""
+    SELECT date, ts, symbol, open, high, low, close, volume, value
+    FROM read_parquet('{layout.s3_glob_1m()}', hive_partitioning=1)
+    WHERE date IN ({date_sql})
+      AND symbol IN ({symbols_sql})
+    ORDER BY symbol, ts
+    """
+    con = duckdb.connect()
+    try:
+        _configure_duckdb_s3(con)
+        return con.execute(query).df()
+    finally:
+        con.close()

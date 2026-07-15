@@ -109,6 +109,12 @@ VI_SWITCH_BY_VICLS = True
 ORDERBOOK_ENABLED = False
 ORDERBOOK_BUS_NAME = "stockbus"     # 공유메모리 버스 이름 (생산자·소비자 일치)
 ORDERBOOK_LOG_SEC = 60             # 버스 수신현황 로그 주기(초)
+
+# [260715] 다계좌 WSS 구독 — a1(체결통보+종목데이터) + a2(장운영정보+오버플로 종목데이터).
+#   kis_auth_llm 을 importlib 로 독립 로드 → 전역(open_map/approval_key/_cfg) 완전 격리한
+#   격리 사본으로 한 프로세스 내 다연결(과거 이중연결 실패=전역 공유 → 사본은 애초에 공유 없음).
+#   False 동안 기존 단일(a1) 동작 그대로. 설계: docs/multiacct_wss_subscribe_plan_260715.md
+MULTIACCT_WSS_ENABLED = False
 # 상한가 스톱 연속 이탈 확인 틱 수 (서버 스톱지정가 대신 클라이언트에서 N틱 연속 확인 후 매도)
 STOP_LIMIT_CONFIRM_TICKS = 30
 # 매수가 손절 N틱 연속 이탈 확인 (단일 틱 fake 가격 차단). 임계 회복 시 카운터 리셋.
@@ -14143,6 +14149,152 @@ def _orderbook_bus_consumer_loop():
             logger.warning(f"{ts_prefix()} [orderbook-bus] 상태로그 실패: {e}")
 
 
+# ============================================================================
+# [260715] 다계좌 WSS 구독 — a2 격리 연결 (S2)
+#   a1(글로벌 ka) = 체결통보(H0STCNI0) + 종목데이터.
+#   a2(격리 사본 _ka2) = 장운영정보(H0STMKO0, S3 이관 예정) + 오버플로 종목데이터.
+#   kis_auth_llm 을 importlib 로 독립 로드해 전역(open_map/_base_headers_ws/_cfg)을 완전 격리한다.
+#   (orderbook 레코더가 별도 프로세스로 쓰던 'a2 _cfg 덮어쓰기 → auth_ws' 계좌전환 패턴을
+#    한 프로세스 내 사본으로 복제. approval_key 캐시는 이미 appkey별이라 a1 과 충돌 없음.)
+#   ※ 매매/체결통보 없음(a2 = 구독 전용). 틱은 a1 과 동일한 on_result 파이프라인으로 합류.
+# ============================================================================
+_ka2 = None                                    # a2 격리 모듈 사본(kis_auth_llm)
+_active_kws_a2 = None                           # a2 활성 KISWebSocket 인스턴스
+_kws_a2_lock = threading.Lock()
+_a2_assigned_codes: set[str] = set()            # 구독 총괄관리자(S4)가 a2 에 배정한 종목데이터 코드
+_a2_assigned_lock = threading.Lock()
+
+
+def _import_ka_copy(mod_alias: str):
+    """kis_auth_llm 을 격리된 별도 모듈 객체로 로드(전역 완전 분리). 인증 등 네트워크 부작용 없음."""
+    import importlib.util
+    src = str(SCRIPT_DIR / "kis_auth_llm.py")
+    spec = importlib.util.spec_from_file_location(mod_alias, src)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[mod_alias] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _account_cfg(account_id: str) -> dict | None:
+    """config V2 계좌 중 account_id 매칭 항목 반환(_iter_enabled_accounts 재사용)."""
+    for a in _iter_enabled_accounts(trade_only=False):
+        if a.get("account_id") == account_id:
+            return a
+    return None
+
+
+def _setup_ka2():
+    """a2 격리 사본 로드 + a2 자격 인증. 실패 시 None."""
+    a2 = _account_cfg("a2")
+    if not a2 or not a2.get("appkey") or not a2.get("appsecret"):
+        logger.warning(f"{ts_prefix()} [a2-wss] a2 계좌 appkey/secret 없음 → a2 연결 비활성")
+        return None
+    try:
+        mod = _import_ka_copy("kis_auth_llm__a2")
+    except Exception as e:
+        logger.warning(f"{ts_prefix()} [a2-wss] 사본 로드 실패: {type(e).__name__}: {e}")
+        return None
+    # a2 자격 주입(레코더와 동일 패턴)
+    mod._cfg["my_app"] = a2["appkey"]
+    mod._cfg["my_sec"] = a2["appsecret"]
+    # REST 토큰 캐시 경로 분리(디스크 충돌 방지). approval_key 캐시는 이미 appkey별이라 무관.
+    try:
+        mod.token_tmp = os.path.join(
+            mod.config_root, f"KIS_a2_wss_{datetime.now(KST).strftime('%y%m%d')}"
+        )
+    except Exception:
+        pass
+    try:
+        mod.auth(svr="prod")        # REST env(my_url_ws) + access_token
+        mod.auth_ws(svr="prod")     # a2 appkey 전용 approval_key (a1 과 독립)
+    except Exception as e:
+        logger.warning(f"{ts_prefix()} [a2-wss] 인증 실패: {type(e).__name__}: {e}")
+        return None
+    if not (getattr(mod, "_base_headers_ws", {}) or {}).get("approval_key"):
+        logger.warning(f"{ts_prefix()} [a2-wss] auth_ws 실패(approval_key 없음) → a2 연결 비활성")
+        return None
+    logger.info(f"{ts_prefix()} [a2-wss] a2 격리 연결 인증 완료 (appkey…{str(a2['appkey'])[-4:]})")
+    return mod
+
+
+def _a2_desired_subscription() -> dict:
+    """a2 연결이 구독할 {request_func: set(codes)}.
+    S4(구독 총괄관리자)가 _a2_assigned_codes 를 채우고, S3 에서 H0STMKO0 도 여기 합류한다.
+    현재(S2)는 배정 매핑 미구현 → 빈 dict(연결하지 않고 대기)."""
+    # TODO(S4): _a2_assigned_codes → ccnl 요청함수 매핑 + (S3) H0STMKO0 합류.
+    return {}
+
+
+def _on_system_a2(rsp):
+    """a2 연결 시스템 메시지 핸들러(간소). invalid approval / ALREADY IN USE 시 재접속 유도."""
+    try:
+        if getattr(rsp, "isOk", False) and getattr(rsp, "tr_msg", None) and "SUCCESS" in str(rsp.tr_msg):
+            return
+        msg = str(getattr(rsp, "tr_msg", "") or "")
+        if not msg:
+            return
+        low = msg.lower()
+        if "not found" in low or "ALREADY IN SUBSCRIBE" in msg:
+            return
+        logger.warning(f"{ts_prefix()} [a2-wss][system] tr_id={getattr(rsp,'tr_id','')} msg={msg}")
+        if "invalid approval" in low or "ALREADY IN USE" in msg:
+            with _kws_a2_lock:
+                k = _active_kws_a2
+            try:
+                if k is not None:
+                    k.close()   # SDK 내부 reconnect 루프 중단 → 바깥 루프가 backoff 후 재접속
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+def run_ws_forever_a2():
+    """a2 격리 연결 루프 — 장운영정보(S3)+오버플로 종목데이터 전용. 매매/체결통보 없음.
+    배정 코드가 없으면 연결하지 않고 대기(빈 구독 방지). 배정되면 연결·구독·수신."""
+    global _ka2, _active_kws_a2
+    if not MULTIACCT_WSS_ENABLED:
+        return
+    if _ka2 is None:
+        _ka2 = _setup_ka2()
+        if _ka2 is None:
+            logger.warning(f"{ts_prefix()} [a2-wss] a2 연결 셋업 실패 → 루프 종료(단일 a1 로 동작)")
+            return
+    attempt = 0
+    while not _stop_event.is_set():
+        desired = _a2_desired_subscription()
+        if not any(desired.values()):
+            time.sleep(5.0)          # 배정 없음 → 빈 연결 회피, 재확인
+            continue
+        attempt += 1
+        try:
+            if attempt > 1:
+                try:
+                    _ka2.auth_ws(svr="prod")
+                except Exception as ae:
+                    logger.warning(f"{ts_prefix()} [a2-wss] auth_ws 재발급 실패: {ae}")
+            _ka2.open_map.clear()
+            for req, cs in desired.items():
+                if cs:
+                    _ka2.KISWebSocket.subscribe(req, list(cs))
+            kws2 = _ka2.KISWebSocket(api_url="", max_retries=1)
+            with _kws_a2_lock:
+                _active_kws_a2 = kws2
+            kws2.on_system = _on_system_a2
+            n = sum(len(v) for v in desired.values())
+            logger.info(f"{ts_prefix()} [a2-wss] start on_result (구독 {n}건)")
+            _t0 = time.time()
+            kws2.start(on_result=on_result)   # a1 과 동일한 틱 파이프라인
+            logger.info(f"{ts_prefix()} [a2-wss] kws.start returned (dwell={time.time()-_t0:.1f}s)")
+        except Exception as e:
+            logger.warning(f"{ts_prefix()} [a2-wss] 연결 예외: {type(e).__name__}: {e}")
+        for _ in range(30):          # backoff(stop 이벤트 빠른 응답)
+            if _stop_event.is_set():
+                break
+            time.sleep(0.1)
+
+
 # =============================================================================
 # main
 # =============================================================================
@@ -14284,9 +14436,15 @@ if __name__ == "__main__":
     t_top.start()
 
     # [260702] 호가 통합 — A) 레코더(a2) subprocess 기동  B) 버스 소비/로그 스레드
+    #   [260715] ORDERBOOK_ENABLED=False → 아래 둘 다 내부에서 no-op(플래그 가드).
     _start_orderbook_recorder()
     t_orderbook = threading.Thread(target=_orderbook_bus_consumer_loop, name="orderbook-bus", daemon=True)
     t_orderbook.start()
+
+    # [260715] 다계좌 WSS — a2 격리 연결 루프(장운영정보+오버플로 종목데이터). 플래그 OFF 시 즉시 반환.
+    if MULTIACCT_WSS_ENABLED:
+        t_a2wss = threading.Thread(target=run_ws_forever_a2, name="a2-wss", daemon=True)
+        t_a2wss.start()
 
     try:
         run_ws_forever()

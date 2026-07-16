@@ -14560,18 +14560,11 @@ def _uplimit_watch_loop():
                     _uplimit_watch_codes.add(c)
                     new_codes.append(c)
         if new_codes:
-            with _lock:
-                for c in new_codes:
-                    if c not in codes:
-                        codes.append(c)
-                        try:
-                            _code_added_ts[c] = time.time()
-                        except Exception:
-                            pass
-            try:
-                code_name_map.update(_code_name_map())
-            except Exception:
-                pass
+            # ★ 표준 등록 헬퍼 사용: codes 추가 + 카운터(_per_sec/_since_save)·_last_recv_ts·
+            #   지표버퍼(_init_indicator_buf)·이름맵·persist·iscd 조회까지 일괄. (직접 codes.append
+            #   만 하면 ingest 의 'if code in _per_sec_counts' 블록이 스킵돼 카운트·watchdog·VI감지·
+            #   지표계산에서 누락됨 — 260716 실버그 수정.)
+            _ensure_code_structs(new_codes)
             names = [code_name_map.get(c, c) for c in new_codes]
             _notify(
                 f"{ts_prefix()} [상한가감시] +{UPLIMIT_WATCH_RATE_MIN}%↑ 신규 {len(new_codes)}종목 구독 편입: "

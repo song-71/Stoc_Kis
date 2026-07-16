@@ -8682,9 +8682,10 @@ def _mkstatus_sub_add(codes_to_add: set[str]) -> None:
         return
     with _mko_lock:
         _mko_kws = _active_kws_a2 if MULTIACCT_WSS_ENABLED else _active_kws
+        _mko_req = _a2_req(market_status_krx) if MULTIACCT_WSS_ENABLED else market_status_krx  # noqa: F405
         if _mko_kws is not None:
             try:
-                _send_subscribe(_mko_kws, market_status_krx, list(new_codes), "1")  # noqa: F405
+                _send_subscribe(_mko_kws, _mko_req, list(new_codes), "1")
                 _mkstatus_sub_codes.update(new_codes)
                 names = [f"{code_name_map.get(c, c)}({c})" for c in new_codes]
                 logger.info(f"{ts_prefix()} [H0STMKO0] 구독 추가: {', '.join(names)}")
@@ -8702,9 +8703,10 @@ def _mkstatus_sub_remove(codes_to_remove: set[str]) -> None:
     _mko_lock = _kws_a2_lock if MULTIACCT_WSS_ENABLED else _kws_lock
     with _mko_lock:
         _mko_kws = _active_kws_a2 if MULTIACCT_WSS_ENABLED else _active_kws
+        _mko_req = _a2_req(market_status_krx) if MULTIACCT_WSS_ENABLED else market_status_krx  # noqa: F405
         if _mko_kws is not None:
             try:
-                _send_subscribe(_mko_kws, market_status_krx, list(active), "2")  # noqa: F405
+                _send_subscribe(_mko_kws, _mko_req, list(active), "2")
                 _mkstatus_sub_codes -= active
                 names = [f"{code_name_map.get(c, c)}({c})" for c in active]
                 logger.info(f"{ts_prefix()} [H0STMKO0] 구독 해제: {', '.join(names)}")
@@ -14236,6 +14238,16 @@ _kws_a2_lock = threading.Lock()
 _a2_assigned_codes: set[str] = set()            # 구독 총괄관리자(S4)가 a2 에 배정한 종목데이터 코드
 _a2_assigned_lock = threading.Lock()
 _subscribed_a2: dict = {}                        # a2 연결 구독 추적 {req.__name__: set(codes)} (a1 _subscribed 과 분리)
+_dsfw_a2 = None                                  # domestic_stock_functions_ws 의 a2 바인딩 사본(요청함수가 a2 approval_key 로 메시지 생성)
+
+
+def _a2_req(req):
+    """전역 요청함수(a1 kis_auth 바인딩)를 a2 사본(_dsfw_a2)의 동명 함수로 치환.
+    ★ 미치환 시 요청함수가 data_fetch→글로벌(a1) _base_headers_ws 의 approval_key 로 메시지를
+      만들어, a2 연결(핸드셰이크는 a2 키)과 불일치 → bare 1006. (260716 근본원인)"""
+    if _dsfw_a2 is None:
+        return req
+    return getattr(_dsfw_a2, getattr(req, "__name__", ""), req)
 
 
 def _import_ka_copy(mod_alias: str):
@@ -14279,15 +14291,40 @@ def _setup_ka2():
     except Exception:
         pass
     try:
-        mod.auth(svr="prod")        # REST env(my_url_ws) + access_token
-        mod.auth_ws(svr="prod")     # a2 appkey 전용 approval_key (a1 과 독립)
+        mod.auth(svr="prod")                       # REST env(my_url_ws) + access_token
+        mod.auth_ws(svr="prod", force_new=True)     # a2 appkey 전용 approval_key 신규 발급
+        #  ★ force_new: a2 appkey 는 잔고조회 등과 공유돼 캐시 approval_key 가 무효화됐을 수 있어
+        #    (stale → bare 1006), 연결 전 새 키를 확보한다. a2 WSS 는 이 프로세스 전용이라 안전.
     except Exception as e:
         logger.warning(f"{ts_prefix()} [a2-wss] 인증 실패: {type(e).__name__}: {e}")
         return None
     if not (getattr(mod, "_base_headers_ws", {}) or {}).get("approval_key"):
         logger.warning(f"{ts_prefix()} [a2-wss] auth_ws 실패(approval_key 없음) → a2 연결 비활성")
         return None
-    logger.info(f"{ts_prefix()} [a2-wss] a2 격리 연결 인증 완료 (appkey…{str(a2['appkey'])[-4:]})")
+    # ── 요청함수를 a2 approval_key 로 바인딩: domestic_stock_functions_ws 를 사본으로 로드 ──
+    #   dsfw 는 import kis_auth as ka → data_fetch. 로드 동안만 sys.modules["kis_auth"]=mod 로
+    #   바꿔, 사본의 요청함수가 a2(mod) 의 _base_headers_ws(approval_key)로 메시지를 만들게 한다.
+    #   로드 직후 원복 → a1(전역) 영향 없음(a1 요청함수는 이미 자기 ka 참조를 바인딩 완료).
+    global _dsfw_a2
+    try:
+        import importlib.util as _ilu
+        _saved_ka = sys.modules.get("kis_auth")
+        sys.modules["kis_auth"] = mod
+        try:
+            _spec2 = _ilu.spec_from_file_location(
+                "domestic_stock_functions_ws__a2", str(SCRIPT_DIR / "domestic_stock_functions_ws.py")
+            )
+            _dsfw = _ilu.module_from_spec(_spec2)
+            sys.modules["domestic_stock_functions_ws__a2"] = _dsfw
+            _spec2.loader.exec_module(_dsfw)
+            _dsfw_a2 = _dsfw
+        finally:
+            if _saved_ka is not None:
+                sys.modules["kis_auth"] = _saved_ka
+    except Exception as e:
+        logger.warning(f"{ts_prefix()} [a2-wss] dsfw a2 사본 로드 실패 → a2 연결 비활성: {e}")
+        return None
+    logger.info(f"{ts_prefix()} [a2-wss] a2 격리 연결 인증 완료 (appkey…{str(a2['appkey'])[-4:]}, dsfw 사본 바인딩)")
     return mod
 
 
@@ -14296,13 +14333,15 @@ def _a2_desired_subscription() -> dict:
     [S4] 오버플로 종목데이터 = _a2_share() 를 a1 과 동일한 exp/ccnl 로직으로 매핑.
     [S3 예정] 여기에 H0STMKO0(장운영정보) 구독을 합류시킨다."""
     now = datetime.now(KST)
-    data_map = _build_sub_map(now, _a2_share())
+    base = _build_sub_map(now, _a2_share())
+    # ★ 요청함수를 a2 사본(_dsfw_a2)의 동명 함수로 치환 → a2 approval_key 로 메시지 생성(1006 방지)
+    data_map = {_a2_req(r): set(c) for r, c in base.items()}
     # [S3] 장운영정보(H0STMKO0) — a1 에서 이관. keepalive+보유+VI+관찰 종목(§6-1) 을 a2 로 구독.
     try:
         mko = set(_mkstatus_sub_codes)
         if mko:
-            existing = data_map.get(market_status_krx, set())  # noqa: F405
-            data_map[market_status_krx] = existing | mko       # noqa: F405
+            mk = _a2_req(market_status_krx)                    # noqa: F405
+            data_map[mk] = data_map.get(mk, set()) | mko
     except Exception:
         pass
     return data_map
@@ -14317,10 +14356,12 @@ def _apply_a2_data_subs() -> None:
         kws2 = _active_kws_a2
     if kws2 is None:
         return
-    desired = _a2_desired_subscription()
-    data_reqs = [ccnl_krx, exp_ccnl_krx, overtime_ccnl_krx, overtime_exp_ccnl_krx]  # noqa: F405
-    for req in data_reqs:
-        want = desired.get(req, set())
+    desired = _a2_desired_subscription()   # keys = a2 바인딩 요청함수
+    data_names = {"ccnl_krx", "exp_ccnl_krx", "overtime_ccnl_krx", "overtime_exp_ccnl_krx"}
+    for req, want in desired.items():
+        if getattr(req, "__name__", "") not in data_names:
+            continue   # H0STMKO0(장운영정보)는 _mkstatus_sub_add/remove 경로가 처리
+        want = set(want)
         have = _subscribed_a2.get(req.__name__, set())
         if want == have:
             continue

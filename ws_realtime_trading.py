@@ -114,11 +114,11 @@ ORDERBOOK_LOG_SEC = 60             # 버스 수신현황 로그 주기(초)
 #   kis_auth_llm 을 importlib 로 독립 로드 → 전역(open_map/approval_key/_cfg) 완전 격리한
 #   격리 사본으로 한 프로세스 내 다연결(과거 이중연결 실패=전역 공유 → 사본은 애초에 공유 없음).
 #   False 동안 기존 단일(a1) 동작 그대로. 설계: docs/multiacct_wss_subscribe_plan_260715.md
-MULTIACCT_WSS_ENABLED = False
+MULTIACCT_WSS_ENABLED = True
 
 # [260715] 당일 상한가 감시 — 등락률 +28%↑ 주권(ST)을 주기 조회해 구독 유니버스에 sticky 편입
 #   (한 번 편입되면 당일 장 종료까지 유지). MULTIACCT_WSS_ENABLED 와 함께 켜야 오버플로(a2)까지 수용.
-UPLIMIT_WATCH_ENABLED = False          # 다계좌 경로와 함께 활성화
+UPLIMIT_WATCH_ENABLED = True           # 다계좌 경로와 함께 활성화
 UPLIMIT_WATCH_INTERVAL_SEC = 30        # 28%↑ 조회 주기(초)
 UPLIMIT_WATCH_RATE_MIN = "28"          # 등락률 하한(fid_rsfl_rate1)
 UPLIMIT_WATCH_RATE_MAX = "30"          # 등락률 상한(fid_rsfl_rate2, 비우면 0건 반환됨)

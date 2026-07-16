@@ -150,6 +150,13 @@ ka_a3 = _load_ka_instance("kis_auth_llm__a3")   # (a3 appkey 준비 시)
 - **설계 보완 방향:** 플래그 **디커플**(28% sticky/a1 = 독립, a2 오버플로·H0STMKO0 이관 = a2 연결 확인된 뒤에만) + a2 스레드 in-process 미연결 원인 규명(스레드 예외 표면화·`_setup_ka2` 단계 로깅 강화) + a2 appkey ALREADY-IN-USE 해소 후 재검증.
 - **현재 상태: 플래그 전부 OFF, 프로덕션 안정(단일 a1).**
 
+### 9-6. 260716 12:27 — 다계좌 정상 가동 확인 (해결)
+- **①in-process a2 미연결 원인 = a2 appkey 의 일시적 ALREADY-IN-USE(OPSP8996)** (앞선 1006 폭주 잔재). 코드 버그 아님. 해소 후 재시작하니 `_setup_ka2` step1~4 ~100ms 정상 완료, a2 연결 유지.
+- **실측(12:27~ flags ON):** a2 kws.start(H0STMKO0 2건) **106초+ 무중단·1006 0건**, a1 정상(32종목 데이터), 28%↑ sticky 15종목 편입. **dsfw a2 바인딩 수정으로 a2 가 자기 approval_key 로 구독 성공**(불일치 1006 소멸).
+- **②디커플 적용:** `_a2_active()` — a2 실연결 시에만 H0STMKO0·데이터 배정을 a2 로. a2 미연결이면 전부 a1 폴백(VI/서킷 안 꺼짐). a2 끊김 시 `_active_kws_a2=None`+rebuild 로 a1 재확보.
+- **로버스트:** `_setup_ka2` auth 20s 타임아웃 가드(POST 무timeout hang 방지) + 단계 로깅([a2-diag]).
+- **현재: flags ON 정상 가동.** 남은 실검증(장중 이벤트 필요): VI 이벤트의 a2 경로 A 감지, 유니버스>39 시 a2 데이터 오버플로.
+
 ### ⚠ 미해결/후속 검증 포인트
 - **a2 재접속 시 H0STMKO0 재구독**: 현재 a2 데이터는 `_apply_a2_data_subs` 로 무재연결 동적 갱신하나, H0STMKO0 는 `_mkstatus_sub_add`(라이브) + a2 reconnect 시 `_a2_desired_subscription` 재구독에 의존. a2 가 자주 끊기면 H0STMKO0 재구독 지연 가능 → 장중 관측 필요.
 - **a1/a2 배정 경계**: 보유·전일상한가가 a1 39슬롯을 이미 채운 극단 상황의 오버플로 동작 확인.

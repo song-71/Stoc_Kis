@@ -131,9 +131,19 @@ ka_a3 = _load_ka_instance("kis_auth_llm__a3")   # (a3 appkey 준비 시)
 - 한 종목 종목데이터는 **정확히 한 연결에만**(중복 구독 금지). a1 우선 → 초과분 a2.
 - 구독 유니버스 = 전일상한가(기존) ∪ 당일 28%↑(top30) — **sticky, EOD 해제**.
 
-### 9-3. 구현 단계
-- **S1. orderbook 제거**(지시 4) — 안전·독립. ✅ 착수.
-- **S2. a2 격리 모듈 사본 로더 + a2 경량 연결 루프**(H0STMKO0 + 오버플로 데이터).
-- **S3. H0STMKO0 를 a1→a2 이관**(지시 5).
-- **S4. 구독 총괄관리자**(유니버스·sticky·a1/a2 배정, 지시 6·7).
-- **S5. 로직 파일 §0·§5·§6-1 + 변경이력 갱신, 오프라인 검증.**
+### 9-3. 구현 단계 (전부 `MULTIACCT_WSS_ENABLED` 플래그 OFF 상태로 커밋 — 프로덕션 동작 불변)
+- **S1. orderbook 제거**(지시 4) — ✅ 완료(`ORDERBOOK_ENABLED=False`).
+- **S2. a2 격리 모듈 사본 로더 + a2 경량 연결 루프** — ✅ 완료(`_import_ka_copy`/`_setup_ka2`/`run_ws_forever_a2`, 격리 검증).
+- **S4. 구독 총괄관리자**(유니버스·sticky·a1/a2 배정, 지시 6·7) — ✅ 완료(`_build_sub_map`/`_partition_a1_a2`/`_uplimit_watch_loop`/`_apply_a2_data_subs`).
+- **S3. H0STMKO0 를 a1→a2 이관**(지시 5) — ✅ 완료(a1 rebuild 제외 + `_a2_desired_subscription` 합류 + `_mkstatus_sub_add/remove` a2 라우팅).
+- **S5(남음). 라이브 검증 후 플래그 ON.** 장중 2연결 동시 수신·H0STMKO0 a2 수신·sticky 편입 관측 → 이상 없으면 `MULTIACCT_WSS_ENABLED=True`, `UPLIMIT_WATCH_ENABLED=True`. **검증 전에는 플래그 OFF 유지(프로덕션 무영향).**
+
+### 9-4. 활성화 방법(라이브 검증 후)
+1. 장 시작 전(프로덕션 미가동 시간) `MULTIACCT_WSS_ENABLED=True` + `UPLIMIT_WATCH_ENABLED=True` 로 변경.
+2. 재기동 후 로그에서 `[a2-wss] a2 격리 연결 인증 완료`, `[상한가감시] 신규 N종목 편입`, H0STMKO0 a2 수신, VI 감지 정상 확인.
+3. 이상 시 즉시 플래그 OFF 복귀(단일 a1 동작으로 안전 회귀).
+
+### ⚠ 미해결/후속 검증 포인트
+- **a2 재접속 시 H0STMKO0 재구독**: 현재 a2 데이터는 `_apply_a2_data_subs` 로 무재연결 동적 갱신하나, H0STMKO0 는 `_mkstatus_sub_add`(라이브) + a2 reconnect 시 `_a2_desired_subscription` 재구독에 의존. a2 가 자주 끊기면 H0STMKO0 재구독 지연 가능 → 장중 관측 필요.
+- **a1/a2 배정 경계**: 보유·전일상한가가 a1 39슬롯을 이미 채운 극단 상황의 오버플로 동작 확인.
+- **중복구독 방지**: `_partition_a1_a2` 가 한 종목을 정확히 한쪽에만 넣는지(교집합 0) 라이브 확인.

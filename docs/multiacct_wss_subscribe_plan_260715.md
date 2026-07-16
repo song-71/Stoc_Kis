@@ -143,6 +143,13 @@ ka_a3 = _load_ka_instance("kis_auth_llm__a3")   # (a3 appkey 준비 시)
 2. 재기동 후 로그에서 `[a2-wss] a2 격리 연결 인증 완료`, `[상한가감시] 신규 N종목 편입`, H0STMKO0 a2 수신, VI 감지 정상 확인.
 3. 이상 시 즉시 플래그 OFF 복귀(단일 a1 동작으로 안전 회귀).
 
+### 9-5. 260716 라이브 검증 결과 (중요)
+- **S1(orderbook OFF)·S4a(28%↑ sticky)·a1 리팩터: 정상.** 재시작 후 a1 단일 경로 무결(1006 0건), 28%↑ 신규 편입 실측(8~14종목).
+- **a2 1006 근본원인 규명·수정(격리 검증 완료):** `ws_realtime_trading.py:708 sys.modules["kis_auth"]=글로벌(a1)` 별칭 → `domestic_stock_functions_ws` 요청함수의 `data_fetch` 가 항상 **a1 approval_key** 로 메시지 생성 → a2 연결(핸드셰이크=a2 키)과 불일치 → **bare 1006 storm**. 수정: 요청함수를 a2 사본(`_dsfw_a2`)에 바인딩(`_a2_req`). 격리 재현 테스트 = 48건 수신·1006 0건 ✅ (커밋 fd529ed).
+- **미해결(다음 안전창):** ① **in-process 에서 a2 스레드가 연결 안 됨**(로그 전무·approval 파일 미갱신 — 격리는 성공하나 전체 프로세스에선 `_setup_ka2` 가 조용히 멈춤/실패). ② 09:27 런에서 **`[a2-wss][system] ALREADY IN USE appkey`**(OPSP8996) 관측 — a2 appkey 사용중 충돌(자연해제 ~10h). ③ 플래그 ON 이 H0STMKO0→a2 이관까지 묶여 있어, a2 미연결 시 **VI/서킷 감지가 꺼짐**.
+- **설계 보완 방향:** 플래그 **디커플**(28% sticky/a1 = 독립, a2 오버플로·H0STMKO0 이관 = a2 연결 확인된 뒤에만) + a2 스레드 in-process 미연결 원인 규명(스레드 예외 표면화·`_setup_ka2` 단계 로깅 강화) + a2 appkey ALREADY-IN-USE 해소 후 재검증.
+- **현재 상태: 플래그 전부 OFF, 프로덕션 안정(단일 a1).**
+
 ### ⚠ 미해결/후속 검증 포인트
 - **a2 재접속 시 H0STMKO0 재구독**: 현재 a2 데이터는 `_apply_a2_data_subs` 로 무재연결 동적 갱신하나, H0STMKO0 는 `_mkstatus_sub_add`(라이브) + a2 reconnect 시 `_a2_desired_subscription` 재구독에 의존. a2 가 자주 끊기면 H0STMKO0 재구독 지연 가능 → 장중 관측 필요.
 - **a1/a2 배정 경계**: 보유·전일상한가가 a1 39슬롯을 이미 채운 극단 상황의 오버플로 동작 확인.

@@ -8650,10 +8650,11 @@ def _mkstatus_sub_add(codes_to_add: set[str]) -> None:
         return
     # WSS 미연결 → 보류 후 연결 시 open_map 빌드에서 (재)구독 (이전엔 조용히 no-op 되어
     # 구독이 영영 안 됐던 버그 — 보유/VI H0STMKO0 가 장중 0이 되는 원인이었음)
-    # [260715] 다계좌 ON → H0STMKO0 는 a2 연결에 싣는다(§S3). OFF → 기존 a1.
-    _mko_lock = _kws_a2_lock if MULTIACCT_WSS_ENABLED else _kws_lock
+    # [260715] a2 연결됨 → H0STMKO0 를 a2 연결에 싣는다(§S3). a2 미연결 → a1(VI 보호).
+    _use_a2 = _a2_active()
+    _mko_lock = _kws_a2_lock if _use_a2 else _kws_lock
     with _mko_lock:
-        _mko_kws = _active_kws_a2 if MULTIACCT_WSS_ENABLED else _active_kws
+        _mko_kws = _active_kws_a2 if _use_a2 else _active_kws
         _is_connected = _mko_kws is not None
     if not _is_connected:
         _mkstatus_pending |= new_codes
@@ -8681,8 +8682,8 @@ def _mkstatus_sub_add(codes_to_add: set[str]) -> None:
     if not new_codes:
         return
     with _mko_lock:
-        _mko_kws = _active_kws_a2 if MULTIACCT_WSS_ENABLED else _active_kws
-        _mko_req = _a2_req(market_status_krx) if MULTIACCT_WSS_ENABLED else market_status_krx  # noqa: F405
+        _mko_kws = _active_kws_a2 if _use_a2 else _active_kws
+        _mko_req = _a2_req(market_status_krx) if _use_a2 else market_status_krx  # noqa: F405
         if _mko_kws is not None:
             try:
                 _send_subscribe(_mko_kws, _mko_req, list(new_codes), "1")
@@ -8699,11 +8700,12 @@ def _mkstatus_sub_remove(codes_to_remove: set[str]) -> None:
     active = set(codes_to_remove) & _mkstatus_sub_codes
     if not active:
         return
-    # [260715] 다계좌 ON → a2 연결에서 해제(§S3). OFF → a1.
-    _mko_lock = _kws_a2_lock if MULTIACCT_WSS_ENABLED else _kws_lock
+    # [260715] a2 연결됨 → a2 연결에서 해제(§S3). a2 미연결 → a1.
+    _use_a2 = _a2_active()
+    _mko_lock = _kws_a2_lock if _use_a2 else _kws_lock
     with _mko_lock:
-        _mko_kws = _active_kws_a2 if MULTIACCT_WSS_ENABLED else _active_kws
-        _mko_req = _a2_req(market_status_krx) if MULTIACCT_WSS_ENABLED else market_status_krx  # noqa: F405
+        _mko_kws = _active_kws_a2 if _use_a2 else _active_kws
+        _mko_req = _a2_req(market_status_krx) if _use_a2 else market_status_krx  # noqa: F405
         if _mko_kws is not None:
             try:
                 _send_subscribe(_mko_kws, _mko_req, list(active), "2")
@@ -13658,8 +13660,9 @@ def _a2_share() -> set:
 
 
 def _desired_subscription_map(now: datetime) -> dict:
-    """a1 연결 구독 매핑. 다계좌 OFF → 전체 codes(기존 동작 그대로), ON → a1 배정분."""
-    if not MULTIACCT_WSS_ENABLED:
+    """a1 연결 구독 매핑. 다계좌 OFF 또는 a2 미연결 → 전체 codes(a1 이 전부, 기존 캡 로직),
+    a2 연결됨 → a1 배정분(_a1_share). ★ a2 미연결 시 오버플로가 사라지지 않도록 a1 폴백."""
+    if not MULTIACCT_WSS_ENABLED or not _a2_active():
         return _build_sub_map(now, set(codes))
     return _build_sub_map(now, _a1_share())
 
@@ -13828,8 +13831,8 @@ def run_ws_forever():
 
             # ── 슬롯 상한 준수: H0STCNI0(1) + H0STMKO0(N) + 종목데이터(M) <= 40 ──
             ccnl_notice_slots = 1  # H0STCNI0 이미 구독됨
-            # [260715] 다계좌 ON 시 H0STMKO0 는 a2 예산 → a1 예산에서 0
-            mkstatus_slots = 0 if MULTIACCT_WSS_ENABLED else len(_mkstatus_sub_codes)
+            # [260715] a2 연결됨 → H0STMKO0 는 a2 예산 → a1 예산에서 0. a2 미연결 → a1 유지.
+            mkstatus_slots = 0 if _a2_active() else len(_mkstatus_sub_codes)
             desired_map = _desired_subscription_map(datetime.now(KST))
             data_slots = sum(len(v) for v in desired_map.values())
             total_sub = ccnl_notice_slots + mkstatus_slots + data_slots
@@ -13863,8 +13866,8 @@ def run_ws_forever():
                 _subscribed[req.__name__] = set(code_set)
 
             # ── H0STMKO0 (재)구독: 부팅·재연결마다 open_map 에 실어 복원 보장 ──
-            #   [260715] 다계좌 ON 시 H0STMKO0 는 a2 연결이 담당(§S3) → a1 에서는 구독하지 않음.
-            if _mkstatus_sub_codes and not MULTIACCT_WSS_ENABLED:
+            #   [260715] a2 연결됨 → H0STMKO0 는 a2 담당(§S3), a1 미구독. a2 미연결 → a1 유지(VI 보호).
+            if _mkstatus_sub_codes and not _a2_active():
                 ka.KISWebSocket.subscribe(market_status_krx, list(_mkstatus_sub_codes))  # noqa: F405
                 _subscribed["market_status_krx"] = set(_mkstatus_sub_codes)
 
@@ -14241,6 +14244,15 @@ _subscribed_a2: dict = {}                        # a2 연결 구독 추적 {req.
 _dsfw_a2 = None                                  # domestic_stock_functions_ws 의 a2 바인딩 사본(요청함수가 a2 approval_key 로 메시지 생성)
 
 
+def _a2_active() -> bool:
+    """a2 연결이 실제로 살아있는지. H0STMKO0 이관·a2 배정은 이 값이 True 일 때만 적용해,
+    a2 미연결 시 H0STMKO0(VI/서킷 감지)가 a1 에 그대로 남도록 한다(디커플)."""
+    if not MULTIACCT_WSS_ENABLED:
+        return False
+    with _kws_a2_lock:
+        return _active_kws_a2 is not None
+
+
 def _a2_req(req):
     """전역 요청함수(a1 kis_auth 바인딩)를 a2 사본(_dsfw_a2)의 동명 함수로 치환.
     ★ 미치환 시 요청함수가 data_fetch→글로벌(a1) _base_headers_ws 의 approval_key 로 메시지를
@@ -14271,15 +14283,18 @@ def _account_cfg(account_id: str) -> dict | None:
 
 def _setup_ka2():
     """a2 격리 사본 로드 + a2 자격 인증. 실패 시 None."""
+    logger.warning(f"{ts_prefix()} [a2-diag] step1 _setup_ka2 진입")
     a2 = _account_cfg("a2")
     if not a2 or not a2.get("appkey") or not a2.get("appsecret"):
         logger.warning(f"{ts_prefix()} [a2-wss] a2 계좌 appkey/secret 없음 → a2 연결 비활성")
         return None
+    logger.warning(f"{ts_prefix()} [a2-diag] step2 import_ka_copy 시작")
     try:
         mod = _import_ka_copy("kis_auth_llm__a2")
     except Exception as e:
         logger.warning(f"{ts_prefix()} [a2-wss] 사본 로드 실패: {type(e).__name__}: {e}")
         return None
+    logger.warning(f"{ts_prefix()} [a2-diag] step2 import_ka_copy 완료")
     # a2 자격 주입(레코더와 동일 패턴)
     mod._cfg["my_app"] = a2["appkey"]
     mod._cfg["my_sec"] = a2["appsecret"]
@@ -14290,14 +14305,30 @@ def _setup_ka2():
         )
     except Exception:
         pass
-    try:
-        mod.auth(svr="prod")                       # REST env(my_url_ws) + access_token
-        mod.auth_ws(svr="prod", force_new=True)     # a2 appkey 전용 approval_key 신규 발급
-        #  ★ force_new: a2 appkey 는 잔고조회 등과 공유돼 캐시 approval_key 가 무효화됐을 수 있어
-        #    (stale → bare 1006), 연결 전 새 키를 확보한다. a2 WSS 는 이 프로세스 전용이라 안전.
-    except Exception as e:
-        logger.warning(f"{ts_prefix()} [a2-wss] 인증 실패: {type(e).__name__}: {e}")
+    # ── a2 인증(REST env + approval_key). requests.post 에 타임아웃이 없어 hang 가능 →
+    #    별도 스레드 + join 타임아웃으로 감싸 절대 무한대기 하지 않도록 방어(+단계 로깅). ──
+    logger.warning(f"{ts_prefix()} [a2-diag] step3 auth 시작 (REST+approval)")
+    _auth_done = {"ok": False, "err": None}
+
+    def _do_auth():
+        try:
+            mod.auth(svr="prod")                     # REST env(my_url_ws) + access_token
+            _auth_done["step"] = "auth_ok"
+            mod.auth_ws(svr="prod", force_new=True)   # a2 appkey 전용 approval_key 신규 발급(stale 회피)
+            _auth_done["ok"] = True
+        except Exception as e:
+            _auth_done["err"] = f"{type(e).__name__}: {e}"
+
+    _ath = threading.Thread(target=_do_auth, name="a2-auth", daemon=True)
+    _ath.start()
+    _ath.join(timeout=20.0)
+    if _ath.is_alive():
+        logger.warning(f"{ts_prefix()} [a2-wss] 인증 20s 초과(hang, POST 무응답 추정) → a2 비활성")
         return None
+    if _auth_done["err"]:
+        logger.warning(f"{ts_prefix()} [a2-wss] 인증 실패: {_auth_done['err']} (last={_auth_done.get('step')})")
+        return None
+    logger.warning(f"{ts_prefix()} [a2-diag] step4 auth 완료")
     if not (getattr(mod, "_base_headers_ws", {}) or {}).get("approval_key"):
         logger.warning(f"{ts_prefix()} [a2-wss] auth_ws 실패(approval_key 없음) → a2 연결 비활성")
         return None
@@ -14438,10 +14469,19 @@ def run_ws_forever_a2():
             n = sum(len(v) for v in desired.values())
             logger.info(f"{ts_prefix()} [a2-wss] start on_result (구독 {n}건)")
             _t0 = time.time()
-            kws2.start(on_result=on_result)   # a1 과 동일한 틱 파이프라인
-            logger.info(f"{ts_prefix()} [a2-wss] kws.start returned (dwell={time.time()-_t0:.1f}s)")
+            logger.warning(f"{ts_prefix()} [a2-wss] kws.start (구독 {n}건) — 연결 시작")
+            kws2.start(on_result=on_result)   # a1 과 동일한 틱 파이프라인 (블로킹)
+            logger.warning(f"{ts_prefix()} [a2-wss] kws.start returned (dwell={time.time()-_t0:.1f}s)")
         except Exception as e:
             logger.warning(f"{ts_prefix()} [a2-wss] 연결 예외: {type(e).__name__}: {e}")
+        # 연결 종료 → a2 비활성 표시 + a1 이 H0STMKO0 재확보하도록 rebuild
+        with _kws_a2_lock:
+            _active_kws_a2 = None
+        _subscribed_a2.clear()
+        try:
+            _trigger_ws_rebuild()
+        except Exception:
+            pass
         for _ in range(30):          # backoff(stop 이벤트 빠른 응답)
             if _stop_event.is_set():
                 break

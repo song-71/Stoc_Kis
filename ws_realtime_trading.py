@@ -116,12 +116,19 @@ ORDERBOOK_LOG_SEC = 60             # 버스 수신현황 로그 주기(초)
 #   False 동안 기존 단일(a1) 동작 그대로. 설계: docs/multiacct_wss_subscribe_plan_260715.md
 MULTIACCT_WSS_ENABLED = True
 
-# [260715] 당일 상한가 감시 — 등락률 +28%↑ 주권(ST)을 주기 조회해 구독 유니버스에 sticky 편입
+# [260715] 당일 상한가 감시 — 등락률 +20%↑ 주권(ST)을 주기 조회해 구독 유니버스에 sticky 편입
 #   (한 번 편입되면 당일 장 종료까지 유지). MULTIACCT_WSS_ENABLED 와 함께 켜야 오버플로(a2)까지 수용.
+#   [260720] 하한 28→20 완화 (사용자 요청). 이 API 는 30건 하드캡이라 20~30% 종목이 30건을
+#   넘으면 정렬 상위 30건만 잡힘(초과분 미편입) — 주의.
 UPLIMIT_WATCH_ENABLED = True           # 다계좌 경로와 함께 활성화
-UPLIMIT_WATCH_INTERVAL_SEC = 30        # 28%↑ 조회 주기(초)
-UPLIMIT_WATCH_RATE_MIN = "28"          # 등락률 하한(fid_rsfl_rate1)
-UPLIMIT_WATCH_RATE_MAX = "30"          # 등락률 상한(fid_rsfl_rate2, 비우면 0건 반환됨)
+UPLIMIT_WATCH_INTERVAL_SEC = 30        # 20%↑ 조회 주기(초)
+UPLIMIT_WATCH_RATE_MIN = "20"          # 등락률 하한(전체 범위, 로그 표기용)
+UPLIMIT_WATCH_RATE_MAX = "30"          # 등락률 상한(전체 범위, 로그 표기용)
+# [260720] 등락률순위 API(FHPST01700000)는 응답이 30건 하드캡·연속조회 불가.
+#   → 20~30% 구간을 여러 밴드로 나눠 각각 조회(밴드마다 30건)한 뒤 합집합(set 중복제거)해
+#     30건 벽을 넘어 더 많은 20%↑ 종목을 발굴한다. 경계는 겹치게 두고 중복은 set 이 제거.
+#   최종 편입 총량은 _partition_a1_a2 에서 a1+a2 슬롯 합계로 절단(두 계좌 상한선 내 관리).
+UPLIMIT_WATCH_RATE_BANDS = [("20", "24"), ("24", "27"), ("27", "30")]
 # 상한가 스톱 연속 이탈 확인 틱 수 (서버 스톱지정가 대신 클라이언트에서 N틱 연속 확인 후 매도)
 STOP_LIMIT_CONFIRM_TICKS = 30
 # 매수가 손절 N틱 연속 이탈 확인 (단일 틱 fake 가격 차단). 임계 회복 시 카운터 리셋.
@@ -13625,10 +13632,22 @@ def _a1_data_budget() -> int:
     return max(1, MAX_WSS_SUBSCRIBE - 1)
 
 
+def _a2_data_budget() -> int:
+    """a2 연결의 종목데이터 예산 = 40 - H0STMKO0(장운영정보) 구독 슬롯.
+    (H0STMKO0 는 S3 로 a2 가 담당 — a1 rebuild 참조.)"""
+    try:
+        mko = len(_mkstatus_sub_codes)
+    except Exception:
+        mko = 0
+    return max(0, MAX_WSS_SUBSCRIBE - mko)
+
+
 def _partition_a1_a2():
     """전체 구독 유니버스(set(codes))를 a1(우선) / a2(오버플로)로 분할.
-    우선순위(a1 우선 배정): 보유 > VI활성 > 전일상한가(_base_codes) > 나머지(당일 28%↑ 등).
-    a1 예산 초과분은 a2 로. 한 종목은 정확히 한쪽에만(중복구독 금지)."""
+    우선순위(a1 우선 배정): 보유 > VI활성 > 전일상한가(_base_codes) > 나머지(당일 20%↑ 등).
+    a1 예산 초과분은 a2 로. 한 종목은 정확히 한쪽에만(중복구독 금지).
+    [260720] a1+a2 슬롯 합계를 넘는 최저우선순위(당일 20%↑ 꼬리)는 절단해 두 계좌 상한선
+    내에서만 구독한다(보유·VI·전일상한가는 절대 절단되지 않음 — 우선순위 앞쪽)."""
     universe = set(codes)
     if not universe:
         return set(), set()
@@ -13644,6 +13663,14 @@ def _partition_a1_a2():
     rest = universe - held - vi - base
     ordered = list(held) + list(vi) + list(base) + list(rest)
     budget = _a1_data_budget()
+    combined_cap = budget + _a2_data_budget()
+    if len(ordered) > combined_cap:
+        dropped = len(ordered) - combined_cap
+        logger.warning(
+            f"{ts_prefix()} [상한가감시] 유니버스 {len(ordered)} > 두 계좌 슬롯합계 {combined_cap}"
+            f" → 최저우선순위 {dropped}종목(당일 20%↑ 꼬리) 이번 배정 제외"
+        )
+        ordered = ordered[:combined_cap]
     a1 = set(ordered[:budget])
     a2 = set(ordered[budget:])
     return a1, a2
@@ -14488,14 +14515,14 @@ def run_ws_forever_a2():
             time.sleep(0.1)
 
 
-# ── [260715] 당일 상한가 감시(28%↑) sticky 수집기 (S4a) ──
-_uplimit_watch_codes: set[str] = set()          # 당일 28%↑ 편입 종목(sticky, EOD까지 유지)
+# ── [260715] 당일 상한가 감시(20%↑) sticky 수집기 (S4a) ──
+_uplimit_watch_codes: set[str] = set()          # 당일 20%↑ 편입 종목(sticky, EOD까지 유지)
 _uplimit_watch_lock = threading.Lock()
 
 
-def _fetch_uplimit_candidates(client) -> list[str]:
-    """등락률 +28~30% 주권(ST) 코드 목록(한 스냅샷). 이 API 는 30건 하드캡·연속조회 불가.
-    fid_rsfl_rate1/2 는 반드시 쌍으로(28~30). rate2 를 비우면 0건 반환됨(260715 실측)."""
+def _fetch_uplimit_band(client, rate_min: str, rate_max: str) -> list[str]:
+    """등락률 [rate_min, rate_max]% 주권(ST) 코드 한 밴드 조회(응답 30건 하드캡).
+    fid_rsfl_rate1/2 는 반드시 쌍으로. rate2 를 비우면 0건 반환됨(260715 실측)."""
     url = f"{client.cfg.base_url}/uapi/domestic-stock/v1/ranking/fluctuation"
     headers = client._headers(tr_id="FHPST01700000")
     params = {
@@ -14504,13 +14531,13 @@ def _fetch_uplimit_candidates(client) -> list[str]:
         "fid_rank_sort_cls_code": "0", "fid_input_cnt_1": "0", "fid_prc_cls_code": "0",
         "fid_input_price_1": "", "fid_input_price_2": "", "fid_vol_cnt": "",
         "fid_trgt_cls_code": "0", "fid_trgt_exls_cls_code": "0", "fid_div_cls_code": "0",
-        "fid_rsfl_rate1": UPLIMIT_WATCH_RATE_MIN, "fid_rsfl_rate2": UPLIMIT_WATCH_RATE_MAX,
+        "fid_rsfl_rate1": rate_min, "fid_rsfl_rate2": rate_max,
     }
     r = requests.get(url, headers=headers, params=params, timeout=10)
     r.raise_for_status()
     j = r.json()
     if str(j.get("rt_cd")) != "0":
-        raise RuntimeError(f"[상한가감시] 등락률순위 실패: {j.get('msg1')}")
+        raise RuntimeError(f"[상한가감시] 등락률순위 실패({rate_min}~{rate_max}): {j.get('msg1')}")
     out = j.get("output") or []
     if isinstance(out, dict):
         out = [out]
@@ -14525,8 +14552,22 @@ def _fetch_uplimit_candidates(client) -> list[str]:
     return result
 
 
+def _fetch_uplimit_candidates(client) -> list[str]:
+    """당일 등락률 +20~30% 주권(ST) 코드 목록. 이 API 는 응답 30건 하드캡·연속조회 불가라
+    UPLIMIT_WATCH_RATE_BANDS 밴드별로 조회해 합집합(순서 보존 dedup)한다 → 30건 벽 돌파.
+    최종 편입 총량 상한은 _partition_a1_a2(a1+a2 슬롯 합계)에서 관리한다."""
+    seen: set[str] = set()
+    result: list[str] = []
+    for rate_min, rate_max in UPLIMIT_WATCH_RATE_BANDS:
+        for c in _fetch_uplimit_band(client, rate_min, rate_max):
+            if c not in seen:
+                seen.add(c)
+                result.append(c)
+    return result
+
+
 def _uplimit_watch_loop():
-    """당일 등락률 +28%↑ 주권을 주기 조회해 구독 유니버스(codes)에 sticky 편입(EOD까지 유지).
+    """당일 등락률 +20%↑ 주권을 주기 조회해 구독 유니버스(codes)에 sticky 편입(EOD까지 유지).
     09:00~15:20 신규 편입. 편입 종목은 해제하지 않음(watchdog sticky-skip 로 보호)."""
     if not (MULTIACCT_WSS_ENABLED and UPLIMIT_WATCH_ENABLED):
         return

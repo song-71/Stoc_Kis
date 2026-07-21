@@ -43,6 +43,9 @@ ROLL = 50                # "직전 50틱 이내" 윈도우 (지정가 기준가)
 STOP_LOSS_PCT = 0.03     # 손절 -3%
 TRAIL_STOP_PCT = 0.03    # 트레일스톱 -3%
 MA500_GAP_PCT = 0.03     # ma500gap 기준 +3%
+DEPTH_FLOOR_PCT = 0.005  # [260722] 검증본 하한 2%였으나, 모의투자 데이터 수집 위해 0.5%로 낮춤
+                         #   (0.5~2% 얕은구간 포함 → 장부에 깊이% 기록되므로 나중에 제외/포함 성과 재분석).
+                         #   ※검증본 결론: 얕은구간 기대값≈0(2%하한이 총수익·MDD 우월). 지정가면 소폭 흑자 가능.
 STOCH_N = 1500           # 스토캐스틱 %K 기간 (데이터 단계와 동일)
 STOCH_M = 100
 
@@ -81,12 +84,16 @@ class Str2State:
     running_low: float = 0.0       # 당일(정규장) 저점 (매수필터②)
     closing_checked: bool = False  # 15:18 1회 판정
     carry_hold: bool = False       # 15:18 상한가 → 보유 이월
+    limit_up_touched: bool = False # 당일 상한가 도달 이력(상한가 이탈→오더북 구독 트리거)
+    pullback_low: float = 0.0      # 상한가 이탈 후 눌림 저점(상한가 재도달 시 리셋) — 진입 깊이 하한 판정
     qty: int = 0                   # 보유 수량 (체결통보로 갱신; 호출자 bookkeeping)
     last_buy_ordno: str = ""       # 직전 매수 주문번호 (취소/체결 매칭)
     last_sell_ordno: str = ""      # 직전 매도 주문번호
     last_sell_reason: str = ""     # 직전 매도 사유
     ma10_prev: float = 0.0         # 직전 틱 ma10 (데드크로스 판정)
     ma500_prev: float = 0.0        # 직전 틱 ma500
+    ma2000_prev: float = 0.0       # 직전 틱 ma2000 (ma500<ma2000 데드크로스 판정)
+    golden_seen: bool = False      # ma500>=ma2000(정배열) 관측 래치 → 이후 하향교차 시 매도
     buy_order_tick: int = -1       # 매수 지정가 발주 시점 tick_idx (can_fill 판정)
     sell_order_tick: int = -1      # 매도 지정가 발주 시점 tick_idx
     buy_order_qty: int = 0         # 매수 지정가 주문수량 (미체결 취소 시 사용)
@@ -182,12 +189,17 @@ def sell_stop_trail(
     buy_price: float, pr: float, highest: float,
     stop_loss_pct: float = STOP_LOSS_PCT, trail_stop_pct: float = TRAIL_STOP_PCT,
 ) -> tuple[bool, str]:
-    """공통 손절(-3%)/트레일스톱(-3%) → (do_sell, reason)."""
-    if buy_price > 0 and pr > 0 and pr <= buy_price * (1 - stop_loss_pct):
-        return True, "str2_손절(-3%)"
-    if highest > 0 and pr > 0 and pr <= highest * (1 - trail_stop_pct):
-        return True, f"str2_트레일스톱-3%(고가{int(highest):,})"
+    """[260722] 상한가 눌림목 검증본 반영 — 손절/트레일 '없음'(손절이 오히려 손해라 백테스트로 확인).
+    항상 미발동. (매도는 상한가 재도달 / ma500<ma2000 데드크로스 / EOD 만.)"""
     return False, ""
+
+
+def depth_floor_ok(limit_up: float, pullback_low: float, floor_pct: float = DEPTH_FLOOR_PCT) -> bool:
+    """[260722] 검증본: 진입 깊이 하한 — 상한가 대비 눌림 저점 하락폭 >= floor_pct(2%) 여야 진입 허용.
+    (하한만; 상한 없음. limit_up/pullback_low 미확정이면 보수적으로 False.)"""
+    if limit_up > 0 and pullback_low > 0:
+        return (limit_up - pullback_low) / limit_up >= floor_pct
+    return False
 
 
 def compute_ma500gap(bidp0: float, ma500: float, gap_pct: float = MA500_GAP_PCT) -> bool:
@@ -226,11 +238,20 @@ def sell_order_resolve(sell_order_active: bool, ma50: float, ma200: float, can_f
 
 
 def sell_deadcross(ma500gap: bool, ma10_prev: float, ma500_prev: float,
-                   ma10: float, ma500: float) -> tuple[bool, str]:
-    """ma500gap 해제 & ma10/ma500 데드크로스 → 시장가 매도."""
+                   ma10: float, ma500: float,
+                   ma2000_prev: float = 0.0, ma2000: float = 0.0,
+                   golden_seen: bool = False) -> tuple[bool, str]:
+    """[260722] 검증본 반영 — ma500 vs ma2000 데드크로스로 변경(구 ma10<ma500 대체).
+    골든(ma500>ma2000) 관측 후 ma500<ma2000 하향교차 시 매도. 드라이버가 golden_seen(state) 갱신.
+    ma2000 미제공(워밍업) 시 구 로직(ma10<ma500)으로 폴백."""
+    if ma2000 > 0 and ma2000_prev > 0 and ma500 > 0 and ma500_prev > 0:
+        if golden_seen and ma500_prev >= ma2000_prev and ma500 < ma2000:
+            return True, "str2_ma500ma2000_데드크로스_시장가"
+        return False, ""
+    # 폴백(ma2000 워밍업 전): 구 ma10<ma500
     if ((not ma500gap) and ma10_prev > 0 and ma500_prev > 0 and ma10_prev > ma500_prev
             and ma10 > 0 and ma500 > 0 and ma10 < ma500):
-        return True, "str2_ma10ma500_데드크로스_시장가"
+        return True, "str2_ma10ma500_데드크로스_시장가(폴백)"
     return False, ""
 
 

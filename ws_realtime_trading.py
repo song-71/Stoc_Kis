@@ -199,6 +199,11 @@ STR2_PULLBACK_ONLY = True
 STR2_VI_TRADE_MODE = "run_mode"   # "off"/"test_mode"(1주)/"run_mode"(정상) — str2 매수 수량 정책
 # str2 시드: 동시 보유 분산 종목 수 (가용현금 / N 으로 종목당 투자금 결정)
 STR2_DIVERSIFY_N = 3
+# [260722] 상한가 눌림목 검증본(symulation/sweep_exec_sim.py) 진입 파라미터
+STR2_ESC_MIN = 3                  # ma10<bb_lo 연속 N회 → escaped(밴드 하단 이탈 확정)
+STR2_MAXE = 5                     # 종목당 하루 최대 진입 횟수
+STR2_SHALLOW = 0.02              # 얕은 눌림 경계(2%): 이하=지정가 전용
+STR2_SIZE_LIM_MAX = 40_000_000  # 깊은 눌림(>2%) 시 투입액 이 값 이하=지정가 / 초과=시장가 스윕
 
 # 직전 영업일 종가매수 선정 종목을 당일 base codes로 자동 사용
 AUTO_CODE_FROM_PREV_CLOSING = True
@@ -2932,6 +2937,12 @@ _str2_ob_subs: dict[str, float] = {}           # code → 구독 시작 epoch (5
 _str2_ob_acct: dict[str, str] = {}             # code → "a1"|"a2" (구독된 연결 — a1 만석 시 a2 오버플로)
 _str2_ob_lock = threading.Lock()
 _str2_ob_cmd_q: "queue.Queue" = queue.Queue()  # (code, on:bool) — 워커가 _send_subscribe 수행
+# [260722] 오더북 프레임 디스크 저장(검증용) — 구독 종목 호가를 CSV 로 누적(배치 flush)
+STR2_OB_SAVE = True                            # 저장 on/off
+_str2_ob_save_buf: list = []                   # 저장 대기 행 버퍼
+_str2_ob_save_lock = threading.Lock()
+_str2_ob_save_last: float = 0.0                # 마지막 flush epoch (30s 주기 flush 용)
+_STR2_OB_SAVE_FLUSH_N = 2000                   # 이 건수 도달 시 즉시 flush
 # bb_hi_max = rolling_max(bb_upper, 600). baked bb_upper(ddof=0) 를 매 틱 push.
 #   ※ ddof 결정: 로컬 회신 §2/§3 은 σ ddof=1 명시하나, 서버 파리티 기준은
 #     _calc_indicators 가 산출하는 baked BB(모집단분산 ddof=0)이므로 ddof=0 채택.
@@ -11992,7 +12003,7 @@ def _str2_simul_ob_fill(code: str, use_market: bool, ord_price: float, qty: int,
 
 
 def _str2_place_buy(code: str, st: "Str2State", price: float, stck_prpr: float,
-                    use_market: bool, origin: str, reason: str) -> None:
+                    use_market: bool, origin: str, reason: str, depth: float = 0.0) -> None:
     """str2 매수 주문 (use_market=True 시장가 ord_dvsn='01', 아니면 지정가 '00').
 
     지정가 가격(price)은 회신 §3 의 '직전50틱 min(bidp1)' 기준가(호출자 계산).
@@ -12011,6 +12022,11 @@ def _str2_place_buy(code: str, st: "Str2State", price: float, stck_prpr: float,
     if qty <= 0:
         logger.info(f"{ts_prefix()} [str2_buy] {name}({code}) 수량=0 → 스킵 (현재가={int(stck_prpr):,})")
         return
+    # [260722] 검증본 라우팅: 깊이>2% & 투입액>4천만 → 시장가 스윕. 그 외(얕은 ≤2% / 소액)=지정가.
+    if (not use_market) and depth > STR2_SHALLOW and (qty * stck_prpr) > STR2_SIZE_LIM_MAX:
+        use_market = True
+        price = 0.0
+        reason = f"{reason}·시장가전환(깊이>2%·투입>4천만)"
     ord_dvsn = "01" if use_market else "00"
     ord_price = 0 if use_market else round_to_tick(price, market)
     if not use_market and ord_price <= 0:
@@ -12375,19 +12391,32 @@ def _check_str2_from_tick(result: "pl.DataFrame", col_map: dict, code_col: str, 
                 st.ma10_prev, st.ma500_prev, st.ma2000_prev = ma10, ma500, ma2000
                 continue
 
-            # [260722] 상한가 이탈/복귀 추적 → 눌림 저점(진입깊이 하한) + 오더북 구독 트리거
+            # [260722] 검증본 상한가 눌림목 상태머신(armed/escaped) + 오더북 트리거
             if st.limit_up > 0:
                 if strat2.is_limit_up(stck_prpr, prdy_ctrt, st.limit_up):
+                    # 상한가 (재)도달 → 재무장 + escape·눌림저점 리셋
                     st.limit_up_touched = True
-                    st.pullback_low = stck_prpr          # 상한가 재도달 → 눌림 저점 리셋
+                    st.armed = True; st.escaped = False; st.esc_count = 0
+                    st.pullback_low = stck_prpr
+                    # 미체결 지정가 매수 대기 중이면 취소(눌림목 무산 = 상한가 복귀)
+                    if st.buy_order_active and not st.position:
+                        if STR2_SIMUL_MODE:
+                            _str2_cancel(code, st, st.last_buy_ordno or "SIMUL", st.buy_order_qty, "00", "상한가복귀_지정가취소")
+                        with _str2_state_lock:
+                            st.buy_order_active = False; st.buy_order_qty = 0
                     if STR2_OB_ON_TRIGGER and not st.position:
                         _str2_ob_unsubscribe(code, "상한가복귀")
                 elif st.limit_up_touched:
                     if st.pullback_low <= 0 or (stck_prpr > 0 and stck_prpr < st.pullback_low):
-                        st.pullback_low = stck_prpr      # 이탈 중 눌림 저점 갱신
+                        st.pullback_low = stck_prpr
+                    # 밴드 하단 이탈(ma10<bb_lo) 연속 카운트 → escaped(복귀 대기)
+                    if bb_lo_v > 0 and ma10 > 0 and ma10 < bb_lo_v:
+                        st.esc_count += 1
+                        if st.esc_count >= STR2_ESC_MIN and not st.escaped:
+                            st.escaped = True
+                            logger.info(f"{ts_prefix()} [str2_이탈] {code_name_map.get(code, code)}({code}) 밴드하단 이탈확정(esc={st.esc_count}) → 복귀 대기")
                     if STR2_OB_ON_TRIGGER and not st.position:
                         _str2_ob_subscribe(code)
-                # 보유 중 오더북 유실(재접속 등) → 청산 전까지 재구독 보장(idempotent)
                 if STR2_OB_ON_TRIGGER and st.position and code not in _str2_ob_subs:
                     _str2_ob_subscribe(code)
 
@@ -12509,17 +12538,21 @@ def _check_str2_from_tick(result: "pl.DataFrame", col_map: dict, code_col: str, 
                 st.ma10_prev, st.ma500_prev, st.ma2000_prev = ma10, ma500, ma2000
                 continue
 
-            # 신규 매수 발주 (b1/b3)
-            origin = strat2.buy_b1b3_origin(
-                st.b1_enabled, allowed, bidp1, bb_lo_v, ma10, ma50, ma300, ma500,
-                ma500_up, ma2000_up)
-            # [260722] 검증본: 진입 깊이 하한 2%(상한가 대비 눌림 저점) 충족 시에만 매수
-            if origin and roll_min_ma10 > 0 and strat2.depth_floor_ok(st.limit_up, st.pullback_low):
+            # [260722] 검증본 상한가 눌림목 진입: escaped(밴드하단이탈 확정) → 복귀(ma10≥bb_lo & ma10>ma50) & 깊이 0.5%↑
+            #   깊이 = (상한가-현재가)/상한가 (복귀 시점 기준, sweep_exec_sim dep 와 동일). 라우팅은 _str2_place_buy(depth) 가.
+            _depth = (st.limit_up - stck_prpr) / st.limit_up if st.limit_up > 0 else 0.0
+            if (st.escaped and st.armed and st.entries < STR2_MAXE
+                    and ma10 > 0 and ma50 > 0 and bb_lo_v > 0
+                    and ma10 >= bb_lo_v and ma10 > ma50
+                    and 0.005 <= _depth <= 1.0 and roll_min_ma10 > 0):
+                st.escaped = False; st.esc_count = 0; st.armed = False   # 진입 소진(재무장=상한가 재도달)
+                st.entries += 1
                 st.buy_order_tick = tick_idx
-                _depth = (st.limit_up - st.pullback_low) / st.limit_up * 100 if st.limit_up > 0 else 0.0
+                logger.info(f"{ts_prefix()} [str2_진입] {code_name_map.get(code, code)}({code}) 복귀매수 깊이{_depth*100:.1f}% "
+                            f"(ma10={int(ma10):,}>ma50={int(ma50):,}, 지정가기준={int(roll_min_ma10):,}) entries={st.entries}")
                 _str2_place_buy(code, st, price=roll_min_ma10, stck_prpr=stck_prpr,
-                                use_market=False, origin=origin,
-                                reason=f"{origin}_지정가(직전50틱min ma10, 깊이{_depth:.1f}%)")
+                                use_market=False, origin="눌림목",
+                                reason=f"상한가눌림목(깊이{_depth*100:.1f}%)", depth=_depth)
 
             st.ma10_prev, st.ma500_prev, st.ma2000_prev = ma10, ma500, ma2000
         except Exception as _e:
@@ -14440,31 +14473,74 @@ def _rec_i(rec: dict, key: str) -> int:
         return 0
 
 
+_STR2_OB_SAVE_COLS = (["recv_ts", "code", "name", "bsop_hour"]
+    + [f"{p}{k}" for k in range(1, 11) for p in ("askp", "bidp", "askp_rsqn", "bidp_rsqn")]
+    + ["total_askp_rsqn", "total_bidp_rsqn"])
+
+
+def _flush_str2_ob_save() -> None:
+    """오더북 저장 버퍼 → CSV append. 호출자가 _str2_ob_save_lock 을 보유한 상태로 호출."""
+    global _str2_ob_save_last
+    if not _str2_ob_save_buf:
+        return
+    try:
+        import csv as _csv
+        d = OUT_DIR / "orderbook"
+        d.mkdir(parents=True, exist_ok=True)
+        path = d / f"{today_yymmdd}_orderbook.csv"
+        write_header = not path.exists()
+        n = len(_str2_ob_save_buf)
+        with open(path, "a", encoding="utf-8-sig", newline="") as f:
+            w = _csv.DictWriter(f, fieldnames=_STR2_OB_SAVE_COLS, extrasaction="ignore")
+            if write_header:
+                w.writeheader()
+            w.writerows(_str2_ob_save_buf)
+        _str2_ob_save_buf.clear()
+        _str2_ob_save_last = time.time()
+        logger.info(f"{ts_prefix()} [str2_ob] 오더북 {n}건 저장 → {path.name}")
+    except Exception as e:
+        logger.warning(f"{ts_prefix()} [str2_ob] 오더북 저장 실패: {type(e).__name__}: {e}")
+
+
 def _str2_ob_ingest(result: "pl.DataFrame") -> None:
-    """[260722] H0STASP0(오더북) 프레임 → _str2_ob_latest 에 종목별 최신 호가만 유지.
+    """[260722] H0STASP0(오더북) 프레임 → _str2_ob_latest(종목별 최신) + (STR2_OB_SAVE 시) 디스크 저장 버퍼.
     소비측(_str2_simul_ob_fill)이 쓰는 askp/bidp/askp_rsqn/bidp_rsqn 10단계 형태로 정규화."""
     try:
         recs = result.to_dicts()
     except Exception:
         return
     now_ep = time.time()
+    _rts = datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S.%f")
     latest: dict[str, dict] = {}
+    save_rows: list = []
     for rec in recs:
         c = str(rec.get("mksc_shrn_iscd") or "").strip().zfill(6)
         if c == "000000" or len(c) != 6:
             continue
-        latest[c] = {
-            "code": c, "name": code_name_map.get(c, c), "recv_epoch": now_ep,
-            "bsop_hour": str(rec.get("bsop_hour") or ""),
-            "askp":      [_rec_i(rec, f"askp{k}") for k in range(1, 11)],
-            "bidp":      [_rec_i(rec, f"bidp{k}") for k in range(1, 11)],
-            "askp_rsqn": [_rec_i(rec, f"askp_rsqn{k}") for k in range(1, 11)],
-            "bidp_rsqn": [_rec_i(rec, f"bidp_rsqn{k}") for k in range(1, 11)],
-            "total_askp_rsqn": _rec_i(rec, "total_askp_rsqn"),
-            "total_bidp_rsqn": _rec_i(rec, "total_bidp_rsqn"),
-        }
+        askp = [_rec_i(rec, f"askp{k}") for k in range(1, 11)]
+        bidp = [_rec_i(rec, f"bidp{k}") for k in range(1, 11)]
+        askq = [_rec_i(rec, f"askp_rsqn{k}") for k in range(1, 11)]
+        bidq = [_rec_i(rec, f"bidp_rsqn{k}") for k in range(1, 11)]
+        ta = _rec_i(rec, "total_askp_rsqn"); tb = _rec_i(rec, "total_bidp_rsqn")
+        bsop = str(rec.get("bsop_hour") or "")
+        nm = code_name_map.get(c, c)
+        latest[c] = {"code": c, "name": nm, "recv_epoch": now_ep, "bsop_hour": bsop,
+                     "askp": askp, "bidp": bidp, "askp_rsqn": askq, "bidp_rsqn": bidq,
+                     "total_askp_rsqn": ta, "total_bidp_rsqn": tb}
+        if STR2_OB_SAVE:
+            row = {"recv_ts": _rts, "code": c, "name": nm, "bsop_hour": bsop,
+                   "total_askp_rsqn": ta, "total_bidp_rsqn": tb}
+            for k in range(10):
+                row[f"askp{k+1}"] = askp[k]; row[f"bidp{k+1}"] = bidp[k]
+                row[f"askp_rsqn{k+1}"] = askq[k]; row[f"bidp_rsqn{k+1}"] = bidq[k]
+            save_rows.append(row)
     if latest:
-        _str2_ob_latest.update(latest)   # 종목별 최신 1건만(누적 저장은 배치 확장 시)
+        _str2_ob_latest.update(latest)
+    if save_rows:
+        with _str2_ob_save_lock:
+            _str2_ob_save_buf.extend(save_rows)
+            if len(_str2_ob_save_buf) >= _STR2_OB_SAVE_FLUSH_N:
+                _flush_str2_ob_save()
 
 
 def _str2_ob_subscribe(code: str) -> None:
@@ -14548,7 +14624,12 @@ def _str2_ob_worker() -> None:
 
 
 def _str2_ob_timeout_sweep() -> None:
-    """이탈 후 신호(매수) 없이 STR2_OB_HOLD_SEC 초 경과 & 미보유 종목 오더북 자동 해제."""
+    """이탈 후 신호(매수) 없이 STR2_OB_HOLD_SEC 초 경과 & 미보유 종목 오더북 자동 해제.
+    + 오더북 저장 버퍼 30초 주기 flush(부분 버퍼 유실 방지)."""
+    if STR2_OB_SAVE:
+        with _str2_ob_save_lock:
+            if _str2_ob_save_buf and (time.time() - _str2_ob_save_last) > 30:
+                _flush_str2_ob_save()
     if not _str2_ob_subs:
         return
     now = time.time()

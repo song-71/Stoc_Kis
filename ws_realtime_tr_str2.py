@@ -86,6 +86,11 @@ class Str2State:
     carry_hold: bool = False       # 15:18 상한가 → 보유 이월
     limit_up_touched: bool = False # 당일 상한가 도달 이력(상한가 이탈→오더북 구독 트리거)
     pullback_low: float = 0.0      # 상한가 이탈 후 눌림 저점(상한가 재도달 시 리셋) — 진입 깊이 하한 판정
+    # [260722] 검증본 상한가 눌림목 진입 상태머신 (sweep_exec_sim.py 의 armed/escaped/esc)
+    armed: bool = False            # 상한가 도달 후 무장(진입 후 해제, 상한가 재도달 시 재무장)
+    esc_count: int = 0             # ma10<bb_lo 연속 카운트
+    escaped: bool = False          # esc_count>=ESC_MIN → 밴드 하단 이탈 확정(복귀 대기)
+    entries: int = 0               # 당일 진입 횟수(MAXE 제한)
     qty: int = 0                   # 보유 수량 (체결통보로 갱신; 호출자 bookkeeping)
     last_buy_ordno: str = ""       # 직전 매수 주문번호 (취소/체결 매칭)
     last_sell_ordno: str = ""      # 직전 매도 주문번호

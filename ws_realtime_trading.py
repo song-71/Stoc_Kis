@@ -2944,6 +2944,10 @@ _str2_ob_save_buf: list = []                   # 저장 대기 행 버퍼
 _str2_ob_save_lock = threading.Lock()
 _str2_ob_save_last: float = 0.0                # 마지막 flush epoch (30s 주기 flush 용)
 _STR2_OB_SAVE_FLUSH_N = 2000                   # 이 건수 도달 시 즉시 flush
+_str2_ob_last_sig: dict = {}                   # code → 직전 저장 호가 시그니처(중복 스냅샷 제거용)
+# [260722] 원본(전체 59컬럼) 캡처 — KIS 민원/파싱진단용. 하루 첫 N프레임을 그대로 저장.
+_str2_ob_raw_saved: int = 0
+_STR2_OB_RAW_MAX = 400
 # bb_hi_max = rolling_max(bb_upper, 600). baked bb_upper(ddof=0) 를 매 틱 push.
 #   ※ ddof 결정: 로컬 회신 §2/§3 은 σ ddof=1 명시하나, 서버 파리티 기준은
 #     _calc_indicators 가 산출하는 baked BB(모집단분산 ddof=0)이므로 ddof=0 채택.
@@ -13049,8 +13053,9 @@ def on_result(ws, tr_id, result, data_info):
         _mkstatus_recv_queue.put(result)
         return
 
-    # [260722] H0STASP0 오더북: 종목별 최신 호가만 메모리 유지(_str2_ob_latest). parquet 미포함.
+    # [260722] H0STASP0 오더북: 원본(진단용) 캡처 → 최신유지·저장(_str2_ob_ingest).
     if trid == "H0STASP0":
+        _str2_ob_raw_capture(result)   # 하루 첫 N프레임 전체컬럼 원본 저장(민원/진단)
         _str2_ob_ingest(result)
         return
     # polars는 중복 컬럼명을 자동으로 suffix 처리하므로 별도 제거 불필요
@@ -14482,6 +14487,23 @@ def _merge_str2_ob_parts() -> None:
         logger.warning(f"{ts_prefix()} [str2_ob] 오더북 병합 실패: {type(e).__name__}: {e}")
 
 
+def _str2_ob_raw_capture(result: "pl.DataFrame") -> None:
+    """[260722] 원본 H0STASP0 프레임(전체 59컬럼)을 하루 첫 _STR2_OB_RAW_MAX 건 '가공 전' 그대로 저장.
+    쓰레기(예상체결가-as-code) 행 포함 → 파싱진단·KIS 민원 근거. data/wss_data/orderbook/raw_diag/."""
+    global _str2_ob_raw_saved
+    if _str2_ob_raw_saved >= _STR2_OB_RAW_MAX:
+        return
+    try:
+        d = OUT_DIR / "orderbook" / "raw_diag"
+        d.mkdir(parents=True, exist_ok=True)
+        rts = datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S.%f")
+        df = result.with_columns(pl.lit(rts).alias("recv_ts_diag"))
+        _str2_ob_raw_saved += df.height
+        df.write_parquet(d / f"{today_yymmdd}_h0stasp0_raw_{_str2_ob_raw_saved:05d}.parquet")
+    except Exception as e:
+        logger.warning(f"{ts_prefix()} [str2_ob] 원본 캡처 실패: {type(e).__name__}: {e}")
+
+
 def _str2_ob_ingest(result: "pl.DataFrame") -> None:
     """[260722] H0STASP0(오더북) 프레임 → _str2_ob_latest(종목별 최신) + (STR2_OB_SAVE 시) 디스크 저장 버퍼.
     소비측(_str2_simul_ob_fill)이 쓰는 askp/bidp/askp_rsqn/bidp_rsqn 10단계 형태로 정규화."""
@@ -14512,12 +14534,15 @@ def _str2_ob_ingest(result: "pl.DataFrame") -> None:
                      "askp": askp, "bidp": bidp, "askp_rsqn": askq, "bidp_rsqn": bidq,
                      "total_askp_rsqn": ta, "total_bidp_rsqn": tb}
         if STR2_OB_SAVE:
-            row = {"recv_ts": _rts, "code": c, "name": nm, "bsop_hour": bsop,
-                   "total_askp_rsqn": ta, "total_bidp_rsqn": tb}
-            for k in range(10):
-                row[f"askp{k+1}"] = askp[k]; row[f"bidp{k+1}"] = bidp[k]
-                row[f"askp_rsqn{k+1}"] = askq[k]; row[f"bidp_rsqn{k+1}"] = bidq[k]
-            save_rows.append(row)
+            sig = (tuple(askp), tuple(bidp), tuple(askq), tuple(bidq))
+            if _str2_ob_last_sig.get(c) != sig:   # [260722] 변화 있을 때만 저장(동일 스냅샷 반복 제거)
+                _str2_ob_last_sig[c] = sig
+                row = {"recv_ts": _rts, "code": c, "name": nm, "bsop_hour": bsop,
+                       "total_askp_rsqn": ta, "total_bidp_rsqn": tb}
+                for k in range(10):
+                    row[f"askp{k+1}"] = askp[k]; row[f"bidp{k+1}"] = bidp[k]
+                    row[f"askp_rsqn{k+1}"] = askq[k]; row[f"bidp_rsqn{k+1}"] = bidq[k]
+                save_rows.append(row)
     if latest:
         _str2_ob_latest.update(latest)
     if save_rows:

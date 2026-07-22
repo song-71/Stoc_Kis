@@ -457,6 +457,7 @@ LEDGER_DIR.mkdir(parents=True, exist_ok=True)
 LEDGER_PATH = LEDGER_DIR / f"trade_ledger_{today_yymmdd}.csv"
 LEDGER_COLS = [
     "date", "time", "code", "name", "cano_alias",
+    "mode",          # 모의 / 실전 — 이 기록이 모의투자(SIMUL)인지 실거래인지 구분
     "order_type",    # buy_order / sell_order / buy_fill / sell_fill / buy_cancel
     "ord_dvsn",      # 시장가/지정가/시간외종가 등
     "stck_prpr",     # 현재가 (주문 시 현재가, 체결 시 체결가)
@@ -1032,10 +1033,15 @@ def _append_ledger(
     note: str = "",
     cano_alias: str = "",
     stck_prpr: float = 0.0,
+    mode: str = "",
 ) -> None:
     """거래장부 CSV 에 1행 추가 (스레드 안전)."""
     try:
         now = datetime.now(KST)
+        # 모의/실전 자동판정: SIMUL 표식(ord_no=="SIMUL" 또는 reason에 "SIMUL")이면 모의, 아니면 실전.
+        #   호출부에서 mode 를 명시하면 그 값을 우선 사용.
+        if not mode:
+            mode = "모의" if (str(ord_no) == "SIMUL" or "SIMUL" in str(reason)) else "실전"
         amount = sell_price * fill_qty if sell_price > 0 else buy_price * fill_qty
         # 수익률/수익액: sell_fill 시에만 의미 있음
         ret = round((sell_price / buy_price - 1), 4) if buy_price > 0 and sell_price > 0 else 0.0
@@ -1046,6 +1052,7 @@ def _append_ledger(
             "code":       str(code).zfill(6),
             "name":       name or code_name_map.get(str(code).zfill(6), ""),
             "cano_alias": cano_alias,
+            "mode":       mode,
             "order_type": order_type,
             "ord_dvsn":   ord_dvsn,
             "stck_prpr":  round(stck_prpr, 2),
@@ -11963,14 +11970,16 @@ def _str2_qty(stck_prpr: float, market: str) -> int:
 def _str2_simul_ob_fill(code: str, use_market: bool, ord_price: float, qty: int,
                         stck_prpr: float, side: str = "buy") -> tuple[int, float, str]:
     """[260722] SIMUL 체결 판단 — 실시간 orderbook(_get_orderbook) 참조.
-    반환 (체결수량, 체결가, note). orderbook 없으면 폴백(터치=전량, 시장가=현재가).
+    반환 (체결수량, 체결가, note). [260722] '터치=전량' 가정 폐기 — 실제 호가 잔량만 체결.
       · 매수 시장가 : 매도호가 사다리(askp1..10)를 수량만큼 위로 쓸어담기 → 부분체결·VWAP.
-      · 매수 지정가 : 최우선 매도호가(askp1) ≤ 지정가면 즉시 체결가능(그 잔량 한도), 아니면 대기(0).
+      · 매수 지정가 : 최우선 매도호가(askp1) ≤ 지정가면 그 잔량 한도로만 체결, 아니면 대기(0).
+      · 오더북 없으면: 지정가=체결보류(대기, 전량가정 절대 안함) / 시장가=현재가 근사(시장가는 즉시체결이라).
       · 매도는 반대(매수호가 bidp 기준). """
     ob = _get_orderbook(code)
     if not ob:
-        fp = float(stck_prpr) if use_market else float(ord_price)
-        return qty, fp, "orderbook없음→폴백(터치=전량)"
+        if use_market:
+            return qty, float(stck_prpr), "orderbook없음→시장가 현재가근사체결"
+        return 0, 0.0, "orderbook없음→지정가 체결보류(대기; 전량가정 폐기)"
     if side == "buy":
         px_lv = ob.get("askp") or []; rsqn_lv = ob.get("askp_rsqn") or []
         if use_market:
@@ -11985,8 +11994,10 @@ def _str2_simul_ob_fill(code: str, use_market: bool, ord_price: float, qty: int,
             return sh, vwap, f"시장가 호가스윕 {sh}/{qty}주 vwap={int(vwap):,}" + ("(부분체결)" if rem > 0 else "")
         else:
             a1 = px_lv[0] if px_lv else 0; q1 = int(rsqn_lv[0]) if rsqn_lv else 0
-            if a1 and a1 <= ord_price:                       # 지정가가 매도호가 이상 → 즉시 체결가능
-                sh = min(qty, q1 or qty)
+            if a1 and a1 <= ord_price:                       # 지정가가 매도호가 이상 → 그 잔량 한도로만 체결
+                sh = min(qty, q1)                            # [260722] 실제 잔량만(q1). '잔량0→전량' 낙관 폐기.
+                if sh <= 0:
+                    return 0, 0.0, f"지정가 매도호가 잔량0 → 체결보류(askp1={int(a1):,})"
                 return sh, float(min(a1, ord_price)), f"지정가 즉시체결 askp1={int(a1):,} 잔량{q1} → {sh}/{qty}주" + ("(부분)" if sh < qty else "")
             return 0, 0.0, f"지정가 대기(askp1={int(a1 or 0):,} > 지정가 {int(ord_price):,})"
     else:  # sell
@@ -12002,7 +12013,9 @@ def _str2_simul_ob_fill(code: str, use_market: bool, ord_price: float, qty: int,
         else:
             b1 = px_lv[0] if px_lv else 0; q1 = int(rsqn_lv[0]) if rsqn_lv else 0
             if b1 and b1 >= ord_price:
-                sh = min(qty, q1 or qty)
+                sh = min(qty, q1)                            # [260722] 실제 매수호가 잔량만(q1). '잔량0→전량' 낙관 폐기.
+                if sh <= 0:
+                    return 0, 0.0, f"지정가매도 매수호가 잔량0 → 체결보류(bidp1={int(b1):,})"
                 return sh, float(max(b1, ord_price)), f"지정가매도 즉시체결 bidp1={int(b1):,} 잔량{q1} → {sh}/{qty}주"
             return 0, 0.0, f"지정가매도 대기(bidp1={int(b1 or 0):,} < 지정가 {int(ord_price):,})"
 
@@ -12051,21 +12064,33 @@ def _str2_place_buy(code: str, st: "Str2State", price: float, stck_prpr: float,
         out = j.get("output") or {}
         ordno = str(out.get("ODNO") or out.get("odno") or "").strip()
     # [260722] SIMUL: 실시간 orderbook 참조 체결 판정 (fill_qty>0=즉시·부분체결, 0=지정가 대기→틱 재점검)
-    ob_note = ""; fill_qty = 0; fill_pr = 0.0
+    # [260722 체결모델 확정] SIMUL 체결:
+    #   · 시장가 = 오더북 매도호가 사다리 위로 스윕(즉시).
+    #   · 지정가 = 즉시 스냅샷 체결 안 함. 대기 + '내 앞 대기물량'(오더북 매수호가 ≥P 잔량) 포착
+    #             → 이후 틱에서 재점검이 'P 이하 모든 체결(방향무관)'을 대기물량 먼저 소진 후 누적 체결.
+    ob_note = ""; fill_qty = 0; fill_pr = 0.0; sim_queue = 0.0
     if STR2_SIMUL_MODE:
-        fill_qty, fill_pr, ob_note = _str2_simul_ob_fill(code, use_market, float(ord_price), qty, stck_prpr, "buy")
+        if use_market:
+            fill_qty, fill_pr, ob_note = _str2_simul_ob_fill(code, True, float(ord_price), qty, stck_prpr, "buy")
+        else:
+            _ob = _get_orderbook(code)
+            if _ob:
+                for _bpx, _bqq in zip(_ob.get("bidp") or [], _ob.get("bidp_rsqn") or []):
+                    if _bpx and _bpx >= ord_price: sim_queue += (_bqq or 0)
+            ob_note = f"지정가 대기(내앞 대기물량 {int(sim_queue)})"
     with _str2_state_lock:
         st.buy_origin = origin
         st.last_buy_ordno = ordno
         if STR2_SIMUL_MODE:
-            if fill_qty > 0:
+            if fill_qty > 0:                                # 시장가 즉시체결
                 if st.qty <= 0:      st.buy_price = fill_pr
                 elif fill_pr > 0:    st.buy_price = (st.buy_price * st.qty + fill_pr * fill_qty) / (st.qty + fill_qty)
                 st.qty += fill_qty; st.position = True; st.buy_order_active = False
                 st.highest = max(st.highest, fill_pr)
-            else:
-                st.buy_order_active = True                  # 지정가 대기 → 이후 틱에서 재점검 체결
+            else:                                           # 지정가 대기(흐름체결 대기)
+                st.buy_order_active = True
                 st.buy_order_price = float(ord_price); st.buy_order_qty = qty
+                st.buy_queue = sim_queue
         elif use_market:
             # 시장가: 즉시 체결 가정 → 보유 잠정 표시 (체결통보가 buy_price/qty 확정)
             st.buy_order_active = False
@@ -12255,6 +12280,7 @@ def _check_str2_from_tick(result: "pl.DataFrame", col_map: dict, code_col: str, 
     # askp1: 매도 지정가 기준가(직전50틱 max). col_map 에 없으면 fallback.
     #   라이브 H0STCNT0 엔 askp1 존재(domestic_stock_functions_ws schema) — 방어용 폴백.
     askp1_col = col_map.get("askp1")
+    vol_col   = col_map.get("cntg_vol")   # [260722] 체결량(흐름 체결모델용)
 
     df_tmp = result.with_columns(
         pl.col(code_col).cast(pl.Utf8).str.zfill(6).alias(code_col)
@@ -12295,20 +12321,46 @@ def _check_str2_from_tick(result: "pl.DataFrame", col_map: dict, code_col: str, 
             st.tick_idx += 1
             tick_idx = st.tick_idx
 
-            # [260722] SIMUL 지정가 대기건 재점검 — orderbook 충족 시 (부분)체결 처리(장부기록)
+            # [260722 체결모델 확정] SIMUL 재점검 —
+            #   매수 지정가 = 배치 내 'P 이하 모든 체결(방향무관)'을 순회 누적, 내 앞 대기물량 먼저 소진(흐름체결).
+            #   매수 시장가 잔량 = 오더북 매도호가 사다리 스윕.  매도 = (상한가 매수대기 풍부) 오더북 스냅샷 유지.
             if STR2_SIMUL_MODE and (st.buy_order_active or st.sell_order_active):
                 nm2 = code_name_map.get(code, code)
                 if st.buy_order_active and st.buy_order_qty > 0:
-                    _fq, _fp, _obn = _str2_simul_ob_fill(code, False, st.buy_order_price, st.buy_order_qty, stck_prpr, "buy")
-                    if _fq > 0:
-                        if st.qty <= 0:   st.buy_price = _fp
-                        elif _fp > 0:     st.buy_price = (st.buy_price * st.qty + _fp * _fq) / (st.qty + _fq)
-                        st.qty += _fq; st.position = True; st.highest = max(st.highest, _fp)
-                        st.buy_order_qty = max(0, st.buy_order_qty - _fq)
-                        if st.buy_order_qty <= 0: st.buy_order_active = False
-                        _append_ledger(order_type="buy_fill", code=code, name=nm2, buy_price=_fp, fill_qty=_fq,
-                                       reason="str2_SIMUL_지정가매수체결", note=f"orderbook판정: {_obn}", stck_prpr=stck_prpr)
-                        logger.info(f"{ts_prefix()} [str2_체결(SIMUL)] 매수 {nm2}({code}) {_fq}주×{int(_fp):,} | {_obn}")
+                    Pbuy = st.buy_order_price
+                    if Pbuy > 0:                                 # 지정가 → 흐름 체결
+                        _fq = 0
+                        for _trow in df_code.iter_rows(named=True):
+                            try: _tp = float(str(_trow.get(pr_col) or 0).replace(",", "") or 0)
+                            except Exception: _tp = 0.0
+                            try: _tv = float(str(_trow.get(vol_col) or 0).replace(",", "") or 0)
+                            except Exception: _tv = 0.0
+                            if _tp <= 0 or _tv <= 0 or _tp > Pbuy: continue   # 내 지정가 이하 체결만
+                            if st.buy_queue > 0:                 # 내 앞 대기물량 먼저 소진
+                                _c = min(st.buy_queue, _tv); st.buy_queue -= _c; _tv -= _c
+                            if _tv > 0 and st.buy_order_qty > 0:
+                                _f = min(st.buy_order_qty, int(_tv)); st.buy_order_qty -= _f; _fq += _f
+                            if st.buy_order_qty <= 0: break
+                        if _fq > 0:
+                            if st.qty <= 0:   st.buy_price = Pbuy
+                            else:             st.buy_price = (st.buy_price * st.qty + Pbuy * _fq) / (st.qty + _fq)
+                            st.qty += _fq; st.position = True; st.highest = max(st.highest, Pbuy)
+                            if st.buy_order_qty <= 0: st.buy_order_active = False
+                            _append_ledger(order_type="buy_fill", code=code, name=nm2, buy_price=Pbuy, fill_qty=_fq,
+                                           reason="str2_SIMUL_지정가매수체결(흐름)",
+                                           note=f"P이하 모든체결·대기물량 소진 후, 잔여대기{int(st.buy_queue)}", stck_prpr=stck_prpr)
+                            logger.info(f"{ts_prefix()} [str2_체결(SIMUL)] 매수 {nm2}({code}) {_fq}주×{int(Pbuy):,} (흐름, 잔여대기{int(st.buy_queue)})")
+                    else:                                        # 시장가 잔량 → 오더북 사다리
+                        _fq, _fp, _obn = _str2_simul_ob_fill(code, True, 0.0, st.buy_order_qty, stck_prpr, "buy")
+                        if _fq > 0:
+                            if st.qty <= 0:   st.buy_price = _fp
+                            elif _fp > 0:     st.buy_price = (st.buy_price * st.qty + _fp * _fq) / (st.qty + _fq)
+                            st.qty += _fq; st.position = True; st.highest = max(st.highest, _fp)
+                            st.buy_order_qty = max(0, st.buy_order_qty - _fq)
+                            if st.buy_order_qty <= 0: st.buy_order_active = False
+                            _append_ledger(order_type="buy_fill", code=code, name=nm2, buy_price=_fp, fill_qty=_fq,
+                                           reason="str2_SIMUL_시장가매수체결", note=f"orderbook판정: {_obn}", stck_prpr=stck_prpr)
+                            logger.info(f"{ts_prefix()} [str2_체결(SIMUL)] 매수 {nm2}({code}) {_fq}주×{int(_fp):,} | {_obn}")
                 if st.sell_order_active and st.qty > 0:
                     _fq, _fp, _obn = _str2_simul_ob_fill(code, False, st.sell_order_price, st.qty, stck_prpr, "sell")
                     if _fq > 0:

@@ -102,6 +102,10 @@ class Str2State:
     buy_order_tick: int = -1       # 매수 지정가 발주 시점 tick_idx (can_fill 판정)
     sell_order_tick: int = -1      # 매도 지정가 발주 시점 tick_idx
     buy_order_qty: int = 0         # 매수 지정가 주문수량 (미체결 취소 시 사용)
+    # [260722 체결모델 확정] SIMUL 흐름체결용: 지정가 주문시점 '내 앞 대기물량'(가격≥P 매수호가 잔량).
+    #   이후 P 이하 체결이 올 때마다 이 대기물량을 먼저 소진하고, 남는 만큼만 내 체결로 잡는다.
+    buy_queue: float = 0.0         # 매수 지정가 내 앞 대기물량(남은 값, 소진하며 감소)
+    sell_queue: float = 0.0        # 매도 지정가 내 앞 대기물량(가격≤S 매도호가 잔량)
     tick_idx: int = 0              # 종목별 누적 틱 카운터
 
 

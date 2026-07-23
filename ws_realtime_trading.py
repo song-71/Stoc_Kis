@@ -12555,13 +12555,13 @@ def _check_str2_from_tick(result: "pl.DataFrame", col_map: dict, code_col: str, 
                 st.ma10_prev, st.ma500_prev, st.ma2000_prev = ma10, ma500, ma2000
                 continue
 
-            # [260723] 검증본 상한가 눌림목 진입: escaped(밴드하단이탈 확정) → 복귀(ma10≥bb_lo & ma10>ma50) & 깊이 2%↑
-            #   깊이 = (상한가-현재가)/상한가 (복귀 시점 기준, sweep_exec_sim dep 와 동일). 라우팅은 _str2_place_buy(depth) 가.
+            # [260723] 검증본 상한가 눌림목 진입: escaped(밴드하단이탈 확정) → 복귀(ma10≥bb_lo & ma10>ma50) & 깊이 4%↑
+            #   깊이 = (상한가-현재가)/상한가 (복귀 시점 기준, 종합본 dep 와 동일). 라우팅은 _str2_place_buy(depth) 가.
             _depth = (st.limit_up - stck_prpr) / st.limit_up if st.limit_up > 0 else 0.0
             if (st.escaped and st.armed and (STR2_MAXE <= 0 or st.entries < STR2_MAXE)
                     and ma10 > 0 and ma50 > 0 and bb_lo_v > 0
                     and ma10 >= bb_lo_v and ma10 > ma50
-                    and 0.02 <= _depth <= 1.0 and roll_min_ma10 > 0):   # [260723] 2% 미만 제외(검증본·뷰어 통일)
+                    and 0.04 <= _depth <= 1.0 and roll_min_ma10 > 0):   # [260723] 4% 미만 제외(전 기간 스윕 최적·검증본·뷰어 통일)
                 st.escaped = False; st.esc_count = 0; st.armed = False   # 진입 소진(재무장=상한가 재도달)
                 st.entries += 1
                 st.buy_order_tick = tick_idx

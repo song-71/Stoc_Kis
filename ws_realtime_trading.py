@@ -81,7 +81,8 @@ CODE_TEXT = """
 #            - 미수신 구독 10분 경과 해제
 #            - 종가매매 종목 선정(15:19) 및 종가매매 구독 전환(15:20)  ← 종가매매 매수 사실상 중단
 #          ★ 필요 시 True 로 되돌리면 기존 동작(top30 추가/제거 + 종가매매선정/전환) 그대로 복원.
-TOP5_ADD = False  # True: Top5 추가/해제/종가매매선정·전환(15:19/15:20)/미수신구독해제 O / False: Top50 다운·저장만, 위 동작 전부 X
+CLOSING_SELECT_ENABLED = False  # [260723] 종가매매 게이트: 15:19 종가매매 종목선정 + 15:20 종가 구독전환. 현재 미사용(False). (구 TOP5_ADD 개명 — 옛 top30 동적구독 루프는 제거)
+# ※ 잔재: _load_codes_from_cfg(재시작 config복원)·watchdog(미수신 재확인) 2곳도 이 플래그를 공유하는 옛 레거시(False라 무동작). 추후 별도 정리 대상.
 
 # 한도 초과 시 폴백 계정 사용 여부 (True: 한도 초과 시 계정2(syw_2)로 재시도)
 USE_FALLBACK_ACCOUNT = False
@@ -4663,18 +4664,18 @@ def _run_today_target_reselect() -> list[str]:
     return codes_result
 
 def _load_codes_from_cfg(base_codes: list[str]) -> list[str]:
-    """TOP5_ADD=True → config 우선 복원, False → CODE_TEXT 원본으로 시작."""
+    """CLOSING_SELECT_ENABLED=True → config 우선 복원, False → CODE_TEXT 원본으로 시작."""
     global _loaded_top_added
 
-    # ── TOP5_ADD=False → 항상 CODE_TEXT 원본으로 시작 (config 복원 안 함) ──
-    if not TOP5_ADD:
+    # ── CLOSING_SELECT_ENABLED=False → 항상 CODE_TEXT 원본으로 시작 (config 복원 안 함) ──
+    if not CLOSING_SELECT_ENABLED:
         _loaded_top_added = []
         logger.info(
-            f"[codes] TOP5_ADD=False → CODE_TEXT base({len(base_codes)}개)로 시작"
+            f"[codes] CLOSING_SELECT_ENABLED=False → CODE_TEXT base({len(base_codes)}개)로 시작"
         )
         return list(base_codes)
 
-    # ── TOP5_ADD=True → 기존 로직: config 우선 복원 ──
+    # ── CLOSING_SELECT_ENABLED=True → 기존 로직: config 우선 복원 ──
     now_t = datetime.now(KST).time()
 
     # 09:00 이전 시작 → config 초기화, CODE_TEXT 원본으로 시작
@@ -9060,8 +9061,8 @@ def _price_watchdog_loop() -> None:
                     # [260715] 당일 28%↑ sticky 편입 종목은 미수신이어도 해제하지 않음(EOD까지 유지)
                     if c in _uplimit_watch_codes:
                         continue
-                    # ── WSS 한 번도 미수신 + 추가 시점부터 10분(600초) 경과 → 구독 해제 (TOP5_ADD=False면 스킵) ──
-                    if not TOP5_ADD:
+                    # ── WSS 한 번도 미수신 + 추가 시점부터 10분(600초) 경과 → 구독 해제 (CLOSING_SELECT_ENABLED=False면 스킵) ──
+                    if not CLOSING_SELECT_ENABLED:
                         continue
                     added_ts = _code_added_ts.get(c, start_ts)
                     if (now - added_ts) >= 600.0:
@@ -9975,7 +9976,7 @@ def _top_rank_loop():
             # 조건: 전일대비 CLOSING_TARGET_PDY_CTRT*100 % 이상 상승(sign=1)
             #       + 현재가/당일고가 >= 0.97 (고가 대비 3% 이내)
             # ============================================================
-            if TOP5_ADD and is_closing_select and not _closing_codes:
+            if CLOSING_SELECT_ENABLED and is_closing_select and not _closing_codes:
                 closing_candidates = []
                 _closing_code_info = {}
                 ctrt_threshold = CLOSING_TARGET_PDY_CTRT * 100  # 0.20 → 20.0
@@ -10069,147 +10070,18 @@ def _top_rank_loop():
                     _save_closing_buy_state(list(_closing_codes), dict(_closing_code_info), [])
 
             # ============================================================
-            # 15:20 구독 전환: 기존 전부 해제 → 종가매매 종목으로 교체 (TOP5_ADD=False면 스킵)
+            # 15:20 구독 전환: 기존 전부 해제 → 종가매매 종목으로 교체 (CLOSING_SELECT_ENABLED=False면 스킵)
             # ============================================================
-            if TOP5_ADD and is_closing_switch and _closing_codes:
+            if CLOSING_SELECT_ENABLED and is_closing_switch and _closing_codes:
                 _switch_to_closing_codes()
                 logger.info(f"{ts_prefix()} [top] end time reached (종가매매 전환 완료), stopping")
                 return
 
             # ============================================================
-            # 일반 시간대 처리 (15:19/15:20 아닌 경우만, TOP5_ADD=True일 때)
-            # ============================================================
-            if TOP5_ADD and not is_closing_select:
-                changed = False
-
-                # [260423 재설계]
-                # --- 1) 구독 해제 대상: 20% 미만으로 떨어진 미매수 종목 + Top 랭킹 완전 이탈 종목
-                #       (매수/매도 pending 중인 종목은 보호)
-                codes_to_remove: list[str] = []
-                for c in list(_top_added_codes):
-                    # 보호: 매수 완료/대기 또는 매도 대기 중이면 해제 금지
-                    if c in _uplimit_positions or c in _uplimit_buy_pending or c in _uplimit_exit_pending:
-                        continue
-                    cur_ctrt = current_top_ctrt.get(c)
-                    if cur_ctrt is None:
-                        # Top 응답에서 사라짐 → 완전 이탈, 해제
-                        codes_to_remove.append(c)
-                        continue
-                    # 20% 미만으로 떨어진 미매수 종목 → 해제
-                    if cur_ctrt < UPLIMIT_UNSUBSCRIBE_CTRT:
-                        codes_to_remove.append(c)
-
-                if codes_to_remove:
-                    removed = _remove_code_structs(codes_to_remove)
-                    for c in removed:
-                        _top_added_codes.discard(c)
-                        _top_added_ts.pop(c, None)
-                        name = code_name_map.get(c, c)
-                        _log_top_sub_event(c, name, "해제")
-                    if removed:
-                        removed_names = [code_name_map.get(c, c) for c in removed]
-                        removed_ctrts = [f"{current_top_ctrt.get(c, 0.0):.2f}%" for c in removed]
-                        msg_rm = (
-                            f"{ts_prefix()} [top] 구독 해제 (<{UPLIMIT_UNSUBSCRIBE_CTRT}% 또는 이탈): "
-                            f"{list(zip(removed, removed_names, removed_ctrts))}"
-                        )
-                        sys.stdout.write("\n")
-                        _notify(msg_rm)
-                        changed = True
-
-                # --- 2) 25% 이상 모든 Top 종목 → 구독 추가 (신규만)
-                candidates = []
-                for code in current_top_codes:
-                    _ctrt_cur = current_top_ctrt.get(code, 0.0)
-                    if _ctrt_cur < UPLIMIT_SUBSCRIBE_MIN_CTRT:
-                        continue   # [260423] 25% 미만은 편입 대상 아님
-                    # [260423] 상한가 30% 초과 이상치 제외 (SPAC/재상장/오류 데이터)
-                    if _ctrt_cur > 30.0:
-                        continue
-                    # [260423] SPAC(스팩) 제외 — 상한가 규정 무의미, 변동성 예측 불가
-                    _nm = code_name_map.get(code, "")
-                    if "스팩" in _nm or "SPAC" in _nm.upper():
-                        continue
-                    if code in _base_codes:
-                        continue
-                    if code in codes:
-                        continue  # 이미 구독 중
-                    if code in _watchdog_removed_codes:
-                        continue
-                    if not _is_stock_group(code):
-                        continue
-                    candidates.append(code)
-
-                # 구독 상한 체크 + LRU 해제 (이미 구독 중인 _top_added 중 가장 오래된 것부터)
-                # H0STMKO0(보유/VI 동적 구독) 도 동일 40 슬롯에서 차감
-                current_count = len(codes)
-                available_slots = max(0, MAX_WSS_SUBSCRIBE - current_count - len(_mkstatus_sub_codes))
-                if available_slots < len(candidates):
-                    # LRU 해제 대상: _top_added_codes 중 매수/매도 pending 없는 종목을 추가 시각 오름차순 정렬
-                    evictable = [
-                        (ts, c) for c, ts in _top_added_ts.items()
-                        if c in _top_added_codes
-                        and c not in _uplimit_positions
-                        and c not in _uplimit_buy_pending
-                        and c not in _uplimit_exit_pending
-                    ]
-                    evictable.sort()   # 오래된 것부터
-                    need = len(candidates) - available_slots
-                    evicted_codes = [c for _, c in evictable[:need]]
-                    if evicted_codes:
-                        _removed_lru = _remove_code_structs(evicted_codes)
-                        for c in _removed_lru:
-                            _top_added_codes.discard(c)
-                            _top_added_ts.pop(c, None)
-                            _log_top_sub_event(c, code_name_map.get(c, c), "해제")
-                        if _removed_lru:
-                            msg_lru = f"{ts_prefix()} [top] LRU 해제 (슬롯 확보 {len(_removed_lru)}건): {_removed_lru}"
-                            _notify(msg_lru)
-                            changed = True
-                        available_slots = max(0, MAX_WSS_SUBSCRIBE - len(codes) - len(_mkstatus_sub_codes))
-                    candidates = candidates[:available_slots]
-
-                added = _ensure_code_structs(candidates)
-                _now_ts = time.time()
-                for c in added:
-                    _top_added_codes.add(c)
-                    _top_added_ts[c] = _now_ts
-                    name = code_name_map.get(c, c)
-                    _log_top_sub_event(c, name, "추가")
-                # [v_1] Top30 신규 추가 종목에 uplimit 프리캐시 (vola_10d, prev_day_ctrt, frgn_3d)
-                if UPLIMIT_BUY_ENABLED and added:
-                    try:
-                        _precache_uplimit_for_new_codes(added)
-                    except Exception as _e:
-                        logger.warning(f"{ts_prefix()} [uplimit_precache_top] 실패: {_e}")
-                added_names = [code_name_map.get(c, c) for c in added]
-                added_ctrts = [f"{current_top_ctrt.get(c, 0.0):.2f}%" for c in added]
-                if added:
-                    msg2 = (
-                        f"{ts_prefix()} [top] 구독 추가 (≥{UPLIMIT_SUBSCRIBE_MIN_CTRT}%): "
-                        f"{list(zip(added, added_names, added_ctrts))} "
-                        f"(총 {len(codes)}/{MAX_WSS_SUBSCRIBE})"
-                    )
-                    changed = True
-                else:
-                    if available_slots <= 0:
-                        reason = f"상한도달({current_count}/{MAX_WSS_SUBSCRIBE})"
-                    elif not candidates:
-                        reason = f"후보없음(25%+ Top 중 base/구독중 제외)"
-                    else:
-                        reason = "확인필요"
-                    msg2 = f"{ts_prefix()} [top] 구독 추가 없음 (총 {len(codes)}/{MAX_WSS_SUBSCRIBE}) [{reason}]"
-                sys.stdout.write("\n")
-                _notify(msg2)
-
-                # --- 3) 해제/추가 완료 후 1회만 동적 구독 적용 ---
-                if changed:
-                    _persist_subscription_codes(codes)
-                    _trigger_ws_rebuild()
         except Exception as e:
             logger.warning(f"{ts_prefix()} [top] fetch failed (schedule #{idx}): {type(e).__name__}: {e}")
-            # ── 15:20 구독 전환은 fetch 실패해도 반드시 실행 (TOP5_ADD=True일 때만) ──
-            if TOP5_ADD and is_closing_switch:
+            # ── 15:20 구독 전환은 fetch 실패해도 반드시 실행 (CLOSING_SELECT_ENABLED=True일 때만) ──
+            if CLOSING_SELECT_ENABLED and is_closing_switch:
                 if _closing_codes:
                     _switch_to_closing_codes()
                     logger.info(f"{ts_prefix()} [top] fetch 실패했으나 종가매매 전환 실행 완료")

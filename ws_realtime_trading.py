@@ -4931,12 +4931,16 @@ def _trigger_ws_rebuild():
             if _active_kws is not None:
                 desired = _desired_subscription_map(datetime.now(KST))
                 _apply_subscriptions(_active_kws, desired, reason="ws_rebuild")
-        # [260715] 다계좌 ON → a2 오버플로 데이터도 동적 재구독(재연결 없이)
+        # [260715] 다계좌 ON → a2/a3 오버플로 데이터도 동적 재구독(재연결 없이)
         if MULTIACCT_WSS_ENABLED:
             try:
                 _apply_a2_data_subs()
             except Exception as _e2:
                 logger.warning(f"{ts_prefix()} [a2-wss] rebuild apply 실패: {_e2}")
+            try:
+                _apply_a3_data_subs()
+            except Exception as _e3:
+                logger.warning(f"{ts_prefix()} [a3-wss] rebuild apply 실패: {_e3}")
 
     t = threading.Thread(target=_do, daemon=True)
     t.start()
@@ -13910,6 +13914,11 @@ def _a2_data_budget() -> int:
     return max(0, MAX_WSS_SUBSCRIBE - mko - _str2_ob_count("a2"))
 
 
+def _a3_data_budget() -> int:
+    """a3 데이터 예산 = 40 - a3 오더북. (a3 = 순수 오버플로, MKO·CNI0 없음)"""
+    return max(0, MAX_WSS_SUBSCRIBE - _str2_ob_count("a3"))
+
+
 def _partition_a1_a2():
     """전체 구독 유니버스(set(codes))를 a1(우선) / a2(오버플로)로 분할.
     우선순위(a1 우선 배정): 보유 > VI활성 > 전일상한가(_base_codes) > 나머지(당일 20%↑ 등).
@@ -13930,34 +13939,48 @@ def _partition_a1_a2():
     base = (set(_base_codes) & universe) - held - vi
     rest = universe - held - vi - base
     ordered = list(held) + list(vi) + list(base) + list(rest)
-    budget = _a1_data_budget()
-    combined_cap = budget + _a2_data_budget()
+    # [260723] 3계좌 분할: a1 우선 → a2 → a3. 예산은 '항상' 계산(연결 전에도 몫을 줘야 부트스트랩).
+    #   미연결 오버플로 계좌(a2/a3)의 몫은 _a1_share() 가 흡수 → 코드 유실 방지.
+    b1 = _a1_data_budget()
+    b2 = _a2_data_budget()
+    b3 = _a3_data_budget()
+    combined_cap = b1 + b2 + b3
+    n_acct = 1 + (1 if _a2_active() else 0) + (1 if _a3_active() else 0)
     if len(ordered) > combined_cap:
         dropped = len(ordered) - combined_cap
         logger.warning(
-            f"{ts_prefix()} [상한가감시] 유니버스 {len(ordered)} > 두 계좌 슬롯합계 {combined_cap}"
+            f"{ts_prefix()} [상한가감시] 유니버스 {len(ordered)} > {n_acct}계좌 슬롯합계 {combined_cap}"
             f" → 최저우선순위 {dropped}종목(당일 20%↑ 꼬리) 이번 배정 제외"
         )
         ordered = ordered[:combined_cap]
-    a1 = set(ordered[:budget])
-    a2 = set(ordered[budget:])
-    return a1, a2
+    a1 = set(ordered[:b1])
+    a2 = set(ordered[b1:b1 + b2])
+    a3 = set(ordered[b1 + b2:b1 + b2 + b3])
+    return a1, a2, a3
 
 
 def _a1_share() -> set:
-    a1, _ = _partition_a1_a2()
+    # a1 몫 + 미연결 오버플로 계좌(a2/a3) 몫 흡수(코드 유실 방지). 연결되면 rebuild 가 넘겨줌.
+    a1, a2, a3 = _partition_a1_a2()
+    if not _a2_active():
+        a1 = a1 | a2
+    if not _a3_active():
+        a1 = a1 | a3
     return a1
 
 
 def _a2_share() -> set:
-    _, a2 = _partition_a1_a2()
-    return a2
+    return _partition_a1_a2()[1]
+
+
+def _a3_share() -> set:
+    return _partition_a1_a2()[2]
 
 
 def _desired_subscription_map(now: datetime) -> dict:
     """a1 연결 구독 매핑. 다계좌 OFF 또는 a2 미연결 → 전체 codes(a1 이 전부, 기존 캡 로직),
     a2 연결됨 → a1 배정분(_a1_share). ★ a2 미연결 시 오버플로가 사라지지 않도록 a1 폴백."""
-    if not MULTIACCT_WSS_ENABLED or not _a2_active():
+    if not MULTIACCT_WSS_ENABLED or not (_a2_active() or _a3_active()):
         return _build_sub_map(now, set(codes))
     return _build_sub_map(now, _a1_share())
 
@@ -14634,7 +14657,7 @@ def _str2_ob_pick_acct() -> "str | None":
     두 계좌 모두 만석이면 None(이번 구독 보류 → 다음 이탈 틱 재시도).
     슬롯 셈: a1 = CNI0(1)+데이터+MKO(a2미연결시)+a1오더북, a2 = 데이터+MKO+a2오더북.
     데이터 예산은 _a1/_a2_data_budget 이 이미 오더북분을 차감(오버플로 방지)."""
-    a1_data = len(set(codes)) if not (MULTIACCT_WSS_ENABLED and _a2_active()) else len(_a1_share())
+    a1_data = len(set(codes)) if not (MULTIACCT_WSS_ENABLED and (_a2_active() or _a3_active())) else len(_a1_share())
     a1_mko = 0 if _a2_active() else len(_mkstatus_sub_codes)
     a1_used = 1 + a1_data + a1_mko + _str2_ob_count("a1")
     if a1_used < MAX_WSS_SUBSCRIBE:
@@ -14643,6 +14666,10 @@ def _str2_ob_pick_acct() -> "str | None":
         a2_used = len(_a2_share()) + len(_mkstatus_sub_codes) + _str2_ob_count("a2")
         if a2_used < MAX_WSS_SUBSCRIBE:
             return "a2"
+    if MULTIACCT_WSS_ENABLED and _a3_active():
+        a3_used = len(_a3_share()) + _str2_ob_count("a3")   # a3 = 순수 오버플로(MKO·CNI0 없음)
+        if a3_used < MAX_WSS_SUBSCRIBE:
+            return "a3"
     return None
 
 
@@ -14659,12 +14686,14 @@ def _str2_ob_worker() -> None:
             if on:
                 acct = _str2_ob_pick_acct()
                 if acct is None:
-                    logger.warning(f"{ts_prefix()} [str2_ob] 슬롯 만석(a1·a2) → {c} 구독 보류(재시도)")
+                    logger.warning(f"{ts_prefix()} [str2_ob] 슬롯 만석(a1·a2·a3) → {c} 구독 보류(재시도)")
                     with _str2_ob_lock:
                         _str2_ob_subs.pop(c, None)   # 보류 → 다음 이탈 틱에 재시도
                     continue
-                kws = _active_kws if acct == "a1" else _active_kws_a2
-                req = asking_price_krx if acct == "a1" else _a2_req(asking_price_krx)  # noqa: F405
+                kws = {"a1": _active_kws, "a2": _active_kws_a2, "a3": _active_kws_a3}.get(acct)
+                req = (asking_price_krx if acct == "a1"
+                       else _a2_req(asking_price_krx) if acct == "a2"
+                       else _a3_req(asking_price_krx))  # noqa: F405
                 if kws is None:
                     with _str2_ob_lock:
                         _str2_ob_subs.pop(c, None)
@@ -14674,8 +14703,10 @@ def _str2_ob_worker() -> None:
                 logger.info(f"{ts_prefix()} [str2_ob] 구독 전송 {c}({code_name_map.get(c, c)}) → {acct}")
             else:
                 acct = _str2_ob_acct.pop(c, "a1")
-                kws = _active_kws if acct == "a1" else _active_kws_a2
-                req = asking_price_krx if acct == "a1" else _a2_req(asking_price_krx)  # noqa: F405
+                kws = {"a1": _active_kws, "a2": _active_kws_a2, "a3": _active_kws_a3}.get(acct)
+                req = (asking_price_krx if acct == "a1"
+                       else _a2_req(asking_price_krx) if acct == "a2"
+                       else _a3_req(asking_price_krx))  # noqa: F405
                 if kws is None:
                     continue
                 _send_subscribe(kws, req, [c], "2", reason=f"str2_눌림목_오더북해제({acct})")
@@ -15016,6 +15047,206 @@ def run_ws_forever_a2():
             time.sleep(0.1)
 
 
+# ============================================================================
+# [260723] 다계좌 WSS 구독 — a3 격리 연결 (S2-a3, a2 와 동일 패턴)
+#   a3(격리 사본 _ka3) = 순수 오버플로 종목데이터 전용. 장운영정보(MKO)·체결통보(CNI0) 없음.
+#   a2 만석 시 a3 로 추가 오버플로 → 슬롯 합계 확장(계좌당 40). appkey 전용이라 a1·a2 무영향.
+# ============================================================================
+_ka3 = None
+_active_kws_a3 = None
+_kws_a3_lock = threading.Lock()
+_subscribed_a3: dict = {}
+_dsfw_a3 = None
+
+
+def _a3_active() -> bool:
+    if not MULTIACCT_WSS_ENABLED:
+        return False
+    with _kws_a3_lock:
+        return _active_kws_a3 is not None
+
+
+def _a3_req(req):
+    if _dsfw_a3 is None:
+        return req
+    return getattr(_dsfw_a3, getattr(req, "__name__", ""), req)
+
+
+def _setup_ka3():
+    """a3 격리 사본 로드 + a3 자격 인증. 실패 시 None. (_setup_ka2 미러)"""
+    logger.warning(f"{ts_prefix()} [a3-diag] step1 _setup_ka3 진입")
+    a3 = _account_cfg("a3")
+    if not a3 or not a3.get("appkey") or not a3.get("appsecret"):
+        logger.warning(f"{ts_prefix()} [a3-wss] a3 계좌 appkey/secret 없음 → a3 연결 비활성")
+        return None
+    try:
+        mod = _import_ka_copy("kis_auth_llm__a3")
+    except Exception as e:
+        logger.warning(f"{ts_prefix()} [a3-wss] 사본 로드 실패: {type(e).__name__}: {e}")
+        return None
+    mod._cfg["my_app"] = a3["appkey"]
+    mod._cfg["my_sec"] = a3["appsecret"]
+    try:
+        mod.token_tmp = os.path.join(
+            mod.config_root, f"KIS_a3_wss_{datetime.now(KST).strftime('%y%m%d')}"
+        )
+    except Exception:
+        pass
+    _auth_done = {"ok": False, "err": None}
+    def _do_auth():
+        try:
+            mod.auth(svr="prod")
+            _auth_done["step"] = "auth_ok"
+            mod.auth_ws(svr="prod", force_new=True)
+            _auth_done["ok"] = True
+        except Exception as e:
+            _auth_done["err"] = f"{type(e).__name__}: {e}"
+    _ath = threading.Thread(target=_do_auth, name="a3-auth", daemon=True)
+    _ath.start()
+    _ath.join(timeout=20.0)
+    if _ath.is_alive():
+        logger.warning(f"{ts_prefix()} [a3-wss] 인증 20s 초과(hang) → a3 비활성")
+        return None
+    if _auth_done["err"]:
+        logger.warning(f"{ts_prefix()} [a3-wss] 인증 실패: {_auth_done['err']} (last={_auth_done.get('step')})")
+        return None
+    if not (getattr(mod, "_base_headers_ws", {}) or {}).get("approval_key"):
+        logger.warning(f"{ts_prefix()} [a3-wss] auth_ws 실패(approval_key 없음) → a3 연결 비활성")
+        return None
+    global _dsfw_a3
+    try:
+        import importlib.util as _ilu
+        _saved_ka = sys.modules.get("kis_auth")
+        sys.modules["kis_auth"] = mod
+        try:
+            _spec3 = _ilu.spec_from_file_location(
+                "domestic_stock_functions_ws__a3", str(SCRIPT_DIR / "domestic_stock_functions_ws.py")
+            )
+            _dsfw = _ilu.module_from_spec(_spec3)
+            sys.modules["domestic_stock_functions_ws__a3"] = _dsfw
+            _spec3.loader.exec_module(_dsfw)
+            _dsfw_a3 = _dsfw
+        finally:
+            if _saved_ka is not None:
+                sys.modules["kis_auth"] = _saved_ka
+    except Exception as e:
+        logger.warning(f"{ts_prefix()} [a3-wss] dsfw a3 사본 로드 실패 → a3 연결 비활성: {e}")
+        return None
+    logger.info(f"{ts_prefix()} [a3-wss] a3 격리 연결 인증 완료 (appkey…{str(a3['appkey'])[-4:]})")
+    return mod
+
+
+def _a3_desired_subscription() -> dict:
+    """a3 연결 구독 {request_func: set(codes)} — 순수 오버플로 데이터(MKO 미포함)."""
+    now = datetime.now(KST)
+    base = _build_sub_map(now, _a3_share())
+    return {_a3_req(r): set(c) for r, c in base.items()}
+
+
+def _apply_a3_data_subs() -> None:
+    """a3 종목데이터 동적 재구독(재연결 없이)."""
+    if not MULTIACCT_WSS_ENABLED:
+        return
+    with _kws_a3_lock:
+        kws3 = _active_kws_a3
+    if kws3 is None:
+        return
+    desired = _a3_desired_subscription()
+    data_names = {"ccnl_krx", "exp_ccnl_krx", "overtime_ccnl_krx", "overtime_exp_ccnl_krx"}
+    for req, want in desired.items():
+        if getattr(req, "__name__", "") not in data_names:
+            continue
+        want = set(want)
+        have = _subscribed_a3.get(req.__name__, set())
+        if want == have:
+            continue
+        to_del = list(have - want)
+        to_add = list(want - have)
+        if to_del:
+            _send_subscribe(kws3, req, to_del, "2", reason="a3_rebuild")
+        if to_add:
+            _send_subscribe(kws3, req, to_add, "1", reason="a3_rebuild")
+        if want:
+            _subscribed_a3[req.__name__] = set(want)
+        else:
+            _subscribed_a3.pop(req.__name__, None)
+
+
+def _on_system_a3(rsp):
+    try:
+        if getattr(rsp, "isOk", False) and getattr(rsp, "tr_msg", None) and "SUCCESS" in str(rsp.tr_msg):
+            return
+        msg = str(getattr(rsp, "tr_msg", "") or "")
+        if not msg:
+            return
+        low = msg.lower()
+        if "not found" in low or "ALREADY IN SUBSCRIBE" in msg:
+            return
+        logger.warning(f"{ts_prefix()} [a3-wss][system] tr_id={getattr(rsp,'tr_id','')} msg={msg}")
+        if "invalid approval" in low or "ALREADY IN USE" in msg:
+            with _kws_a3_lock:
+                k = _active_kws_a3
+            try:
+                if k is not None:
+                    k.close()
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+def run_ws_forever_a3():
+    """a3 격리 연결 루프 — 순수 오버플로 종목데이터 전용(a2 미러). 배정 없으면 대기."""
+    global _ka3, _active_kws_a3, _subscribed_a3
+    if not MULTIACCT_WSS_ENABLED:
+        return
+    if _ka3 is None:
+        _ka3 = _setup_ka3()
+        if _ka3 is None:
+            logger.warning(f"{ts_prefix()} [a3-wss] a3 연결 셋업 실패 → 루프 종료(a1·a2 로 동작)")
+            return
+    attempt = 0
+    while not _stop_event.is_set():
+        desired = _a3_desired_subscription()
+        if not any(desired.values()):
+            time.sleep(5.0)          # 배정 없음 → 빈 연결 회피, 재확인
+            continue
+        attempt += 1
+        try:
+            if attempt > 1:
+                try:
+                    _ka3.auth_ws(svr="prod")
+                except Exception as ae:
+                    logger.warning(f"{ts_prefix()} [a3-wss] auth_ws 재발급 실패: {ae}")
+            _ka3.open_map.clear()
+            for req, cs in desired.items():
+                if cs:
+                    _ka3.KISWebSocket.subscribe(req, list(cs))
+            _subscribed_a3 = {req.__name__: set(cs) for req, cs in desired.items() if cs}
+            kws3 = _ka3.KISWebSocket(api_url="", max_retries=1)
+            with _kws_a3_lock:
+                _active_kws_a3 = kws3
+            kws3.on_system = _on_system_a3
+            n = sum(len(v) for v in desired.values())
+            logger.warning(f"{ts_prefix()} [a3-wss] kws.start (구독 {n}건) — 연결 시작")
+            kws3.start(on_result=on_result)   # a1 과 동일한 틱 파이프라인 (블로킹)
+            logger.warning(f"{ts_prefix()} [a3-wss] kws.start returned")
+        except Exception as e:
+            logger.warning(f"{ts_prefix()} [a3-wss] 연결 예외: {type(e).__name__}: {e}")
+        with _kws_a3_lock:
+            _active_kws_a3 = None
+        _subscribed_a3.clear()
+        _str2_ob_reset("a3")
+        try:
+            _trigger_ws_rebuild()
+        except Exception:
+            pass
+        for _ in range(30):
+            if _stop_event.is_set():
+                break
+            time.sleep(0.1)
+
+
 # ── [260715] 당일 상한가 감시(20%↑) sticky 수집기 (S4a) ──
 _uplimit_watch_codes: set[str] = set()          # 당일 20%↑ 편입 종목(sticky, EOD까지 유지)
 _uplimit_watch_lock = threading.Lock()
@@ -15275,6 +15506,9 @@ if __name__ == "__main__":
     if MULTIACCT_WSS_ENABLED:
         t_a2wss = threading.Thread(target=run_ws_forever_a2, name="a2-wss", daemon=True)
         t_a2wss.start()
+        # [260723] a3 격리 연결 루프(순수 오버플로 데이터). a2 만석 시 추가 슬롯.
+        t_a3wss = threading.Thread(target=run_ws_forever_a3, name="a3-wss", daemon=True)
+        t_a3wss.start()
     # [260715] 당일 상한가 감시(28%↑) sticky 수집기. 다계좌+감시 플래그 둘 다 ON 시 기동.
     if MULTIACCT_WSS_ENABLED and UPLIMIT_WATCH_ENABLED:
         t_uplimit = threading.Thread(target=_uplimit_watch_loop, name="uplimit-watch", daemon=True)
